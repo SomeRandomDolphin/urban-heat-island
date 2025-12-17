@@ -1,0 +1,78 @@
+# ===============================
+# Python cache & compiled files
+# ===============================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ===============================
+# Virtual environments
+# ===============================
+.venv/
+venv/
+env/
+ENV/
+
+# ===============================
+# IDE / Editor settings
+# ===============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===============================
+# Logs
+# ===============================
+logs/
+*.log
+
+# ===============================
+# Data (raw & processed)
+# ===============================
+data/raw/
+data/processed/
+
+# If you want to keep folder structure but ignore contents:
+# data/raw/*
+# data/processed/*
+# !data/raw/.gitkeep
+# !data/processed/.gitkeep
+
+# ===============================
+# Model artifacts
+# ===============================
+models/*.pth
+models/*.pt
+models/*.ckpt
+
+# ===============================
+# Outputs / generated files
+# ===============================
+outputs/__pycache__/
+outputs/*.pyc
+
+# ===============================
+# NumPy / large binary files
+# ===============================
+*.npy
+*.npz
+
+# ===============================
+# OS-specific files
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# Temporary / backup files
+# ===============================
+*.tmp
+*.bak
+*.old
+
+# ===============================
+# Environment variables
+# ===============================
+.env
+.env.*
