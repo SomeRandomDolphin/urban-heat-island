@@ -531,12 +531,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Download data for training period
-    # Example: January 2024 to June 2024
+    # Example: January 2016 to December 2025
     results = loader.download_date_range(
-        start_year=2024,
+        start_year=2016,
         start_month=1,
-        end_year=2024,
-        end_month=6,
+        end_year=2025,
+        end_month=12,
         output_dir=output_dir
     )
     

@@ -177,7 +177,7 @@ ENSEMBLE_WEIGHTS = {
 # ============================================================================
 TRAINING_CONFIG = {
     "batch_size": 32,
-    "epochs": 50,
+    "epochs": 200,
     "initial_lr": 1e-4,
     "min_lr": 1e-6,
     "warmup_epochs": 5,

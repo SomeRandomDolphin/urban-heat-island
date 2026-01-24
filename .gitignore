@@ -42,9 +42,7 @@ data/processed/
 # ===============================
 # Model artifacts
 # ===============================
-models/*.pth
-models/*.pt
-models/*.ckpt
+models/
 
 # ===============================
 # Outputs / generated files

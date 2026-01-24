@@ -115,15 +115,15 @@ class SatellitePreprocessor:
         return lst_celsius
     
     def validate_lst(self, lst: np.ndarray, 
-                    min_temp: float = -50, 
-                    max_temp: float = 60) -> Tuple[np.ndarray, Dict]:
+                    min_temp: float = 20, 
+                    max_temp: float = 50) -> Tuple[np.ndarray, Dict]:
         """
-        Validate and clean LST data
+        Validate and clean LST data for Jakarta climate
         
         Args:
             lst: Land Surface Temperature array
-            min_temp: Minimum realistic temperature (°C)
-            max_temp: Maximum realistic temperature (°C)
+            min_temp: Minimum realistic temperature (°C) - default 20°C for Jakarta
+            max_temp: Maximum realistic temperature (°C) - default 50°C for Jakarta (urban surfaces can be hot)
             
         Returns:
             Tuple of (cleaned LST, validation stats)
@@ -133,7 +133,8 @@ class SatellitePreprocessor:
         # Count original valid pixels
         original_valid = np.isfinite(lst).sum()
         
-        # Filter unrealistic values
+        # Filter unrealistic values for Jakarta's tropical climate
+        # Jakarta ambient: 24-34°C, but urban surfaces can reach 40-50°C
         lst_clean[(lst < min_temp) | (lst > max_temp)] = np.nan
         
         # Calculate statistics
@@ -548,9 +549,11 @@ class DatasetCreator:
                     patch_size: int = 64,
                     stride: int = 48,
                     min_valid_ratio: float = 0.7,
-                    min_variance: float = 0.3) -> List[Dict]:
+                    min_variance: float = 1.0,
+                    min_temp: float = 24.0,
+                    max_temp: float = 45.0) -> List[Dict]:
         """
-        Extract patches from raster data with quality control
+        Extract patches from raster data with quality control for Jakarta climate
         
         Args:
             raster_data: Dictionary of raster arrays
@@ -558,6 +561,8 @@ class DatasetCreator:
             stride: Stride between patches (pixels)
             min_valid_ratio: Minimum ratio of valid pixels required
             min_variance: Minimum LST variance (°C) required
+            min_temp: Minimum mean temperature for Jakarta (°C)
+            max_temp: Maximum mean temperature for Jakarta (°C)
             
         Returns:
             List of patch dictionaries
@@ -583,6 +588,8 @@ class DatasetCreator:
             return []
         
         patches = []
+        filtered_by_temp = 0
+        filtered_by_variance = 0
         
         for i in range(0, height - patch_size + 1, stride):
             for j in range(0, width - patch_size + 1, stride):
@@ -630,10 +637,32 @@ class DatasetCreator:
                 if valid_ratio >= min_valid_ratio:
                     # Check variance
                     lst_std = np.nanstd(patch_lst)
-                    if lst_std >= min_variance:
-                        patches.append(patch)
+                    if lst_std < min_variance:
+                        filtered_by_variance += 1
+                        continue
+                    
+                    # CRITICAL: Check for any extreme outlier pixels (cloud shadows, water, data gaps)
+                    # These often show as 0°C or very low values
+                    valid_temps = patch_lst[np.isfinite(patch_lst)]
+                    if len(valid_temps) == 0:
+                        continue
+                    
+                    # Reject patches with ANY pixel below 20°C or above 50°C
+                    if np.any(valid_temps < 20.0) or np.any(valid_temps > 50.0):
+                        filtered_by_temp += 1
+                        continue
+                    
+                    # Check mean temperature is realistic for Jakarta
+                    lst_mean = np.nanmean(patch_lst)
+                    if lst_mean < min_temp or lst_mean > max_temp:
+                        filtered_by_temp += 1
+                        continue
+                    
+                    patches.append(patch)
         
         logger.info(f"  Extracted {len(patches)} valid patches")
+        logger.info(f"  Filtered by temperature: {filtered_by_temp} patches")
+        logger.info(f"  Filtered by variance: {filtered_by_variance} patches")
         return patches
     
     def create_training_samples(self, patches: List[Dict],
@@ -668,6 +697,8 @@ class DatasetCreator:
         X = np.zeros((n_samples, patch_size, patch_size, n_channels), dtype=np.float32)
         y = np.zeros((n_samples, patch_size, patch_size, 1), dtype=np.float32)
         
+        valid_samples = []
+        
         for idx, patch in enumerate(patches):
             # Stack channels
             for channel_idx, feature in enumerate(channel_order):
@@ -678,22 +709,158 @@ class DatasetCreator:
             
             # Target (LST)
             y[idx, :, :, 0] = patch["data"]["LST"]
+            
+            # Final validation: check if this sample has any invalid temperatures
+            lst_values = y[idx, :, :, 0]
+            if np.any(lst_values < 20.0) or np.any(lst_values > 50.0):
+                logger.warning(f"Sample {idx} has invalid temperatures, marking for removal")
+                continue
+            
+            valid_samples.append(idx)
         
-        # Replace NaN with zeros
-        X = np.nan_to_num(X, nan=0.0)
-        y = np.nan_to_num(y, nan=0.0)
+        # Keep only valid samples
+        if len(valid_samples) < n_samples:
+            logger.info(f"Removing {n_samples - len(valid_samples)} samples with invalid temperatures")
+            X = X[valid_samples]
+            y = y[valid_samples]
+            n_samples = len(valid_samples)
+        
+        # Replace remaining NaN with median temperature (safer than 0)
+        # This should rarely happen after our strict filtering
+        median_temp = 35.0  # Typical Jakarta urban temperature
+        X = np.nan_to_num(X, nan=0.0)  # Features: 0 is safer for indices
+        y = np.nan_to_num(y, nan=median_temp)  # LST: use realistic median instead of 0
+        
+        # Final sanity check: clip to valid range
+        y = np.clip(y, 20.0, 50.0)
         
         metadata = {
             "n_samples": n_samples,
             "patch_size": patch_size,
             "n_channels": n_channels,
             "channel_order": channel_order,
-            "temporal_features": temporal_features
+            "temporal_features": temporal_features,
+            "temperature_range": {
+                "min": float(np.min(y)),
+                "max": float(np.max(y)),
+                "mean": float(np.mean(y)),
+                "std": float(np.std(y))
+            }
         }
         
         logger.info(f"Created training samples: X={X.shape}, y={y.shape}")
+        logger.info(f"Temperature range: [{metadata['temperature_range']['min']:.2f}, {metadata['temperature_range']['max']:.2f}]°C")
+        logger.info(f"Mean: {metadata['temperature_range']['mean']:.2f}°C, Std: {metadata['temperature_range']['std']:.2f}°C")
         return X, y, metadata
     
+    def compute_and_save_normalization_stats(self, X_train: np.ndarray, 
+                                            y_train: np.ndarray,
+                                            output_dir: Path) -> Dict:
+        """
+        Compute normalization statistics from training data and save them
+        
+        Args:
+            X_train: Training features (N, H, W, C)
+            y_train: Training targets (N, H, W, 1)
+            output_dir: Directory to save statistics
+            
+        Returns:
+            Normalization statistics dictionary
+        """
+        logger.info("\n" + "="*70)
+        logger.info("COMPUTING NORMALIZATION STATISTICS")
+        logger.info("="*70)
+        
+        n_channels = X_train.shape[-1]
+        
+        # Compute per-channel statistics for features
+        feature_stats = {}
+        for ch in range(n_channels):
+            channel_data = X_train[:, :, :, ch]
+            
+            feature_stats[f'channel_{ch}'] = {
+                'mean': float(channel_data.mean()),
+                'std': float(channel_data.std()),
+                'min': float(channel_data.min()),
+                'max': float(channel_data.max())
+            }
+            
+            logger.info(f"  Channel {ch}: mean={feature_stats[f'channel_{ch}']['mean']:.2f}, "
+                    f"std={feature_stats[f'channel_{ch}']['std']:.2f}")
+        
+        # Compute target statistics
+        target_stats = {
+            'mean': float(y_train.mean()),
+            'std': float(y_train.std()),
+            'min': float(y_train.min()),
+            'max': float(y_train.max())
+        }
+        
+        logger.info(f"\n  Target LST: mean={target_stats['mean']:.2f}°C, "
+                f"std={target_stats['std']:.2f}°C")
+        
+        # Compile statistics
+        normalization_stats = {
+            'features': feature_stats,
+            'target': target_stats,
+            'n_channels': n_channels,
+            'description': 'Normalization statistics computed from training data'
+        }
+        
+        # Save to file
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stats_path = output_dir / "normalization_stats.json"
+        
+        import json
+        with open(stats_path, 'w') as f:
+            json.dump(normalization_stats, f, indent=2)
+        
+        logger.info(f"\n✅ Saved normalization statistics to: {stats_path}")
+        logger.info("="*70)
+        
+        return normalization_stats
+    
+    def normalize_data(self, X: np.ndarray, y: np.ndarray, 
+                    norm_stats: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Normalize features and targets using provided statistics
+        
+        Args:
+            X: Features (N, H, W, C)
+            y: Targets (N, H, W, 1)
+            norm_stats: Normalization statistics dictionary
+            
+        Returns:
+            Tuple of (X_normalized, y_normalized)
+        """
+        logger.info("Normalizing data...")
+        
+        X_norm = np.zeros_like(X, dtype=np.float32)
+        
+        # Normalize each channel
+        n_channels = X.shape[-1]
+        for ch in range(n_channels):
+            ch_key = f'channel_{ch}'
+            if ch_key in norm_stats['features']:
+                mean = norm_stats['features'][ch_key]['mean']
+                std = norm_stats['features'][ch_key]['std']
+                
+                if std > 1e-8:  # Avoid division by zero
+                    X_norm[:, :, :, ch] = (X[:, :, :, ch] - mean) / std
+                else:
+                    logger.warning(f"  Channel {ch} has zero std, skipping normalization")
+                    X_norm[:, :, :, ch] = X[:, :, :, ch]
+        
+        # Normalize targets
+        target_mean = norm_stats['target']['mean']
+        target_std = norm_stats['target']['std']
+        y_norm = (y - target_mean) / target_std
+        
+        logger.info(f"  X normalized: mean={X_norm.mean():.4f}, std={X_norm.std():.4f}")
+        logger.info(f"  y normalized: mean={y_norm.mean():.4f}, std={y_norm.std():.4f}")
+        
+        return X_norm, y_norm
+        
     def create_train_val_test_split(self, X: np.ndarray, y: np.ndarray,
                                    dates: np.ndarray,
                                    split_method: str = "temporal",
@@ -768,14 +935,16 @@ class DatasetCreator:
         
         return splits
     
-    def save_dataset(self, splits: Dict, output_dir: Path, metadata: Dict):
+    def save_dataset(self, splits: Dict, output_dir: Path, metadata: Dict, 
+                    norm_stats: Optional[Dict] = None):
         """
-        Save dataset to disk
+        Save dataset to disk with normalization statistics
         
         Args:
             splits: Dictionary with train/val/test splits
             output_dir: Output directory
             metadata: Metadata dictionary
+            norm_stats: Normalization statistics (optional)
         """
         output_dir = Path(output_dir)
         
@@ -805,7 +974,14 @@ class DatasetCreator:
                     metadata_clean[k] = v
             json.dump(metadata_clean, f, indent=2)
         
-        logger.info(f"✓ Dataset saved to {output_dir}")
+        # Save normalization statistics if provided
+        if norm_stats is not None:
+            stats_file = output_dir / "normalization_stats.json"
+            with open(stats_file, "w") as f:
+                json.dump(norm_stats, f, indent=2)
+            logger.info(f"✅ Saved normalization stats to {stats_file}")
+        
+        logger.info(f"✅ Dataset saved to {output_dir}")
 
 
 def main():
@@ -988,7 +1164,9 @@ def main():
             patch_size=64,
             stride=48,
             min_valid_ratio=0.7,
-            min_variance=0.3
+            min_variance=1.0,  # Increased from 0.3 for better quality
+            min_temp=20.0,     # Realistic for Jakarta
+            max_temp=50.0      # Realistic for urban surfaces in Jakarta
         )
         
         for patch in patches:
@@ -1017,30 +1195,95 @@ def main():
     logger.info("\n" + "="*70)
     logger.info("STEP 5: Create train/val/test splits")
     logger.info("="*70)
-    
+
     splits = dataset_creator.create_train_val_test_split(
         X, y, dates,
         split_method="temporal",
         split_ratios=(0.7, 0.15, 0.15)
     )
-    
+
+    # Step 6.5: Compute normalization statistics from training data
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.5: Compute normalization statistics")
+    logger.info("="*70)
+
+    output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
+    norm_stats = dataset_creator.compute_and_save_normalization_stats(
+        splits['X_train'], 
+        splits['y_train'],
+        output_dataset_dir
+    )
+
+    # Step 6.6: Normalize all splits
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.6: Normalize data")
+    logger.info("="*70)
+
+    logger.info("Normalizing training data...")
+    splits['X_train'], splits['y_train'] = dataset_creator.normalize_data(
+        splits['X_train'], splits['y_train'], norm_stats
+    )
+
+    logger.info("Normalizing validation data...")
+    splits['X_val'], splits['y_val'] = dataset_creator.normalize_data(
+        splits['X_val'], splits['y_val'], norm_stats
+    )
+
+    logger.info("Normalizing test data...")
+    splits['X_test'], splits['y_test'] = dataset_creator.normalize_data(
+        splits['X_test'], splits['y_test'], norm_stats
+    )
+
+    # Verify normalization on training data
+    logger.info("\n" + "="*70)
+    logger.info("NORMALIZATION VERIFICATION")
+    logger.info("="*70)
+    logger.info("Training data after normalization:")
+    logger.info(f"  X_train: mean={splits['X_train'].mean():.4f}, std={splits['X_train'].std():.4f}")
+    logger.info(f"  y_train: mean={splits['y_train'].mean():.4f}, std={splits['y_train'].std():.4f}")
+
+    if not (-0.1 < splits['X_train'].mean() < 0.1):
+        logger.warning("⚠️ X_train mean is not close to 0!")
+    if not (0.9 < splits['X_train'].std() < 1.1):
+        logger.warning("⚠️ X_train std is not close to 1!")
+    if not (-0.1 < splits['y_train'].mean() < 0.1):
+        logger.warning("⚠️ y_train mean is not close to 0!")
+    if not (0.9 < splits['y_train'].std() < 1.1):
+        logger.warning("⚠️ y_train std is not close to 1!")
+
+    logger.info("="*70)
+
+    # Step 6.7: Update metadata with fusion info
+    logger.info("\n" + "="*70)
+    logger.info("STEP 6.7: Update metadata")
+    logger.info("="*70)
+
+    # Add fusion strategy info to metadata
+    metadata['fusion_info'] = {
+        'fusion_strategy': 'multi-sensor' if (has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0) else 'landsat-only',
+        'landsat_files': len(landsat_processed) if has_landsat else 0,
+        'sentinel2_files': len(sentinel2_processed) if has_sentinel2 else 0,
+        'fused_datasets': len(all_fused_data)
+    }
+
+    # Save the NORMALIZED dataset
+    dataset_creator.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
+
+    # Update metadata with NORMALIZED data statistics
+    metadata['temperature_range'] = {
+        'min': float(np.min(splits['y_train'])),
+        'max': float(np.max(splits['y_train'])),
+        'mean': float(np.mean(splits['y_train'])),
+        'std': float(np.std(splits['y_train']))
+    }
+
+    logger.info("Metadata updated with normalized data statistics")
+    logger.info(f"  y_train range: [{metadata['temperature_range']['min']:.4f}, {metadata['temperature_range']['max']:.4f}]")
+
     # Step 7: Save dataset
     logger.info("\n" + "="*70)
-    logger.info("STEP 6: Save dataset")
+    logger.info("STEP 6: Save normalized dataset")
     logger.info("="*70)
-    
-    # Add fusion info to metadata
-    metadata["fusion_info"] = {
-        "has_landsat": has_landsat,
-        "has_sentinel2": has_sentinel2,
-        "n_landsat": len(landsat_processed) if has_landsat else 0,
-        "n_sentinel2": len(sentinel2_processed) if has_sentinel2 else 0,
-        "n_fused": len(all_fused_data),
-        "fusion_strategy": "temporal_weighted" if has_landsat and has_sentinel2 else "single_sensor"
-    }
-    
-    output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
-    dataset_creator.save_dataset(splits, output_dataset_dir, metadata)
     
     # Final summary
     logger.info("\n" + "="*70)
@@ -1059,6 +1302,11 @@ def main():
     logger.info(f"Output:")
     logger.info(f"  Dataset saved to: {output_dataset_dir}")
     logger.info(f"  Fusion strategy: {metadata['fusion_info']['fusion_strategy']}")
+    logger.info(f"Normalization:")
+    logger.info(f"  Stats saved: ✅")
+    logger.info(f"  Training data normalized: mean≈0, std≈1")
+    logger.info(f"  Validation data normalized: ✅")
+    logger.info(f"  Test data normalized: ✅")
     logger.info("="*70)
     logger.info("\nNext step: Run model training")
 

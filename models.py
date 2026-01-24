@@ -1,5 +1,5 @@
 """
-Deep Learning models for Urban Heat Island detection
+Deep Learning models for Urban Heat Island detection with Ensemble support
 """
 import sys
 import torch
@@ -7,6 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 import logging
+import numpy as np
+import pandas as pd
+import pickle
+from pathlib import Path
 
 from config import CNN_CONFIG, ENSEMBLE_WEIGHTS
 
@@ -161,30 +165,14 @@ class LSTLoss(nn.Module):
         return loss_x + loss_y
     
     def physical_loss(self, pred, features):
-        """
-        Physical consistency loss
-        
-        Args:
-            pred: Predicted LST
-            features: Input features (includes NDVI, etc.)
-        """
-        # For now, simple penalty if predictions are unrealistic
-        # In practice, you'd extract NDVI from features and enforce relationships
-        
+        """Physical consistency loss"""
         # Penalize unrealistic temperature values (20-50°C for Jakarta)
         min_temp, max_temp = 20.0, 50.0
         penalty = torch.relu(min_temp - pred) + torch.relu(pred - max_temp)
         return penalty.mean()
     
     def forward(self, pred, target, features=None):
-        """
-        Calculate total loss
-        
-        Args:
-            pred: Predicted LST
-            target: Ground truth LST
-            features: Input features (optional, for physical loss)
-        """
+        """Calculate total loss"""
         mse = self.mse_loss(pred, target)
         spatial = self.spatial_loss(pred, target)
         
@@ -240,41 +228,220 @@ class EarlyStopping:
 
 
 class ModelEnsemble:
-    """Ensemble of CNN and GBM models"""
+    """Ensemble of CNN and GBM models for production inference"""
     
-    def __init__(self, cnn_model, gbm_model=None):
-        self.cnn_model = cnn_model
-        self.gbm_model = gbm_model
-        self.weights = ENSEMBLE_WEIGHTS
-        
-    def predict(self, cnn_input, gbm_input=None):
+    def __init__(self, cnn_model=None, gbm_model=None, weights=None, device='cpu'):
         """
-        Ensemble prediction
+        Initialize ensemble model
         
         Args:
-            cnn_input: Input tensor for CNN
-            gbm_input: Input dataframe for GBM (optional)
+            cnn_model: Trained CNN model (UNet)
+            gbm_model: Trained GBM model (LightGBM)
+            weights: Dictionary with 'cnn' and 'gbm' weights
+            device: Device for CNN inference
+        """
+        self.cnn_model = cnn_model
+        self.gbm_model = gbm_model
+        self.weights = weights or ENSEMBLE_WEIGHTS
+        self.device = device
+        
+        if self.cnn_model is not None:
+            self.cnn_model.to(device)
+            self.cnn_model.eval()
+        
+        logger.info(f"Ensemble initialized with weights: {self.weights}")
+    
+    def _prepare_gbm_features(self, X: np.ndarray) -> pd.DataFrame:
+        """Prepare GBM features from image patches"""
+        n_samples, n_channels, height, width = X.shape
+        
+        features_list = []
+        for i in range(n_samples):
+            patch_features = {}
+            
+            for ch in range(n_channels):
+                channel_data = X[i, ch, :, :]
+                
+                patch_features[f'ch{ch}_mean'] = channel_data.mean()
+                patch_features[f'ch{ch}_std'] = channel_data.std()
+                patch_features[f'ch{ch}_min'] = channel_data.min()
+                patch_features[f'ch{ch}_max'] = channel_data.max()
+                patch_features[f'ch{ch}_median'] = np.median(channel_data)
+                patch_features[f'ch{ch}_p25'] = np.percentile(channel_data, 25)
+                patch_features[f'ch{ch}_p75'] = np.percentile(channel_data, 75)
+            
+            patch_features['height'] = height
+            patch_features['width'] = width
+            
+            features_list.append(patch_features)
+        
+        return pd.DataFrame(features_list)
+    
+    def predict(self, X, return_individual=False):
+        """
+        Make ensemble predictions
+        
+        Args:
+            X: Input tensor/array (N, C, H, W) or (N, H, W, C)
+            return_individual: If True, return individual model predictions
             
         Returns:
-            Ensemble prediction
+            Ensemble prediction, or (ensemble, cnn, gbm) if return_individual=True
         """
-        # CNN prediction
-        self.cnn_model.eval()
-        with torch.no_grad():
-            cnn_pred = self.cnn_model(cnn_input)
-        
-        # If GBM available, combine predictions
-        if self.gbm_model is not None and gbm_input is not None:
-            gbm_pred = self.gbm_model.predict(gbm_input)
-            
-            # Convert to same shape and combine
-            # This assumes appropriate reshaping logic
-            final_pred = (self.weights["cnn"] * cnn_pred.cpu().numpy() + 
-                         self.weights["gbm"] * gbm_pred)
+        # Convert to torch tensor if numpy
+        if isinstance(X, np.ndarray):
+            # Handle (N, H, W, C) -> (N, C, H, W)
+            if X.ndim == 4 and X.shape[-1] < X.shape[1]:
+                X = np.transpose(X, (0, 3, 1, 2))
+            X_torch = torch.FloatTensor(X)
         else:
-            final_pred = cnn_pred
+            X_torch = X
         
-        return final_pred
+        # CNN prediction
+        cnn_pred = None
+        if self.cnn_model is not None:
+            with torch.no_grad():
+                X_device = X_torch.to(self.device)
+                cnn_output = self.cnn_model(X_device)
+                cnn_pred = cnn_output.cpu().numpy()
+                
+                # Average over spatial dimensions for patch-level prediction
+                cnn_pred_patch = cnn_pred.reshape(cnn_pred.shape[0], -1).mean(axis=1)
+        else:
+            raise ValueError("CNN model not available")
+        
+        # GBM prediction
+        gbm_pred = None
+        if self.gbm_model is not None:
+            X_numpy = X_torch.numpy()
+            X_gbm = self._prepare_gbm_features(X_numpy)
+            gbm_pred = self.gbm_model.predict(X_gbm)
+        
+        # Ensemble prediction
+        if gbm_pred is not None:
+            ensemble_pred = (
+                self.weights["cnn"] * cnn_pred_patch +
+                self.weights["gbm"] * gbm_pred
+            )
+        else:
+            logger.warning("GBM not available, using CNN predictions only")
+            ensemble_pred = cnn_pred_patch
+        
+        if return_individual:
+            return ensemble_pred, cnn_pred, gbm_pred
+        else:
+            return ensemble_pred
+    
+    def predict_spatial(self, X):
+        """
+        Make spatial predictions (full resolution from CNN)
+        
+        Args:
+            X: Input tensor/array (N, C, H, W)
+            
+        Returns:
+            Spatial LST predictions (N, 1, H, W)
+        """
+        if self.cnn_model is None:
+            raise ValueError("CNN model not available for spatial predictions")
+        
+        if isinstance(X, np.ndarray):
+            if X.ndim == 4 and X.shape[-1] < X.shape[1]:
+                X = np.transpose(X, (0, 3, 1, 2))
+            X = torch.FloatTensor(X)
+        
+        with torch.no_grad():
+            X = X.to(self.device)
+            predictions = self.cnn_model(X)
+        
+        return predictions.cpu().numpy()
+    
+    @classmethod
+    def load_from_directory(cls, model_dir: Path, device='cpu'):
+        """
+        Load ensemble from saved directory
+        
+        Args:
+            model_dir: Directory containing saved models
+            device: Device for CNN inference
+            
+        Returns:
+            ModelEnsemble instance
+        """
+        model_dir = Path(model_dir)
+        
+        # Load ensemble config
+        config_path = model_dir / "ensemble_config.json"
+        if config_path.exists():
+            import json
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            weights = config.get('weights', ENSEMBLE_WEIGHTS)
+        else:
+            weights = ENSEMBLE_WEIGHTS
+            logger.warning("No ensemble config found, using default weights")
+        
+        # Load CNN
+        cnn_model = None
+        cnn_path = model_dir / "final_cnn.pth"
+        if not cnn_path.exists():
+            cnn_path = model_dir / "best_cnn.pth"
+        
+        if cnn_path.exists():
+            try:
+                cnn_model = UNet(
+                    in_channels=CNN_CONFIG["input_channels"],
+                    out_channels=1
+                )
+                cnn_model.load_state_dict(torch.load(cnn_path, map_location=device))
+                cnn_model.eval()
+                logger.info(f"Loaded CNN model from {cnn_path}")
+            except Exception as e:
+                logger.error(f"Failed to load CNN: {e}")
+        else:
+            logger.warning("No CNN model found")
+        
+        # Load GBM
+        gbm_model = None
+        gbm_path = model_dir / "gbm_model.pkl"
+        if gbm_path.exists():
+            try:
+                with open(gbm_path, 'rb') as f:
+                    gbm_model = pickle.load(f)
+                logger.info(f"Loaded GBM model from {gbm_path}")
+            except Exception as e:
+                logger.error(f"Failed to load GBM: {e}")
+        else:
+            logger.warning("No GBM model found")
+        
+        return cls(cnn_model, gbm_model, weights, device)
+    
+    def save(self, save_dir: Path):
+        """Save ensemble models"""
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save CNN
+        if self.cnn_model is not None:
+            torch.save(self.cnn_model.state_dict(), save_dir / "final_cnn.pth")
+            logger.info("Saved CNN model")
+        
+        # Save GBM
+        if self.gbm_model is not None:
+            with open(save_dir / "gbm_model.pkl", 'wb') as f:
+                pickle.dump(self.gbm_model, f)
+            logger.info("Saved GBM model")
+        
+        # Save config
+        import json
+        config = {
+            "weights": self.weights,
+            "cnn_path": "final_cnn.pth",
+            "gbm_path": "gbm_model.pkl" if self.gbm_model else None
+        }
+        with open(save_dir / "ensemble_config.json", 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info("Saved ensemble configuration")
 
 
 def count_parameters(model):
@@ -317,6 +484,12 @@ def test_model():
     
     print(f"Total loss: {loss.item():.4f}")
     print(f"Loss components: {components}")
+    
+    # Test ensemble
+    print("\nTesting ensemble...")
+    ensemble = ModelEnsemble(cnn_model=model, device='cpu')
+    pred = ensemble.predict(x)
+    print(f"Ensemble prediction shape: {pred.shape}")
 
 
 if __name__ == "__main__":
