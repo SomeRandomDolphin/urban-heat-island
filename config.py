@@ -1,5 +1,5 @@
 """
-Configuration file for Urban Heat Island Detection System
+Configuration file for Urban Heat Island Detection System - FIXED VERSION
 """
 import os
 from pathlib import Path
@@ -140,10 +140,11 @@ TEMPORAL_FEATURES = [
 CNN_CONFIG = {
     "architecture": "unet",
     "input_channels": 10,
-    "filters": [64, 128, 256, 512, 1024],
-    "dropout_rates": [0.1, 0.1, 0.2, 0.2, 0.3],
+    "filters": [32, 64, 128, 256, 512],  # REDUCED from [64, 128, 256, 512, 1024]
+    "dropout_rates": [0.1, 0.15, 0.2, 0.25, 0.3],
     "batch_norm": True,
-    "activation": "relu"
+    "activation": "relu",
+    "use_attention": False,  # Keep simple initially
 }
 
 GBM_CONFIG = {
@@ -152,17 +153,28 @@ GBM_CONFIG = {
         "objective": "regression",
         "metric": "rmse",
         "boosting_type": "gbdt",
-        "num_leaves": 127,
-        "max_depth": 12,
-        "learning_rate": 0.05,
-        "n_estimators": 1000,
+        
+        # Tree structure - MORE COMPLEX
+        "num_leaves": 255,  # INCREASED from 127
+        "max_depth": 15,  # INCREASED from 12
+        
+        # Learning
+        "learning_rate": 0.03,  # REDUCED from 0.05 - more trees
+        "n_estimators": 2000,  # INCREASED from 1000
+        
+        # Sampling
         "subsample": 0.8,
+        "subsample_freq": 1,
         "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
-        "min_child_samples": 100,
-        "early_stopping_rounds": 50,
-        "verbose": -1
+        
+        # Regularization
+        "reg_alpha": 0.05,  # REDUCED from 0.1
+        "reg_lambda": 0.05,  # REDUCED from 0.1
+        "min_child_samples": 50,  # REDUCED from 100 - allow more complex patterns
+        
+        # Convergence
+        "early_stopping_rounds": 100,  # INCREASED from 50
+        "verbose": 100,
     }
 }
 
@@ -173,22 +185,40 @@ ENSEMBLE_WEIGHTS = {
 }
 
 # ============================================================================
-# TRAINING CONFIGURATION
+# TRAINING CONFIGURATION - FIXED
 # ============================================================================
 TRAINING_CONFIG = {
-    "batch_size": 32,
-    "epochs": 200,
-    "initial_lr": 1e-4,
-    "min_lr": 1e-6,
-    "warmup_epochs": 5,
-    "patience": 10,
+    # Data loading
+    "batch_size": 16,  # REDUCED from 32 - allows better gradient estimates
+    
+    # Training duration
+    "epochs": 150,  # Reasonable middle ground
+    
+    # Learning rate - CRITICAL CHANGES
+    "initial_lr": 0.001,  # DOUBLED from 0.0005 - faster convergence
+    "min_lr": 5e-7,
+    "warmup_epochs": 15,  # INCREASED - gradual warmup helps
+    
+    # Early stopping
+    "patience": 30,  # INCREASED - give model more time
+    "min_delta": 0.0005,  # Smaller threshold for improvement
+    
+    # Optimizer
     "optimizer": "adamw",
-    "weight_decay": 1e-5,
+    "weight_decay": 0.00001,  # Keep regularization
+    
+    # Loss function - SIMPLIFIED
     "loss_weights": {
-        "mse": 0.7,
-        "spatial": 0.2,
-        "physical": 0.1
-    }
+        "mse": 1.0,         # Pure MSE focus
+        "spatial": 0.0,     # DISABLED initially
+        "physical": 0.0,    # DISABLED initially
+        "variance": 0.3,    # IMPORTANT: prevent flat predictions
+        "bias": 0.2         # IMPORTANT: prevent systematic errors
+    },
+    
+    # Gradient control
+    "gradient_clip": 0.5,  # REDUCED from 1.0 - tighter control
+    "accumulation_steps": 2,  # NEW: simulate larger batch size
 }
 
 # Data augmentation

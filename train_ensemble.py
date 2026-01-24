@@ -275,6 +275,47 @@ class GBMTrainer:
             self.model = pickle.load(f)
         logger.info(f"Loaded GBM model from {path}")
 
+def create_temperature_stratified_sampler(y_train):
+    """
+    Create sampler that balances temperature ranges
+    Ensures model sees equal amounts of hot and cold samples
+    
+    Args:
+        y_train: Training targets (N, H, W, 1) - NORMALIZED
+    
+    Returns:
+        WeightedRandomSampler
+    """
+    from torch.utils.data import WeightedRandomSampler
+    
+    # Get mean temperature per sample (in normalized space)
+    sample_means = y_train.reshape(len(y_train), -1).mean(axis=1).flatten()
+    
+    # Define temperature bins
+    # In normalized space: -1.5 = very cold, 0 = average, +1.5 = very hot
+    bins = np.array([-np.inf, -1.0, -0.5, 0.0, 0.5, 1.0, np.inf])
+    bin_indices = np.digitize(sample_means, bins)
+    
+    # Count samples per bin
+    unique_bins, bin_counts = np.unique(bin_indices, return_counts=True)
+    
+    # Calculate weights (inverse frequency)
+    # Rare bins get higher weight
+    bin_weights = {bin_idx: len(sample_means) / count 
+                   for bin_idx, count in zip(unique_bins, bin_counts)}
+    
+    # Assign weight to each sample
+    sample_weights = np.array([bin_weights[bin_idx] for bin_idx in bin_indices])
+    
+    logger.info("Temperature-stratified sampling:")
+    for bin_idx, count in zip(unique_bins, bin_counts):
+        logger.info(f"  Bin {bin_idx}: {count} samples (weight: {bin_weights[bin_idx]:.2f})")
+    
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
 
 class EnsembleTrainer:
     """Ensemble trainer combining CNN and GBM"""
@@ -285,10 +326,11 @@ class EnsembleTrainer:
         self.config = config
         
         # CNN components
-        self.criterion = LSTLoss(
-            alpha=config["loss_weights"]["mse"],
-            beta=config["loss_weights"]["spatial"],
-            gamma=config["loss_weights"]["physical"]
+        from models import VarianceAwareLoss
+        self.criterion = VarianceAwareLoss(
+            mse_weight=0.7,      # Main loss
+            var_weight=0.2,      # Variance preservation
+            spatial_weight=0.1   # Spatial smoothness
         )
         
         if config["optimizer"] == "adamw":
@@ -341,7 +383,7 @@ class EnsembleTrainer:
         """Train CNN for one epoch"""
         self.cnn_model.train()
         total_loss = 0
-        loss_components = {"mse": 0, "spatial": 0, "physical": 0}
+        loss_components = {}
         
         pbar = tqdm(train_loader, desc="Training CNN")
         for batch_idx, (data, target) in enumerate(pbar):
@@ -366,8 +408,10 @@ class EnsembleTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-            for key in loss_components:
-                loss_components[key] += components[key]
+            for key, value in components.items():
+                if key not in loss_components:
+                    loss_components[key] = 0.0
+                loss_components[key] += value
             
             pbar.set_postfix({"loss": loss.item(), "mse": components["mse"]})
         
@@ -985,11 +1029,14 @@ def main():
     train_dataset = UHIDataset(X_train, y_train, augment=True)
     val_dataset = UHIDataset(X_val, y_val, augment=False)
     
-    # Create dataloaders
+    # Create stratified sampler for balanced temperature distribution
+    sampler = create_temperature_stratified_sampler(y_train)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=TRAINING_CONFIG["batch_size"],
-        shuffle=True,
+        sampler=sampler,  # CHANGED: use sampler instead of shuffle
+        # shuffle=True,   # REMOVED: don't use shuffle with sampler
         num_workers=COMPUTE_CONFIG["num_workers"],
         pin_memory=COMPUTE_CONFIG["pin_memory"]
     )

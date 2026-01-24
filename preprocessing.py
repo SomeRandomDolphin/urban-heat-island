@@ -547,11 +547,11 @@ class DatasetCreator:
         
     def extract_patches(self, raster_data: Dict[str, np.ndarray],
                     patch_size: int = 64,
-                    stride: int = 48,
-                    min_valid_ratio: float = 0.7,
-                    min_variance: float = 1.0,
-                    min_temp: float = 24.0,
-                    max_temp: float = 45.0) -> List[Dict]:
+                    stride: int = 32,
+                    min_valid_ratio: float = 0.8,
+                    min_variance: float = 0.5,    # CHANGED: from 1.0
+                    min_temp: float = 22.0,       # CHANGED: from 24.0
+                    max_temp: float = 48.0) -> List[Dict]:  # CHANGED: from 45.0
         """
         Extract patches from raster data with quality control for Jakarta climate
         
@@ -641,20 +641,31 @@ class DatasetCreator:
                         filtered_by_variance += 1
                         continue
                     
-                    # CRITICAL: Check for any extreme outlier pixels (cloud shadows, water, data gaps)
-                    # These often show as 0°C or very low values
+                    # RELAXED: Only check mean temperature, allow pixel variation
                     valid_temps = patch_lst[np.isfinite(patch_lst)]
                     if len(valid_temps) == 0:
                         continue
-                    
-                    # Reject patches with ANY pixel below 20°C or above 50°C
-                    if np.any(valid_temps < 20.0) or np.any(valid_temps > 50.0):
+
+                    # Calculate patch statistics
+                    lst_mean = np.nanmean(patch_lst)
+                    lst_std = np.nanstd(patch_lst)
+
+                    # Only reject if MEAN is extreme (not individual pixels)
+                    # Relaxed from 24-45 to 22-48 to include more edge cases
+                    if lst_mean < 22.0 or lst_mean > 48.0:
                         filtered_by_temp += 1
                         continue
-                    
-                    # Check mean temperature is realistic for Jakarta
-                    lst_mean = np.nanmean(patch_lst)
-                    if lst_mean < min_temp or lst_mean > max_temp:
+
+                    # Remove completely uniform patches (likely bad data)
+                    # Reduced from 1.0 to 0.3 to be less strict
+                    if lst_std < 0.3:
+                        filtered_by_variance += 1
+                        continue
+
+                    # OPTIONAL: Keep some samples with extreme pixels for better training
+                    # This helps the model learn to handle hot urban surfaces and cool water bodies
+                    extreme_pixel_ratio = np.sum((valid_temps < 20.0) | (valid_temps > 50.0)) / len(valid_temps)
+                    if extreme_pixel_ratio > 0.3:  # More than 30% extreme pixels - likely bad data
                         filtered_by_temp += 1
                         continue
                     

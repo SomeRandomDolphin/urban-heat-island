@@ -1,5 +1,9 @@
 """
-Deep Learning models for Urban Heat Island detection with Ensemble support
+Deep Learning models for Urban Heat Island detection with Ensemble support - FIXED VERSION
+Key fixes:
+1. Added bias penalty to LSTLoss
+2. Added variance penalty to prevent constant predictions
+3. Improved loss monitoring
 """
 import sys
 import torch
@@ -136,13 +140,26 @@ class UNet(nn.Module):
 
 
 class LSTLoss(nn.Module):
-    """Multi-task loss for LST prediction"""
+    """
+    Multi-task loss for LST prediction - FIXED VERSION
     
-    def __init__(self, alpha: float = 0.7, beta: float = 0.2, gamma: float = 0.1):
+    New features:
+    1. Bias penalty - forces mean prediction to match mean target
+    2. Variance penalty - prevents constant predictions
+    3. Better component tracking
+    """
+    
+    def __init__(self, alpha: float = 1.0, beta: float = 0.1, 
+                 gamma: float = 0.05, delta: float = 0.5, epsilon: float = 0.2):
         super().__init__()
-        self.alpha = alpha  # MSE weight
-        self.beta = beta    # Spatial weight
-        self.gamma = gamma  # Physical weight
+        self.alpha = alpha      # MSE weight
+        self.beta = beta        # Spatial weight
+        self.gamma = gamma      # Physical weight
+        self.delta = delta      # Bias weight (NEW)
+        self.epsilon = epsilon  # Variance weight (NEW)
+        
+        logger.info(f"LSTLoss initialized with weights: MSE={alpha}, Spatial={beta}, "
+                   f"Physical={gamma}, Bias={delta}, Variance={epsilon}")
         
     def mse_loss(self, pred, target):
         """Mean Squared Error"""
@@ -166,53 +183,112 @@ class LSTLoss(nn.Module):
     
     def physical_loss(self, pred, features):
         """Physical consistency loss"""
-        # Penalize unrealistic temperature values (20-50°C for Jakarta)
-        min_temp, max_temp = 20.0, 50.0
-        penalty = torch.relu(min_temp - pred) + torch.relu(pred - max_temp)
+        # Penalize unrealistic temperature values in NORMALIZED space
+        # For normalized data: mean≈0, std≈1
+        # Reasonable range: [-3, +3] (±3 standard deviations)
+        min_norm, max_norm = -3.0, 3.0
+        penalty = torch.relu(min_norm - pred) + torch.relu(pred - max_norm)
         return penalty.mean()
+    
+    def bias_loss(self, pred, target):
+        """
+        NEW: Bias penalty - forces mean prediction to match mean target
+        This prevents systematic over/underprediction
+        """
+        mask = ~torch.isnan(target)
+        pred_mean = pred[mask].mean()
+        target_mean = target[mask].mean()
+        
+        # Squared difference of means
+        bias = (pred_mean - target_mean) ** 2
+        return bias
+    
+    def variance_loss(self, pred, target):
+        """
+        NEW: Variance penalty - prevents constant predictions
+        Encourages prediction variance to match target variance
+        """
+        mask = ~torch.isnan(target)
+        pred_var = pred[mask].var()
+        target_var = target[mask].var()
+        
+        # Penalize if prediction variance is too low
+        # Use relative difference
+        if target_var > 1e-6:
+            var_ratio = pred_var / (target_var + 1e-8)
+            # Penalize if ratio < 0.5 (predictions too flat)
+            variance_penalty = torch.relu(0.5 - var_ratio)
+        else:
+            variance_penalty = torch.tensor(0.0, device=pred.device)
+        
+        return variance_penalty
     
     def forward(self, pred, target, features=None):
         """Calculate total loss"""
+        # Core losses
         mse = self.mse_loss(pred, target)
         spatial = self.spatial_loss(pred, target)
         
-        total_loss = self.alpha * mse + self.beta * spatial
+        # NEW: Bias and variance losses
+        bias = self.bias_loss(pred, target)
+        variance = self.variance_loss(pred, target)
         
+        # Combine losses
+        total_loss = (
+            self.alpha * mse + 
+            self.beta * spatial +
+            self.delta * bias +
+            self.epsilon * variance
+        )
+        
+        # Physical loss (optional, based on features)
+        physical = torch.tensor(0.0, device=pred.device)
         if features is not None:
             physical = self.physical_loss(pred, features)
             total_loss += self.gamma * physical
         
-        return total_loss, {
+        # Return total loss and components for monitoring
+        components = {
             "mse": mse.item(),
             "spatial": spatial.item(),
-            "physical": physical.item() if features is not None else 0.0
+            "physical": physical.item(),
+            "bias": bias.item(),           # NEW
+            "variance": variance.item()    # NEW
         }
+        
+        return total_loss, components
 
 
 class EarlyStopping:
-    """Early stopping to prevent overfitting"""
+    """Early stopping to prevent overfitting - IMPROVED"""
     
-    def __init__(self, patience: int = 10, min_delta: float = 0.0, mode: str = "min"):
+    def __init__(self, patience: int = 10, min_delta: float = 0.001, mode: str = "min"):
         self.patience = patience
-        self.min_delta = min_delta
+        self.min_delta = min_delta  # Minimum improvement required
         self.mode = mode
         self.counter = 0
         self.best_score = None
         self.early_stop = False
         self.best_model = None
         
+        logger.info(f"EarlyStopping: patience={patience}, min_delta={min_delta}, mode={mode}")
+        
     def __call__(self, score, model):
         if self.best_score is None:
             self.best_score = score
             self.save_checkpoint(model)
         elif self._is_improvement(score):
+            improvement = abs(score - self.best_score)
+            logger.info(f"  → Improvement: {improvement:.6f}")
             self.best_score = score
             self.counter = 0
             self.save_checkpoint(model)
         else:
             self.counter += 1
+            logger.info(f"  → No improvement ({self.counter}/{self.patience})")
             if self.counter >= self.patience:
                 self.early_stop = True
+                logger.info(f"  → Early stopping triggered!")
         
         return self.early_stop
     
@@ -224,7 +300,7 @@ class EarlyStopping:
     
     def save_checkpoint(self, model):
         """Save model checkpoint"""
-        self.best_model = model.state_dict().copy()
+        self.best_model = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
 
 class ModelEnsemble:
@@ -490,6 +566,60 @@ def test_model():
     ensemble = ModelEnsemble(cnn_model=model, device='cpu')
     pred = ensemble.predict(x)
     print(f"Ensemble prediction shape: {pred.shape}")
+
+class VarianceAwareLoss(nn.Module):
+    """
+    Loss function that preserves temperature variance
+    Prevents the model from regressing to the mean
+    """
+    
+    def __init__(self, mse_weight=0.7, var_weight=0.2, spatial_weight=0.1):
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.var_weight = var_weight
+        self.spatial_weight = spatial_weight
+        
+    def forward(self, pred, target, features=None):
+        """
+        Args:
+            pred: Predictions (N, 1, H, W) - NORMALIZED
+            target: Ground truth (N, 1, H, W) - NORMALIZED
+            features: Input features (optional, for physical constraints)
+        
+        Returns:
+            loss, components dict
+        """
+        # 1. Standard MSE
+        mse_loss = nn.functional.mse_loss(pred, target)
+        
+        # 2. Variance preservation loss
+        # Penalize if prediction variance doesn't match target variance
+        pred_var = torch.var(pred)
+        target_var = torch.var(target)
+        var_loss = (pred_var - target_var) ** 2
+        
+        # 3. Spatial smoothness (optional, from original LSTLoss)
+        spatial_loss = 0.0
+        if pred.shape[2] > 1 and pred.shape[3] > 1:
+            # Gradient in x and y
+            dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+            dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+            spatial_loss = torch.mean(dx**2) + torch.mean(dy**2)
+        
+        # Total loss
+        total_loss = (
+            self.mse_weight * mse_loss +
+            self.var_weight * var_loss +
+            self.spatial_weight * spatial_loss
+        )
+        
+        components = {
+            "mse": mse_loss.item(),
+            "variance": var_loss.item(),
+            "spatial": spatial_loss.item() if isinstance(spatial_loss, torch.Tensor) else spatial_loss
+        }
+        
+        return total_loss, components
 
 
 if __name__ == "__main__":

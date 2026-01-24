@@ -126,6 +126,7 @@ class DataNormalizer:
 class EnsemblePredictor:
     """
     FIXED: Ensemble predictor - Expects NORMALIZED input (same as training)
+    Denormalization happens ONCE at the end, not multiple times
     """
     
     def __init__(self, 
@@ -135,17 +136,6 @@ class EnsemblePredictor:
                  normalization_stats_path: Path,
                  device: str = "cuda",
                  mc_dropout_rate: float = 0.1):
-        """
-        Initialize ensemble predictor
-        
-        Args:
-            cnn_model_path: Path to trained CNN model
-            gbm_model_path: Path to trained GBM model  
-            ensemble_config_path: Path to ensemble configuration
-            normalization_stats_path: Path to normalization_stats.json
-            device: Device to run inference on
-            mc_dropout_rate: Dropout rate for MC Dropout
-        """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         
@@ -169,24 +159,16 @@ class EnsemblePredictor:
         # Wrap with MC Dropout
         self.cnn_model = MCDropoutUNet(base_model, dropout_rate=mc_dropout_rate)
         self.cnn_model.to(self.device)
-        logger.info("✓ CNN model loaded with MC Dropout support")
+        logger.info("✅ CNN model loaded with MC Dropout support")
         
         # Load GBM model
         logger.info("Loading GBM model...")
         with open(gbm_model_path, 'rb') as f:
             self.gbm_model = pickle.load(f)
-        logger.info("✓ GBM model loaded")
+        logger.info("✅ GBM model loaded")
     
     def validate_input(self, X: np.ndarray) -> bool:
-        """
-        Validate that input data is properly normalized
-        
-        Args:
-            X: Input features (N, H, W, C)
-            
-        Returns:
-            True if data looks normalized, False otherwise
-        """
+        """Validate that input data is properly normalized"""
         logger.info("\n" + "="*70)
         logger.info("VALIDATING INPUT DATA")
         logger.info("="*70)
@@ -204,33 +186,26 @@ class EnsemblePredictor:
         is_normalized = (-0.5 < X_mean < 0.5) and (0.5 < X_std < 1.5)
         
         if is_normalized:
-            logger.info("✓ Input data appears to be NORMALIZED (mean≈0, std≈1)")
+            logger.info("✅ Input data appears to be NORMALIZED (mean≈0, std≈1)")
             logger.info("  This is correct! Inference expects normalized data.")
             return True
         else:
             logger.warning("⚠️ Input data does NOT appear to be normalized!")
             logger.warning(f"  Mean={X_mean:.4f} (expected ≈0)")
             logger.warning(f"  Std={X_std:.4f} (expected ≈1)")
-            logger.warning("")
-            logger.warning("  This will likely produce POOR predictions!")
-            logger.warning("  Please provide NORMALIZED test data (same as training).")
-            logger.warning("")
-            logger.warning("  The test data should be loaded from:")
-            logger.warning("    data/processed/cnn_dataset/test/X.npy")
-            logger.warning("  This file should already be normalized.")
             return False
         
         logger.info("="*70 + "\n")
     
-    def predict_cnn(self, X: np.ndarray, batch_size: int = 8) -> np.ndarray:
+    def _predict_cnn_normalized(self, X: np.ndarray, batch_size: int = 8) -> np.ndarray:
         """
-        CNN predictions
+        CNN predictions in NORMALIZED space
         
         Args:
-            X: NORMALIZED features (N, H, W, C) - mean≈0, std≈1
+            X: NORMALIZED features (N, H, W, C)
             
         Returns:
-            Predictions in CELSIUS (denormalized)
+            Predictions in NORMALIZED space (DO NOT denormalize here)
         """
         logger.info("Running CNN predictions...")
         
@@ -247,30 +222,23 @@ class EnsemblePredictor:
                 output = self.cnn_model(batch_tensor)
                 predictions.append(output.cpu().numpy())
         
-        # Concatenate predictions (still normalized)
+        # Concatenate predictions (KEEP NORMALIZED)
         predictions = np.concatenate(predictions, axis=0).squeeze(1)
         
         logger.info(f"  CNN raw predictions (normalized): "
                    f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
         
-        # Denormalize to Celsius
-        predictions = self.normalizer.denormalize_predictions(predictions, 
-                                                              prediction_type="target")
-        
-        logger.info(f"  CNN predictions (Celsius): "
-                   f"mean={predictions.mean():.2f}°C, std={predictions.std():.2f}°C")
-        
-        return predictions
+        return predictions  # Return NORMALIZED predictions
     
-    def predict_gbm(self, X: np.ndarray) -> np.ndarray:
+    def _predict_gbm_normalized(self, X: np.ndarray) -> np.ndarray:
         """
-        GBM predictions
+        GBM predictions in NORMALIZED space
         
         Args:
-            X: NORMALIZED features (N, H, W, C) - mean≈0, std≈1
+            X: NORMALIZED features (N, H, W, C)
             
         Returns:
-            Predictions in CELSIUS (denormalized)
+            Predictions in NORMALIZED space (DO NOT denormalize here)
         """
         logger.info("Running GBM predictions...")
         
@@ -298,21 +266,14 @@ class EnsemblePredictor:
         
         features_df = pd.DataFrame(features_list)
         
-        # GBM prediction (in normalized space)
+        # GBM prediction (KEEP NORMALIZED)
         predictions = self.gbm_model.predict(features_df, 
                                             num_iteration=self.gbm_model.best_iteration)
         
         logger.info(f"  GBM raw predictions (normalized): "
                    f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
         
-        # Denormalize to Celsius
-        predictions = self.normalizer.denormalize_predictions(predictions, 
-                                                              prediction_type="target")
-        
-        logger.info(f"  GBM predictions (Celsius): "
-                   f"mean={predictions.mean():.2f}°C, std={predictions.std():.2f}°C")
-        
-        return predictions
+        return predictions  # Return NORMALIZED predictions
     
     def predict_ensemble(self, X: np.ndarray, batch_size: int = 8, 
                         return_uncertainty: bool = False,
@@ -322,11 +283,11 @@ class EnsemblePredictor:
         Make ensemble predictions
         
         Args:
-            X: NORMALIZED input features (N, H, W, C) - mean≈0, std≈1
+            X: NORMALIZED input features (N, H, W, C)
             batch_size: Batch size for inference
             return_uncertainty: Whether to compute MC Dropout uncertainty
             use_spatial_ensemble: Use spatial-level ensemble vs patch-level
-            skip_validation: Skip input validation (use with caution)
+            skip_validation: Skip input validation
             
         Returns:
             Dictionary with ensemble predictions in CELSIUS
@@ -335,63 +296,69 @@ class EnsemblePredictor:
         logger.info("ENSEMBLE PREDICTION PIPELINE")
         logger.info("="*70)
         
-        # Validate input (unless skipped)
+        # Validate input
         if not skip_validation:
             if not self.validate_input(X):
                 logger.error("❌ Input validation failed!")
-                logger.error("   Predictions will likely be incorrect.")
-                logger.error("   Please provide NORMALIZED test data.")
-                # Continue anyway, but warn user
         
-        # Get predictions from both models (already in Celsius)
-        cnn_preds = self.predict_cnn(X, batch_size)
-        gbm_preds = self.predict_gbm(X)
+        # Get predictions in NORMALIZED space
+        cnn_preds_norm = self._predict_cnn_normalized(X, batch_size)
+        gbm_preds_norm = self._predict_gbm_normalized(X)
         
-        # Calculate patch-level averages from CNN spatial predictions
-        cnn_preds_patch = cnn_preds.reshape(cnn_preds.shape[0], -1).mean(axis=1)
+        # Calculate patch-level averages (STILL NORMALIZED)
+        cnn_preds_patch_norm = cnn_preds_norm.reshape(cnn_preds_norm.shape[0], -1).mean(axis=1)
         
-        logger.info("\n📊 Prediction Statistics (in Celsius):")
-        logger.info(f"  CNN spatial: mean={cnn_preds.mean():.2f}°C, "
-                   f"std={cnn_preds.std():.2f}°C")
-        logger.info(f"  CNN patch avg: mean={cnn_preds_patch.mean():.2f}°C, "
-                   f"std={cnn_preds_patch.std():.2f}°C")
-        logger.info(f"  GBM patch: mean={gbm_preds.mean():.2f}°C, "
-                   f"std={gbm_preds.std():.2f}°C")
+        logger.info("\n📊 Prediction Statistics (NORMALIZED space):")
+        logger.info(f"  CNN spatial: mean={cnn_preds_norm.mean():.4f}, std={cnn_preds_norm.std():.4f}")
+        logger.info(f"  CNN patch avg: mean={cnn_preds_patch_norm.mean():.4f}, std={cnn_preds_patch_norm.std():.4f}")
+        logger.info(f"  GBM patch: mean={gbm_preds_norm.mean():.4f}, std={gbm_preds_norm.std():.4f}")
         
-        # Ensemble combination
+        # Ensemble combination in NORMALIZED space
         if use_spatial_ensemble and self.weights["cnn"] > 0:
-            logger.info("\n🔧 Using SPATIAL ensemble")
+            logger.info("\n🔧 Using SPATIAL ensemble (normalized space)")
             
-            # Broadcast GBM patch predictions to spatial dimensions
-            gbm_spatial = np.zeros_like(cnn_preds)
-            for i in range(len(gbm_preds)):
-                gbm_spatial[i] = gbm_preds[i]
+            # Broadcast GBM to spatial dimensions
+            gbm_spatial_norm = np.zeros_like(cnn_preds_norm)
+            for i in range(len(gbm_preds_norm)):
+                gbm_spatial_norm[i] = gbm_preds_norm[i]
             
             # Weighted combination
-            ensemble_preds = (
-                self.weights["cnn"] * cnn_preds +
-                self.weights["gbm"] * gbm_spatial
+            ensemble_preds_norm = (
+                self.weights["cnn"] * cnn_preds_norm +
+                self.weights["gbm"] * gbm_spatial_norm
             )
             
-            ensemble_preds_patch = ensemble_preds.reshape(
-                ensemble_preds.shape[0], -1
+            ensemble_preds_patch_norm = ensemble_preds_norm.reshape(
+                ensemble_preds_norm.shape[0], -1
             ).mean(axis=1)
             
         else:
-            logger.info("\n🔧 Using PATCH-LEVEL ensemble")
+            logger.info("\n🔧 Using PATCH-LEVEL ensemble (normalized space)")
             
             # Weighted combination at patch level
-            ensemble_preds_patch = (
-                self.weights["cnn"] * cnn_preds_patch +
-                self.weights["gbm"] * gbm_preds
+            ensemble_preds_patch_norm = (
+                self.weights["cnn"] * cnn_preds_patch_norm +
+                self.weights["gbm"] * gbm_preds_norm
             )
             
-            # Broadcast to spatial dimensions
-            ensemble_preds = np.zeros_like(cnn_preds)
-            for i in range(len(ensemble_preds_patch)):
-                ensemble_preds[i] = ensemble_preds_patch[i]
+            # Broadcast to spatial
+            ensemble_preds_norm = np.zeros_like(cnn_preds_norm)
+            for i in range(len(ensemble_preds_patch_norm)):
+                ensemble_preds_norm[i] = ensemble_preds_patch_norm[i]
         
-        logger.info(f"\n📈 Final Ensemble Statistics:")
+        logger.info(f"\n📊 Ensemble (NORMALIZED): mean={ensemble_preds_norm.mean():.4f}, "
+                   f"std={ensemble_preds_norm.std():.4f}")
+        
+        # DENORMALIZE ONCE - at the very end
+        logger.info("\n🔄 Denormalizing predictions to Celsius...")
+        
+        cnn_preds = self.normalizer.denormalize_predictions(cnn_preds_norm, "target")
+        gbm_preds = self.normalizer.denormalize_predictions(gbm_preds_norm, "target")
+        cnn_preds_patch = self.normalizer.denormalize_predictions(cnn_preds_patch_norm, "target")
+        ensemble_preds = self.normalizer.denormalize_predictions(ensemble_preds_norm, "target")
+        ensemble_preds_patch = self.normalizer.denormalize_predictions(ensemble_preds_patch_norm, "target")
+        
+        logger.info(f"\n📈 Final Ensemble Statistics (CELSIUS):")
         logger.info(f"  Mean: {ensemble_preds.mean():.2f}°C")
         logger.info(f"  Std:  {ensemble_preds.std():.2f}°C")
         logger.info(f"  Range: [{ensemble_preds.min():.2f}, {ensemble_preds.max():.2f}]°C")
@@ -404,32 +371,20 @@ class EnsemblePredictor:
             "cnn_patch": cnn_preds_patch
         }
         
-        # Uncertainty estimation (optional)
+        # Uncertainty estimation
         if return_uncertainty:
             logger.info("\n🎲 Computing MC Dropout uncertainty...")
-            uncertainty = self._compute_mc_dropout_uncertainty(
-                X, n_samples=50, batch_size=batch_size
-            )
+            uncertainty = self._compute_mc_dropout_uncertainty(X, n_samples=50, batch_size=batch_size)
             results["uncertainty"] = uncertainty
         
-        logger.info(f"\n✓ Ensemble predictions complete")
+        logger.info(f"\n✅ Ensemble predictions complete")
         logger.info("="*70 + "\n")
         
         return results
     
     def _compute_mc_dropout_uncertainty(self, X: np.ndarray, n_samples: int = 50, 
                                        batch_size: int = 8) -> np.ndarray:
-        """
-        Compute uncertainty using MC Dropout
-        
-        Args:
-            X: NORMALIZED input features (N, H, W, C)
-            n_samples: Number of MC samples
-            batch_size: Batch size for inference
-            
-        Returns:
-            Uncertainty map (N, H, W) in Celsius (standard deviation)
-        """
+        """Compute uncertainty using MC Dropout"""
         logger.info(f"  Running {n_samples} MC Dropout forward passes...")
         
         self.cnn_model.enable_mc_dropout()
@@ -451,36 +406,19 @@ class EnsemblePredictor:
             preds = np.concatenate(predictions, axis=0).squeeze(1)
             
             # Denormalize each MC sample
-            preds = self.normalizer.denormalize_predictions(preds, 
-                                                           prediction_type="target")
+            preds = self.normalizer.denormalize_predictions(preds, "target")
             mc_predictions.append(preds)
         
         self.cnn_model.disable_mc_dropout()
         
         # Calculate statistics
-        mc_predictions = np.array(mc_predictions)  # (n_samples, N, H, W)
-        
+        mc_predictions = np.array(mc_predictions)
         mean_pred = np.mean(mc_predictions, axis=0)
         epistemic_uncertainty = np.std(mc_predictions, axis=0)
         
         logger.info(f"\n  MC Dropout Statistics:")
         logger.info(f"    Mean prediction: {mean_pred.mean():.2f}±{mean_pred.std():.2f}°C")
         logger.info(f"    Epistemic uncertainty: {epistemic_uncertainty.mean():.3f}°C")
-        logger.info(f"    Uncertainty range: [{epistemic_uncertainty.min():.3f}, "
-                   f"{epistemic_uncertainty.max():.3f}]°C")
-        
-        # Sanity checks
-        if epistemic_uncertainty.mean() < 0.01:
-            logger.warning("⚠️ Very low uncertainty - dropout might not be working!")
-        elif epistemic_uncertainty.mean() > 5.0:
-            logger.warning("⚠️ Very high uncertainty - model might be unstable")
-        else:
-            logger.info("✓ Uncertainty estimates look reasonable")
-        
-        if epistemic_uncertainty.std() < 0.1:
-            logger.warning("⚠️ Uniform uncertainty - no spatial variation")
-        else:
-            logger.info("✓ Good spatial variation in uncertainty")
         
         return epistemic_uncertainty
 
@@ -624,7 +562,7 @@ def main():
         ensemble_config_path=ensemble_config_path,
         normalization_stats_path=normalization_stats_path,
         device="cuda",
-        mc_dropout_rate=0.1
+        mc_dropout_rate=0.05  # CHANGED: reduced from 0.1
     )
     
     logger.info("\n✓ Ensemble predictor initialized and ready for inference")

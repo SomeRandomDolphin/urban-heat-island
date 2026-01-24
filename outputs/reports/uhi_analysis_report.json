@@ -1,11 +1,11 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-01-24 19:21:33",
+  "date": "2026-01-24 21:17:12",
   "uhi_characterization": {
-    "maximum_intensity": "2.73\u00b0C",
-    "mean_intensity": "1.26\u00b0C",
-    "spatial_extent": "2.07 km\u00b2",
-    "magnitude": "5536.28\u00b0C\u00b7pixels"
+    "maximum_intensity": "3.17\u00b0C",
+    "mean_intensity": "1.62\u00b0C",
+    "spatial_extent": "5.05 km\u00b2",
+    "magnitude": "7170.23\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
     "total_hotspots": 0,
@@ -15,9 +15,9 @@
   },
   "top_priority_hotspots": [],
   "validation": {
-    "r2_score": "-0.7398",
-    "rmse": "5.6819\u00b0C",
-    "mae": "5.1553\u00b0C",
-    "bias": "-4.2532\u00b0C"
+    "r2_score": "0.5673",
+    "rmse": "3.7232\u00b0C",
+    "mae": "2.8607\u00b0C",
+    "bias": "0.3006\u00b0C"
   }
 }

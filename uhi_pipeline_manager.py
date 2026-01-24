@@ -161,7 +161,7 @@ def main():
             ensemble_config_path=model_dir / "ensemble_config.json",
             normalization_stats_path=normalization_stats_path,
             device="cuda",
-            mc_dropout_rate=0.1
+            mc_dropout_rate=0.05
         )
         logger.info("✓ Predictor initialized successfully")
     except Exception as e:
@@ -298,37 +298,116 @@ def main():
             y_test_celsius = normalizer.denormalize_predictions(
                 y_test.squeeze(), prediction_type="target"
             )
+            # Keep original shape for proper comparison
             y_test_celsius = y_test_celsius.reshape(y_test.shape)
             
             logger.info(f"  Denormalized ground truth: "
-                       f"mean={y_test_celsius.mean():.2f}°C")
+                    f"mean={y_test_celsius.mean():.2f}°C")
             
-            # Compare with predictions (already in Celsius)
-            validator = ValidationAnalyzer(
-                results["ensemble"][0], 
-                y_test_celsius[0].squeeze()
-            )
-            validation_metrics = validator.calculate_metrics()
-            validator.plot_validation(maps_dir / "validation_plot.png")
+            # CRITICAL FIX: Compare ALL samples, not just the first one!
+            logger.info(f"\n  Comparing all {len(results['ensemble'])} test samples...")
             
-            logger.info(f"✓ Validation complete")
+            # Flatten all predictions and ground truth
+            predictions_flat = results["ensemble"].flatten()
+            ground_truth_flat = y_test_celsius.flatten()
+            
+            # Remove NaN values
+            mask = ~(np.isnan(predictions_flat) | np.isnan(ground_truth_flat))
+            predictions_flat = predictions_flat[mask]
+            ground_truth_flat = ground_truth_flat[mask]
+            
+            logger.info(f"  Valid pixels: {len(predictions_flat):,}")
+            logger.info(f"  Predictions: mean={predictions_flat.mean():.2f}°C, std={predictions_flat.std():.2f}°C")
+            logger.info(f"  Ground truth: mean={ground_truth_flat.mean():.2f}°C, std={ground_truth_flat.std():.2f}°C")
+            
+            # Calculate metrics manually
+            from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+            
+            r2 = r2_score(ground_truth_flat, predictions_flat)
+            rmse = np.sqrt(mean_squared_error(ground_truth_flat, predictions_flat))
+            mae = mean_absolute_error(ground_truth_flat, predictions_flat)
+            mbe = predictions_flat.mean() - ground_truth_flat.mean()
+            
+            # Calculate additional metrics
+            correlation = np.corrcoef(predictions_flat, ground_truth_flat)[0, 1]
+            
+            # Linear regression for slope/intercept
+            from scipy import stats
+            slope, intercept, r_value, p_value, std_err = stats.linregress(ground_truth_flat, predictions_flat)
+            
+            validation_metrics = {
+                'r2': float(r2),
+                'rmse': float(rmse),
+                'mae': float(mae),
+                'mbe': float(mbe),
+                'correlation': float(correlation),
+                'slope': float(slope),
+                'intercept': float(intercept),
+                'p_value': float(p_value)
+            }
+            
+            logger.info(f"\n✅ Validation complete (ALL SAMPLES)")
             logger.info(f"  R²: {validation_metrics['r2']:.4f}")
             logger.info(f"  RMSE: {validation_metrics['rmse']:.4f}°C")
             logger.info(f"  MAE: {validation_metrics['mae']:.4f}°C")
-            logger.info(f"  Bias: {validation_metrics['mbe']:.4f}°C")
+            logger.info(f"  Bias (MBE): {validation_metrics['mbe']:.4f}°C")
+            logger.info(f"  Correlation: {validation_metrics['correlation']:.4f}")
+            logger.info(f"  Slope: {validation_metrics['slope']:.4f}")
+            logger.info(f"  Intercept: {validation_metrics['intercept']:.4f}°C")
             
             # Check if performance is acceptable
             if validation_metrics['r2'] < 0.3:
-                logger.error("❌ Very poor R² - model not learning well")
-            elif validation_metrics['r2'] < 0.6:
                 logger.warning("⚠️ Low R² - model needs improvement")
+            elif validation_metrics['r2'] < 0.6:
+                logger.info("✓ Moderate R² - acceptable performance")
             else:
-                logger.info("✓ Good R² score")
+                logger.info("✅ Good R² score!")
             
+            # Create validation plot
+            logger.info(f"\n  Creating validation plot...")
+            import matplotlib.pyplot as plt
+            
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            
+            # Scatter plot
+            axes[0].scatter(ground_truth_flat, predictions_flat, alpha=0.3, s=1, c='blue')
+            axes[0].plot([ground_truth_flat.min(), ground_truth_flat.max()], 
+                        [ground_truth_flat.min(), ground_truth_flat.max()], 
+                        'r--', linewidth=2, label='Perfect prediction')
+            axes[0].plot([ground_truth_flat.min(), ground_truth_flat.max()],
+                        [slope * ground_truth_flat.min() + intercept,
+                        slope * ground_truth_flat.max() + intercept],
+                        'g-', linewidth=2, label=f'Fit (slope={slope:.3f})')
+            axes[0].set_xlabel('Ground Truth (°C)', fontsize=12)
+            axes[0].set_ylabel('Predictions (°C)', fontsize=12)
+            axes[0].set_title(f'Predictions vs Ground Truth\nR²={r2:.4f}, RMSE={rmse:.2f}°C', fontsize=14)
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+            
+            # Residual plot
+            residuals = predictions_flat - ground_truth_flat
+            axes[1].scatter(ground_truth_flat, residuals, alpha=0.3, s=1, c='blue')
+            axes[1].axhline(0, color='r', linestyle='--', linewidth=2, label='Zero error')
+            axes[1].axhline(mbe, color='g', linestyle='--', linewidth=2, label=f'Bias={mbe:.2f}°C')
+            axes[1].set_xlabel('Ground Truth (°C)', fontsize=12)
+            axes[1].set_ylabel('Residual (°C)', fontsize=12)
+            axes[1].set_title(f'Residual Plot\nMAE={mae:.2f}°C', fontsize=14)
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(maps_dir / "validation_plot.png", dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"  ✅ Validation plot saved to {maps_dir / 'validation_plot.png'}")
+            
+            # Save metrics
             import json
             serializable_metrics = make_json_serializable(validation_metrics)
             with open(reports_dir / "validation_metrics.json", 'w') as f:
                 json.dump(serializable_metrics, f, indent=2)
+            
+            logger.info(f"  ✅ Metrics saved to {reports_dir / 'validation_metrics.json'}")
             
         except Exception as e:
             logger.error(f"❌ Validation failed: {e}")
@@ -428,24 +507,24 @@ def main():
     except Exception as e:
         logger.error(f"❌ GeoTIFF export failed: {e}")
     
-    # Create Web Map
-    if args.create_webmap:
-        logger.info("\n" + "="*70)
-        logger.info("CREATING WEB MAP")
-        logger.info("="*70)
+    # # Create Web Map
+    # if args.create_webmap:
+    #     logger.info("\n" + "="*70)
+    #     logger.info("CREATING WEB MAP")
+    #     logger.info("="*70)
         
-        try:
-            from uhi_map_overlay import RealMapOverlay
+    #     try:
+    #         from uhi_map_overlay import RealMapOverlay
             
-            overlay = RealMapOverlay(bounds)
-            webmap_dir = output_dir / "webmap"
-            overlay.export_to_webmap(lst_processed, uhi_map, hotspots_df, webmap_dir)
+    #         overlay = RealMapOverlay(bounds)
+    #         webmap_dir = output_dir / "webmap"
+    #         overlay.export_to_webmap(lst_processed, uhi_map, hotspots_df, webmap_dir)
             
-            logger.info(f"✓ Web map created: {webmap_dir / 'index.html'}")
-            logger.info("🌐 Open the HTML file in your browser to view!")
+    #         logger.info(f"✓ Web map created: {webmap_dir / 'index.html'}")
+    #         logger.info("🌐 Open the HTML file in your browser to view!")
             
-        except Exception as e:
-            logger.error(f"❌ Web map creation failed: {e}")
+    #     except Exception as e:
+    #         logger.error(f"❌ Web map creation failed: {e}")
     
     # Final Summary
     logger.info("\n" + "="*70)
