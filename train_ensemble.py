@@ -1,5 +1,6 @@
 """
-Enhanced training pipeline with CNN + GBM ensemble - IMPROVED VERSION
+Enhanced training pipeline with CNN + GBM ensemble - BEST MODELS VERSION
+Uses BEST validation models for ensemble instead of final models
 """
 import sys
 import torch
@@ -126,27 +127,52 @@ class UHIDataset(Dataset):
         return x, y
     
     def _augment(self, x, y):
-        """Apply data augmentation"""
-        if torch.rand(1) > 0.5 and AUGMENTATION_CONFIG["flip_horizontal"]:
-            x = torch.flip(x, dims=[2])
-            y = torch.flip(y, dims=[2])
+        """Enhanced augmentation preserving physical realism"""
         
-        if torch.rand(1) > 0.5 and AUGMENTATION_CONFIG["flip_vertical"]:
-            x = torch.flip(x, dims=[1])
-            y = torch.flip(y, dims=[1])
+        # 1. Geometric transformations (60% probability)
+        if torch.rand(1) > 0.4:
+            # Horizontal flip
+            if torch.rand(1) > 0.5:
+                x = torch.flip(x, dims=[2])
+                y = torch.flip(y, dims=[2])
+            
+            # Vertical flip
+            if torch.rand(1) > 0.5:
+                x = torch.flip(x, dims=[1])
+                y = torch.flip(y, dims=[1])
+            
+            # 90-degree rotation
+            if torch.rand(1) > 0.5:
+                k = torch.randint(1, 4, (1,)).item()
+                x = torch.rot90(x, k, dims=[1, 2])
+                y = torch.rot90(y, k, dims=[1, 2])
         
-        if torch.rand(1) > 0.5:
-            k = torch.randint(1, 4, (1,)).item()
-            x = torch.rot90(x, k, dims=[1, 2])
-            y = torch.rot90(y, k, dims=[1, 2])
+        # 2. Brightness adjustment (30% probability)
+        if torch.rand(1) > 0.7:
+            brightness_factor = 1.0 + (torch.rand(1) - 0.5) * 0.15  # ±7.5%
+            x = x * brightness_factor
         
-        if AUGMENTATION_CONFIG["noise_std"] > 0:
-            noise = torch.randn_like(x) * AUGMENTATION_CONFIG["noise_std"]
+        # 3. Contrast adjustment (30% probability)
+        if torch.rand(1) > 0.7:
+            contrast_factor = 1.0 + (torch.rand(1) - 0.5) * 0.15
+            mean = x.mean(dim=[1, 2], keepdim=True)
+            x = (x - mean) * contrast_factor + mean
+        
+        # 4. Gaussian noise (25% probability)
+        if torch.rand(1) > 0.75:
+            noise = torch.randn_like(x) * 0.015
             x = x + noise
         
-        if AUGMENTATION_CONFIG["brightness_range"] > 0:
-            brightness = 1.0 + (torch.rand(1) - 0.5) * 2 * AUGMENTATION_CONFIG["brightness_range"]
-            x = x * brightness
+        # 5. Regional dropout - simulates cloud patches (20% probability)
+        if torch.rand(1) > 0.8:
+            h, w = x.shape[1], x.shape[2]
+            cut_h = int(h * 0.25)
+            cut_w = int(w * 0.25)
+            cx = torch.randint(0, w - cut_w + 1, (1,)).item()
+            cy = torch.randint(0, h - cut_h + 1, (1,)).item()
+            
+            # Fill with mean instead of zeros (more realistic)
+            x[:, cy:cy+cut_h, cx:cx+cut_w] = x.mean(dim=[1, 2], keepdim=True)
         
         return x, y
 
@@ -169,8 +195,6 @@ def prepare_gbm_features(X: np.ndarray, y: np.ndarray) -> Tuple[pd.DataFrame, np
         Predictions must be denormalized during evaluation.
     """
     logger.info("Preparing GBM features from spatial data...")
-    
-    # ... rest of function stays the same
     
     n_samples, height, width, n_channels = X.shape
     
@@ -212,7 +236,7 @@ def prepare_gbm_features(X: np.ndarray, y: np.ndarray) -> Tuple[pd.DataFrame, np
 
 
 class GBMTrainer:
-    """Trainer for Gradient Boosting Model"""
+    """Trainer for Gradient Boosting Model - Tracks BEST model"""
     
     def __init__(self, config=None):
         self.config = config or {
@@ -231,10 +255,12 @@ class GBMTrainer:
             "verbose": -1
         }
         self.model = None
+        self.best_model = None  # ADDED: Track best model
+        self.best_score = float('inf')  # ADDED: Track best validation RMSE
         
     def train(self, X_train: pd.DataFrame, y_train: np.ndarray,
               X_val: pd.DataFrame, y_val: np.ndarray):
-        """Train GBM model"""
+        """Train GBM model and track best version"""
         logger.info("Training GBM model...")
         
         train_data = lgb.Dataset(X_train, label=y_train)
@@ -255,25 +281,64 @@ class GBMTrainer:
         
         logger.info(f"GBM training complete. Best iteration: {self.model.best_iteration}")
         
+        # ADDED: Evaluate and save as best if it's better
+        val_preds = self.model.predict(X_val, num_iteration=self.model.best_iteration)
+        val_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+        
+        if val_rmse < self.best_score:
+            self.best_score = val_rmse
+            self.best_model = self.model
+            logger.info(f"✅ New best GBM model: RMSE={val_rmse:.4f} (normalized)")
+        
         return self.model
     
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Make predictions"""
-        if self.model is None:
+    def predict(self, X: pd.DataFrame, use_best: bool = True) -> np.ndarray:
+        """
+        Make predictions
+        
+        Args:
+            X: Features
+            use_best: If True, use best_model; if False, use current model
+        """
+        model_to_use = self.best_model if (use_best and self.best_model is not None) else self.model
+        
+        if model_to_use is None:
             raise ValueError("Model not trained yet!")
-        return self.model.predict(X, num_iteration=self.model.best_iteration)
+        
+        return model_to_use.predict(X, num_iteration=model_to_use.best_iteration)
     
     def save(self, path: Path):
-        """Save model"""
+        """Save both best and final models"""
+        # Save final model
         with open(path, 'wb') as f:
             pickle.dump(self.model, f)
-        logger.info(f"Saved GBM model to {path}")
+        logger.info(f"Saved final GBM model to {path}")
+        
+        # ADDED: Save best model separately
+        if self.best_model is not None:
+            best_path = path.parent / f"best_{path.name}"
+            with open(best_path, 'wb') as f:
+                pickle.dump(self.best_model, f)
+            logger.info(f"💾 Saved BEST GBM model to {best_path} (RMSE: {self.best_score:.4f})")
     
     def load(self, path: Path):
         """Load model"""
         with open(path, 'rb') as f:
             self.model = pickle.load(f)
         logger.info(f"Loaded GBM model from {path}")
+    
+    def load_best(self, path: Path):
+        """ADDED: Load best model instead of final"""
+        best_path = path.parent / f"best_{path.name}"
+        
+        if best_path.exists():
+            with open(best_path, 'rb') as f:
+                self.model = pickle.load(f)
+                self.best_model = self.model  # Set as best
+            logger.info(f"✅ Loaded BEST GBM model from {best_path}")
+        else:
+            logger.warning(f"⚠️ Best model not found at {best_path}, loading final model")
+            self.load(path)
 
 def create_temperature_stratified_sampler(y_train):
     """
@@ -317,8 +382,99 @@ def create_temperature_stratified_sampler(y_train):
         replacement=True
     )
 
+class CheckpointManager:
+    """Manages multiple best checkpoints for different metrics"""
+    
+    def __init__(self, save_dir: Path, metrics: list = ['r2', 'rmse', 'mae']):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics = metrics
+        
+        # Track best score for each metric
+        self.best_scores = {
+            m: (float('-inf') if m == 'r2' else float('inf')) 
+            for m in metrics
+        }
+        
+        logger.info(f"CheckpointManager: tracking {metrics}")
+    
+    def save(self, model, optimizer, scheduler, epoch, metrics_dict):
+        """Save checkpoint if it's best for any metric"""
+        saved_any = False
+        
+        for metric_name in self.metrics:
+            if metric_name not in metrics_dict:
+                continue
+            
+            current_value = metrics_dict[metric_name]
+            
+            # Check if this is better
+            is_better = (
+                current_value > self.best_scores[metric_name] 
+                if metric_name == 'r2' 
+                else current_value < self.best_scores[metric_name]
+            )
+            
+            if is_better:
+                self.best_scores[metric_name] = current_value
+                
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'metrics': metrics_dict
+                }
+                
+                save_path = self.save_dir / f"best_{metric_name}.pth"
+                torch.save(checkpoint, save_path)
+                
+                logger.info(f"  💾 New best {metric_name.upper()}: {current_value:.4f} (epoch {epoch+1})")
+                saved_any = True
+        
+        # Always save latest
+        latest_checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'metrics': metrics_dict
+        }
+        torch.save(latest_checkpoint, self.save_dir / "checkpoint_latest.pth")
+        
+        return saved_any
+    
+    def load_best(self, model, metric='r2', device='cpu'):
+        """Load best model for given metric"""
+        checkpoint_path = self.save_dir / f"best_{metric}.pth"
+        
+        if checkpoint_path.exists():
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=device,
+                weights_only=False
+            )
+            model.load_state_dict(checkpoint['model_state_dict'])
+            logger.info(f"✅ Loaded best {metric} CNN model from epoch {checkpoint['epoch']+1}")
+            logger.info(f"  Metrics: {checkpoint['metrics']}")
+            return checkpoint
+        else:
+            logger.warning(f"⚠️ No checkpoint found for {metric}")
+            return None
+    
+    def get_summary(self):
+        """Get summary of best scores"""
+        summary = "\n" + "="*70 + "\n"
+        summary += "BEST CHECKPOINTS SUMMARY\n"
+        summary += "="*70 + "\n"
+        for metric, score in self.best_scores.items():
+            if score != float('inf') and score != float('-inf'):
+                summary += f"  {metric.upper()}: {score:.4f}\n"
+        summary += "="*70
+        return summary
+
 class EnsembleTrainer:
-    """Ensemble trainer combining CNN and GBM"""
+    """Ensemble trainer combining CNN and GBM - Uses BEST models"""
     
     def __init__(self, cnn_model, device, config=TRAINING_CONFIG):
         self.cnn_model = cnn_model.to(device)
@@ -326,12 +482,8 @@ class EnsembleTrainer:
         self.config = config
         
         # CNN components
-        from models import VarianceAwareLoss
-        self.criterion = VarianceAwareLoss(
-            mse_weight=0.7,      # Main loss
-            var_weight=0.2,      # Variance preservation
-            spatial_weight=0.1   # Spatial smoothness
-        )
+        from models import ProgressiveLSTLoss
+        self.criterion = ProgressiveLSTLoss()
         
         if config["optimizer"] == "adamw":
             self.optimizer = optim.AdamW(
@@ -355,6 +507,12 @@ class EnsembleTrainer:
         # Ensemble weights from config
         self.ensemble_weights = ENSEMBLE_WEIGHTS
         
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager(
+            save_dir=MODEL_DIR / "checkpoints",
+            metrics=['r2', 'rmse', 'mae']
+        )
+
         # History
         self.history = {
             "train_loss": [],
@@ -467,9 +625,9 @@ class EnsembleTrainer:
         self.gbm_trainer.train(X_train_gbm, y_train_gbm, X_val_gbm, y_val_gbm)
         self.gbm_trained = True
         
-        # Evaluate
-        train_preds = self.gbm_trainer.predict(X_train_gbm)
-        val_preds = self.gbm_trainer.predict(X_val_gbm)
+        # Evaluate using BEST model
+        train_preds = self.gbm_trainer.predict(X_train_gbm, use_best=True)
+        val_preds = self.gbm_trainer.predict(X_val_gbm, use_best=True)
         
         train_metrics = self._calculate_metrics(train_preds, y_train_gbm, "GBM Train")
         val_metrics = self._calculate_metrics(val_preds, y_val_gbm, "GBM Val")
@@ -558,21 +716,37 @@ class EnsembleTrainer:
     
     def evaluate_ensemble(self, val_loader, X_val, y_val):
         """
-        Evaluate ensemble of CNN + GBM with improved strategy
+        Evaluate ensemble with BEST models (MODIFIED)
         """
         logger.info("\n" + "="*60)
-        logger.info("EVALUATING ENSEMBLE PREDICTIONS")
+        logger.info("EVALUATING ENSEMBLE PREDICTIONS (USING BEST MODELS)")
         logger.info("="*60)
         
-        # Get CNN predictions
+        # ADDED: Load best CNN checkpoint before evaluation
+        logger.info("Loading best CNN model for ensemble...")
+        best_checkpoint = self.checkpoint_manager.load_best(
+            self.cnn_model, 
+            metric='r2', 
+            device=self.device
+        )
+        
+        if best_checkpoint is None:
+            logger.warning("⚠️ Could not load best CNN, using current model state")
+        else:
+            logger.info(f"✅ Using CNN from epoch {best_checkpoint['epoch']+1} (best R²)")
+        
+        # Get CNN predictions (now using best model)
         _, cnn_metrics, cnn_preds_list = self.evaluate_cnn(val_loader)
         cnn_preds = np.concatenate(cnn_preds_list, axis=0)
         cnn_preds_patch = cnn_preds.reshape(cnn_preds.shape[0], -1).mean(axis=1)
         
-        # Get GBM predictions
+        # Get GBM predictions (using best model)
         if self.gbm_trained:
             X_val_gbm, y_val_gbm = prepare_gbm_features(X_val, y_val)
-            gbm_preds = self.gbm_trainer.predict(X_val_gbm)
+            
+            # MODIFIED: Explicitly use best GBM model
+            logger.info("Using best GBM model for ensemble...")
+            gbm_preds = self.gbm_trainer.predict(X_val_gbm, use_best=True)
             gbm_metrics = self._calculate_metrics(gbm_preds, y_val_gbm, "GBM")
             
             # CRITICAL FIX 1: Analyze prediction scales
@@ -635,8 +809,8 @@ class EnsembleTrainer:
             logger.info("="*60)
             logger.info(f"{'Strategy':<25} {'R²':<10} {'RMSE (°C)':<12} {'MAE (°C)':<12}")
             logger.info("-"*60)
-            logger.info(f"{'CNN Only':<25} {cnn_metrics['r2']:<10.4f} {cnn_metrics['rmse']:<12.4f} {cnn_metrics['mae']:<12.4f}")
-            logger.info(f"{'GBM Only':<25} {gbm_metrics['r2']:<10.4f} {gbm_metrics['rmse']:<12.4f} {gbm_metrics['mae']:<12.4f}")
+            logger.info(f"{'CNN Only (BEST)':<25} {cnn_metrics['r2']:<10.4f} {cnn_metrics['rmse']:<12.4f} {cnn_metrics['mae']:<12.4f}")
+            logger.info(f"{'GBM Only (BEST)':<25} {gbm_metrics['r2']:<10.4f} {gbm_metrics['rmse']:<12.4f} {gbm_metrics['mae']:<12.4f}")
             logger.info("-"*60)
             logger.info(f"{'Fixed Weights':<25} {fixed_metrics['r2']:<10.4f} {fixed_metrics['rmse']:<12.4f} {fixed_metrics['mae']:<12.4f}")
             logger.info(f"{'Optimal + Normalized':<25} {ensemble_metrics_normalized['r2']:<10.4f} {ensemble_metrics_normalized['rmse']:<12.4f} {ensemble_metrics_normalized['mae']:<12.4f}")
@@ -644,8 +818,8 @@ class EnsembleTrainer:
             
             # Determine best approach
             all_results = [
-                ("CNN Only", cnn_metrics),
-                ("GBM Only", gbm_metrics),
+                ("CNN Only (BEST)", cnn_metrics),
+                ("GBM Only (BEST)", gbm_metrics),
                 ("Fixed Ensemble", fixed_metrics),
                 ("Optimal Ensemble", ensemble_metrics_normalized)
             ]
@@ -661,12 +835,12 @@ class EnsembleTrainer:
                 logger.info(f"   Weights: CNN={optimal_weights['cnn']:.3f}, GBM={optimal_weights['gbm']:.3f}")
                 self.ensemble_weights = optimal_weights
                 final_metrics = ensemble_metrics_normalized
-            elif best_name == "GBM Only":
+            elif best_name == "GBM Only (BEST)":
                 logger.warning("\n⚠️ GBM alone performs best - ensemble doesn't help")
                 logger.warning("   Consider using GBM only or improving CNN performance")
                 self.ensemble_weights = {"cnn": 0.0, "gbm": 1.0}
                 final_metrics = gbm_metrics
-            elif best_name == "CNN Only":
+            elif best_name == "CNN Only (BEST)":
                 logger.warning("\n⚠️ CNN alone performs best - GBM doesn't help")
                 self.ensemble_weights = {"cnn": 1.0, "gbm": 0.0}
                 final_metrics = cnn_metrics
@@ -683,7 +857,7 @@ class EnsembleTrainer:
             elif improvement < -1:
                 logger.warning(f"\n⚠️ Ensemble is {abs(improvement):.2f}% worse than best individual model")
             else:
-                logger.info(f"\n➡️  Ensemble performance similar to best individual model")
+                logger.info(f"\n➡️ Ensemble performance similar to best individual model")
             
             logger.info("="*60)
             
@@ -730,7 +904,7 @@ class EnsembleTrainer:
         return {"r2": r2, "rmse": rmse, "mae": mae, "mbe": mbe}
     
     def train(self, train_loader, val_loader, X_train, y_train, X_val, y_val, save_dir: Path):
-        """Full training loop for ensemble"""
+        """Full training loop for ensemble - Uses BEST models"""
         logger.info(f"Starting ensemble training for {self.config['epochs']} epochs")
         logger.info(f"CNN parameters: {count_parameters(self.cnn_model):,}")
         
@@ -748,6 +922,9 @@ class EnsembleTrainer:
         
         for epoch in range(self.config["epochs"]):
             logger.info(f"\nEpoch {epoch + 1}/{self.config['epochs']}")
+
+            # Update progressive loss weights
+            self.criterion.set_training_progress(epoch, self.config["epochs"])
             
             # Train CNN
             train_loss, train_components = self.train_cnn_epoch(train_loader)
@@ -778,6 +955,15 @@ class EnsembleTrainer:
             self.history["cnn_metrics"].append(cnn_metrics)
             self.history["lr"].append(current_lr)
             
+            # Save checkpoint if best
+            self.checkpoint_manager.save(
+                model=self.cnn_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                epoch=epoch,
+                metrics_dict=cnn_metrics
+            )
+            
             # Early stopping based on CNN validation loss
             if self.early_stopping(val_loss, self.cnn_model):
                 logger.info(f"Early stopping triggered at epoch {epoch + 1}")
@@ -786,7 +972,31 @@ class EnsembleTrainer:
         # Diagnose CNN issues
         self.diagnose_cnn_issues()
         
-        # Final ensemble evaluation with improved method
+        # ADDED: Load best models before final ensemble evaluation
+        logger.info("\n" + "="*60)
+        logger.info("LOADING BEST MODELS FOR FINAL ENSEMBLE")
+        logger.info("="*60)
+        
+        # Load best CNN checkpoint
+        logger.info("Loading best CNN checkpoint...")
+        best_cnn_checkpoint = self.checkpoint_manager.load_best(
+            self.cnn_model, 
+            metric='r2', 
+            device=self.device
+        )
+        
+        if best_cnn_checkpoint:
+            logger.info(f"✅ Loaded best CNN from epoch {best_cnn_checkpoint['epoch']+1}")
+            logger.info(f"   R²: {best_cnn_checkpoint['metrics']['r2']:.4f}")
+        else:
+            logger.warning("⚠️ Using final CNN state (no best checkpoint found)")
+        
+        # GBM best model is already tracked in self.gbm_trainer.best_model
+        logger.info(f"✅ Using best GBM model (RMSE: {self.gbm_trainer.best_score:.4f})")
+        
+        logger.info("="*60)
+        
+        # Final ensemble evaluation with BEST models
         ensemble_metrics = self.evaluate_ensemble(val_loader, X_val, y_val)
         self.history["ensemble_metrics"] = ensemble_metrics
         
@@ -794,7 +1004,8 @@ class EnsembleTrainer:
         self._save_final_models(save_dir)
         self._save_history(save_dir)
         
-        logger.info("\nEnsemble training complete!")
+        logger.info(self.checkpoint_manager.get_summary())
+        logger.info("\n✅ Ensemble training complete!")
         return self.history
     
     def _save_checkpoint(self, save_dir, epoch, loss, metrics):
@@ -814,29 +1025,31 @@ class EnsembleTrainer:
         logger.info(f"Saved checkpoint: {path}")
     
     def _save_final_models(self, save_dir):
-        """Save final models"""
-        # Save CNN
-        if self.early_stopping.best_model is not None:
-            torch.save(self.early_stopping.best_model, save_dir / "best_cnn.pth")
-            logger.info("Saved best CNN model")
+        """Save best and final models (MODIFIED)"""
+        # Best CNN is already saved by checkpoint manager
+        logger.info("✅ Best CNN model already saved by CheckpointManager")
         
+        # Save current CNN state as final (for comparison)
         torch.save(self.cnn_model.state_dict(), save_dir / "final_cnn.pth")
-        logger.info("Saved final CNN model")
+        logger.info("Saved current CNN state as final_cnn.pth")
         
-        # Save GBM
+        # Save GBM (now saves both best and final)
         if self.gbm_trained:
             self.gbm_trainer.save(save_dir / "gbm_model.pkl")
         
-        # Save ensemble config
+        # MODIFIED: Update ensemble config to reference BEST models
         ensemble_config = {
             "weights": self.ensemble_weights,
-            "cnn_path": "final_cnn.pth",
-            "gbm_path": "gbm_model.pkl" if self.gbm_trained else None
+            "cnn_path": "checkpoints/best_r2.pth",  # CHANGED: Reference best checkpoint
+            "gbm_path": "best_gbm_model.pkl" if self.gbm_trained else None,  # CHANGED
+            "note": "Ensemble uses BEST models based on validation performance",
+            "best_cnn_metric": "r2",
+            "best_gbm_metric": "rmse"
         }
         
         with open(save_dir / "ensemble_config.json", "w") as f:
             json.dump(ensemble_config, f, indent=2)
-        logger.info("Saved ensemble configuration")
+        logger.info("💾 Saved ensemble configuration (referencing BEST models)")
     
     def _save_history(self, save_dir):
         """Save training history"""
@@ -976,9 +1189,9 @@ def load_data(split: str) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def main():
-    """Main training script with ensemble"""
+    """Main training script with ensemble - BEST MODELS VERSION"""
     logger.info("="*60)
-    logger.info("URBAN HEAT ISLAND - ENSEMBLE TRAINING (IMPROVED)")
+    logger.info("URBAN HEAT ISLAND - ENSEMBLE TRAINING (BEST MODELS)")
     logger.info("="*60)
     
     device = torch.device("cuda" if torch.cuda.is_available() and COMPUTE_CONFIG["use_gpu"] else "cpu")
@@ -1035,8 +1248,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=TRAINING_CONFIG["batch_size"],
-        sampler=sampler,  # CHANGED: use sampler instead of shuffle
-        # shuffle=True,   # REMOVED: don't use shuffle with sampler
+        sampler=sampler,
         num_workers=COMPUTE_CONFIG["num_workers"],
         pin_memory=COMPUTE_CONFIG["pin_memory"]
     )
@@ -1059,6 +1271,7 @@ def main():
     logger.info("\nInitializing ensemble trainer...")
     ensemble_trainer = EnsembleTrainer(cnn_model, device)
     logger.info(f"Initial ensemble weights: CNN={ENSEMBLE_WEIGHTS['cnn']}, GBM={ENSEMBLE_WEIGHTS['gbm']}")
+    logger.info("Note: Weights will be optimized based on BEST model performance")
     
     # Train ensemble
     logger.info("\n" + "="*60)
@@ -1084,15 +1297,16 @@ def main():
     # Print final metrics
     if "ensemble_metrics" in history and history["ensemble_metrics"]:
         final_metrics = history["ensemble_metrics"]
-        logger.info("\nFINAL ENSEMBLE METRICS (Denormalized to °C):")
+        logger.info("\nFINAL ENSEMBLE METRICS (Using BEST Models, Denormalized to °C):")
         logger.info(f"  R² Score: {final_metrics['r2']:.4f} (target: ≥ {VALIDATION_CONFIG['targets']['r2']})")
         logger.info(f"  RMSE: {final_metrics['rmse']:.4f}°C (target: ≤ {VALIDATION_CONFIG['targets']['rmse']}°C)")
         logger.info(f"  MAE: {final_metrics['mae']:.4f}°C (target: ≤ {VALIDATION_CONFIG['targets']['mae']}°C)")
         logger.info(f"  MBE: {final_metrics['mbe']:.4f}°C")
         
-        logger.info("\nNote: Metrics are calculated in DENORMALIZED space (actual °C)")
-        logger.info("      Model trains on normalized data (mean≈0, std≈1)")
-        logger.info("      Predictions are denormalized before computing metrics")
+        logger.info("\nNote: Metrics calculated using BEST validation models:")
+        logger.info("      - CNN: Best R² checkpoint from training")
+        logger.info("      - GBM: Best RMSE iteration")
+        logger.info("      - Predictions denormalized before computing metrics")
         
         # Check if targets met
         targets_met = (
@@ -1112,7 +1326,7 @@ def main():
     if history["cnn_metrics"]:
         cnn_final = history["cnn_metrics"][-1]
         logger.info("\nMODEL COMPARISON:")
-        logger.info(f"  CNN Only - R²: {cnn_final['r2']:.4f}, RMSE: {cnn_final['rmse']:.4f}°C")
+        logger.info(f"  CNN Best - R²: {cnn_final['r2']:.4f}, RMSE: {cnn_final['rmse']:.4f}°C")
         if "ensemble_metrics" in history and history["ensemble_metrics"]:
             ens_final = history["ensemble_metrics"]
             logger.info(f"  Ensemble - R²: {ens_final['r2']:.4f}, RMSE: {ens_final['rmse']:.4f}°C")
@@ -1122,7 +1336,7 @@ def main():
                 logger.info(f"  Improvement: {improvement:+.2f}%")
         
         # Print final weights
-        logger.info(f"\nFinal Ensemble Weights:")
+        logger.info(f"\nFinal Ensemble Weights (Optimized):")
         logger.info(f"  CNN: {ensemble_trainer.ensemble_weights['cnn']:.4f}")
         logger.info(f"  GBM: {ensemble_trainer.ensemble_weights['gbm']:.4f}")
         

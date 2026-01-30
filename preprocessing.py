@@ -1173,11 +1173,11 @@ def main():
         patches = dataset_creator.extract_patches(
             fused_data,
             patch_size=64,
-            stride=48,
-            min_valid_ratio=0.7,
-            min_variance=1.0,  # Increased from 0.3 for better quality
-            min_temp=20.0,     # Realistic for Jakarta
-            max_temp=50.0      # Realistic for urban surfaces in Jakarta
+            stride=24,  # CHANGED: 75% overlap → 3x more patches
+            min_valid_ratio=0.8,  # CHANGED: Higher quality
+            min_variance=0.3,  # CHANGED: Accept more variation
+            min_temp=22.0,
+            max_temp=48.0
         )
         
         for patch in patches:

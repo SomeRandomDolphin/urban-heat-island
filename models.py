@@ -138,6 +138,109 @@ class UNet(nn.Module):
         x = self.output(x)
         return x
 
+class ProgressiveLSTLoss(nn.Module):
+    """
+    Loss function that adapts during training
+    Early: Focus on MSE
+    Middle: Add spatial smoothness
+    Late: Add all constraints
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Initial weights (MSE focus)
+        self.mse_weight = 1.0
+        self.variance_weight = 0.2
+        self.bias_weight = 0.1
+        self.spatial_weight = 0.0
+        self.physical_weight = 0.0
+        
+        self.current_epoch = 0
+        self.total_epochs = 200
+        
+        logger.info("ProgressiveLSTLoss initialized")
+    
+    def set_training_progress(self, epoch: int, total_epochs: int):
+        """Update loss weights based on training progress"""
+        self.current_epoch = epoch
+        self.total_epochs = total_epochs
+        progress = epoch / total_epochs
+        
+        if progress < 0.3:
+            # Phase 1: MSE focus (0-30% of training)
+            self.mse_weight = 1.0
+            self.variance_weight = 0.2
+            self.bias_weight = 0.1
+            self.spatial_weight = 0.0
+            self.physical_weight = 0.0
+            phase = "WARMUP"
+            
+        elif progress < 0.7:
+            # Phase 2: Add spatial (30-70% of training)
+            self.mse_weight = 0.8
+            self.variance_weight = 0.3
+            self.bias_weight = 0.2
+            self.spatial_weight = 0.1
+            self.physical_weight = 0.05
+            phase = "REFINEMENT"
+            
+        else:
+            # Phase 3: Full complexity (70-100% of training)
+            self.mse_weight = 0.7
+            self.variance_weight = 0.3
+            self.bias_weight = 0.2
+            self.spatial_weight = 0.15
+            self.physical_weight = 0.1
+            phase = "FINE-TUNING"
+        
+        if epoch == 0 or (progress * 100) % 10 < (1.0 / total_epochs * 100):
+            logger.info(f"Loss phase: {phase} (progress: {progress*100:.1f}%)")
+    
+    def forward(self, pred, target, features=None):
+        """Calculate progressive loss"""
+        components = {}
+        
+        # 1. MSE
+        mse = F.mse_loss(pred, target)
+        components['mse'] = mse.item()
+        
+        # 2. Variance preservation
+        pred_var = torch.var(pred)
+        target_var = torch.var(target)
+        var_loss = (pred_var - target_var) ** 2
+        components['variance'] = var_loss.item()
+        
+        # 3. Bias penalty
+        bias_loss = (pred.mean() - target.mean()) ** 2
+        components['bias'] = bias_loss.item()
+        
+        # 4. Spatial smoothness (only if weight > 0)
+        spatial_loss = torch.tensor(0.0, device=pred.device)
+        if self.spatial_weight > 0 and pred.shape[2] > 1 and pred.shape[3] > 1:
+            dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+            dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+            spatial_loss = torch.mean(dx**2) + torch.mean(dy**2)
+        components['spatial'] = spatial_loss.item()
+        
+        # 5. Physical constraints (only if weight > 0)
+        physical_loss = torch.tensor(0.0, device=pred.device)
+        if self.physical_weight > 0:
+            # Penalize extreme values (in normalized space: ±3 is ~3 std)
+            min_norm, max_norm = -3.0, 3.0
+            penalty = torch.relu(min_norm - pred) + torch.relu(pred - max_norm)
+            physical_loss = penalty.mean()
+        components['physical'] = physical_loss.item()
+        
+        # Total loss
+        total = (
+            self.mse_weight * mse +
+            self.variance_weight * var_loss +
+            self.bias_weight * bias_loss +
+            self.spatial_weight * spatial_loss +
+            self.physical_weight * physical_loss
+        )
+        
+        return total, components
 
 class LSTLoss(nn.Module):
     """

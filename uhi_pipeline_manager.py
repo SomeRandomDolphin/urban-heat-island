@@ -507,24 +507,24 @@ def main():
     except Exception as e:
         logger.error(f"❌ GeoTIFF export failed: {e}")
     
-    # # Create Web Map
-    # if args.create_webmap:
-    #     logger.info("\n" + "="*70)
-    #     logger.info("CREATING WEB MAP")
-    #     logger.info("="*70)
+    # Create Web Map
+    if args.create_webmap:
+        logger.info("\n" + "="*70)
+        logger.info("CREATING WEB MAP")
+        logger.info("="*70)
         
-    #     try:
-    #         from uhi_map_overlay import RealMapOverlay
+        try:
+            from uhi_map_overlay import RealMapOverlay
             
-    #         overlay = RealMapOverlay(bounds)
-    #         webmap_dir = output_dir / "webmap"
-    #         overlay.export_to_webmap(lst_processed, uhi_map, hotspots_df, webmap_dir)
+            overlay = RealMapOverlay(bounds)
+            webmap_dir = output_dir / "webmap"
+            overlay.export_to_webmap(lst_processed, uhi_map, hotspots_df, webmap_dir)
             
-    #         logger.info(f"✓ Web map created: {webmap_dir / 'index.html'}")
-    #         logger.info("🌐 Open the HTML file in your browser to view!")
+            logger.info(f"✓ Web map created: {webmap_dir / 'index.html'}")
+            logger.info("🌐 Open the HTML file in your browser to view!")
             
-    #     except Exception as e:
-    #         logger.error(f"❌ Web map creation failed: {e}")
+        except Exception as e:
+            logger.error(f"❌ Web map creation failed: {e}")
     
     # Final Summary
     logger.info("\n" + "="*70)

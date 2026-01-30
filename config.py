@@ -188,37 +188,37 @@ ENSEMBLE_WEIGHTS = {
 # TRAINING CONFIGURATION - FIXED
 # ============================================================================
 TRAINING_CONFIG = {
-    # Data loading
-    "batch_size": 16,  # REDUCED from 32 - allows better gradient estimates
+    # Batch size
+    "batch_size": 12,  # CHANGED: Smaller batches for better gradients
     
     # Training duration
-    "epochs": 150,  # Reasonable middle ground
+    "epochs": 200,  # CHANGED: More epochs (we have early stopping)
     
-    # Learning rate - CRITICAL CHANGES
-    "initial_lr": 0.001,  # DOUBLED from 0.0005 - faster convergence
+    # Learning rate
+    "initial_lr": 0.0015,  # CHANGED: Slightly increased
     "min_lr": 5e-7,
-    "warmup_epochs": 15,  # INCREASED - gradual warmup helps
+    "warmup_epochs": 20,  # CHANGED: Longer warmup
     
     # Early stopping
-    "patience": 30,  # INCREASED - give model more time
-    "min_delta": 0.0005,  # Smaller threshold for improvement
+    "patience": 40,  # CHANGED: More patience
+    "min_delta": 0.0003,  # CHANGED: Smaller threshold
     
     # Optimizer
     "optimizer": "adamw",
-    "weight_decay": 0.00001,  # Keep regularization
+    "weight_decay": 0.00001,
     
-    # Loss function - SIMPLIFIED
+    # Loss weights (will be adjusted during training)
     "loss_weights": {
-        "mse": 1.0,         # Pure MSE focus
-        "spatial": 0.0,     # DISABLED initially
-        "physical": 0.0,    # DISABLED initially
-        "variance": 0.3,    # IMPORTANT: prevent flat predictions
-        "bias": 0.2         # IMPORTANT: prevent systematic errors
+        "mse": 1.0,
+        "spatial": 0.0,  # Start at 0, increase later
+        "physical": 0.0,  # Start at 0, increase later
+        "variance": 0.3,
+        "bias": 0.2
     },
     
     # Gradient control
-    "gradient_clip": 0.5,  # REDUCED from 1.0 - tighter control
-    "accumulation_steps": 2,  # NEW: simulate larger batch size
+    "gradient_clip": 0.3,  # CHANGED: Tighter control
+    "min_delta": 0.0003
 }
 
 # Data augmentation
