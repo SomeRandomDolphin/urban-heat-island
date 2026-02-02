@@ -421,6 +421,255 @@ class EnsemblePredictor:
         logger.info(f"    Epistemic uncertainty: {epistemic_uncertainty.mean():.3f}°C")
         
         return epistemic_uncertainty
+    
+    def _apply_tta_augmentation(self, X: np.ndarray, aug_idx: int) -> np.ndarray:
+        """
+        Apply test-time augmentation
+        
+        Args:
+            X: Input array (N, H, W, C)
+            aug_idx: Augmentation index (determines which augmentation to apply)
+            
+        Returns:
+            Augmented array
+        """
+        X_aug = X.copy()
+        
+        # Define 8 augmentation combinations
+        # 0: No augmentation (original)
+        # 1: Horizontal flip
+        # 2: Vertical flip
+        # 3: Both flips
+        # 4: Rotate 90°
+        # 5: Rotate 180°
+        # 6: Rotate 270°
+        # 7: Transpose
+        
+        if aug_idx == 0:
+            return X_aug
+        
+        elif aug_idx == 1:
+            # Horizontal flip
+            X_aug = np.flip(X_aug, axis=2)
+        
+        elif aug_idx == 2:
+            # Vertical flip
+            X_aug = np.flip(X_aug, axis=1)
+        
+        elif aug_idx == 3:
+            # Both flips
+            X_aug = np.flip(X_aug, axis=2)
+            X_aug = np.flip(X_aug, axis=1)
+        
+        elif aug_idx == 4:
+            # Rotate 90° clockwise
+            X_aug = np.rot90(X_aug, k=-1, axes=(1, 2))
+        
+        elif aug_idx == 5:
+            # Rotate 180°
+            X_aug = np.rot90(X_aug, k=2, axes=(1, 2))
+        
+        elif aug_idx == 6:
+            # Rotate 270° clockwise (90° counter-clockwise)
+            X_aug = np.rot90(X_aug, k=1, axes=(1, 2))
+        
+        elif aug_idx == 7:
+            # Transpose
+            X_aug = np.transpose(X_aug, (0, 2, 1, 3))
+        
+        return X_aug.copy()
+    
+    def _reverse_tta_augmentation(self, preds: np.ndarray, aug_idx: int) -> np.ndarray:
+        """
+        Reverse augmentation applied to predictions
+        
+        Args:
+            preds: Predictions (N, H, W) or (N,)
+            aug_idx: Augmentation index
+            
+        Returns:
+            Predictions with augmentation reversed
+        """
+        if aug_idx == 0:
+            return preds
+        
+        # Only reverse if predictions are spatial (3D)
+        if preds.ndim == 3:
+            if aug_idx == 1:
+                preds = np.flip(preds, axis=2)
+            elif aug_idx == 2:
+                preds = np.flip(preds, axis=1)
+            elif aug_idx == 3:
+                preds = np.flip(preds, axis=2)
+                preds = np.flip(preds, axis=1)
+            elif aug_idx == 4:
+                preds = np.rot90(preds, k=1, axes=(1, 2))
+            elif aug_idx == 5:
+                preds = np.rot90(preds, k=2, axes=(1, 2))
+            elif aug_idx == 6:
+                preds = np.rot90(preds, k=-1, axes=(1, 2))
+            elif aug_idx == 7:
+                preds = np.transpose(preds, (0, 2, 1))
+        
+        return preds.copy()
+    
+    def predict_ensemble_with_tta(self, X: np.ndarray, 
+                                  batch_size: int = 8,
+                                  n_augmentations: int = 8,
+                                  return_uncertainty: bool = True,
+                                  use_spatial_ensemble: bool = True) -> Dict[str, np.ndarray]:
+        """
+        Make ensemble predictions with Test-Time Augmentation
+        
+        Args:
+            X: NORMALIZED input features (N, H, W, C)
+            batch_size: Batch size for inference
+            n_augmentations: Number of augmented predictions to average
+            return_uncertainty: Whether to compute uncertainty
+            use_spatial_ensemble: Use spatial-level ensemble
+            
+        Returns:
+            Dictionary with ensemble predictions and TTA uncertainty
+        """
+        logger.info("\n" + "="*70)
+        logger.info(f"ENSEMBLE PREDICTION WITH TTA ({n_augmentations} augmentations)")
+        logger.info("="*70)
+        
+        # Validate input
+        if not self.validate_input(X):
+            logger.warning("⚠️ Input validation failed, but continuing...")
+        
+        # Store predictions from all augmentations
+        cnn_preds_spatial_tta = []
+        cnn_preds_patch_tta = []
+        gbm_preds_tta = []
+        
+        for aug_idx in tqdm(range(n_augmentations), desc="TTA iterations"):
+            # Apply augmentation
+            X_aug = self._apply_tta_augmentation(X, aug_idx)
+            
+            # Get predictions (in NORMALIZED space)
+            cnn_preds_norm = self._predict_cnn_normalized(X_aug, batch_size)
+            gbm_preds_norm = self._predict_gbm_normalized(X_aug)
+            
+            # Reverse augmentation for spatial predictions
+            cnn_preds_norm = self._reverse_tta_augmentation(cnn_preds_norm, aug_idx)
+            
+            # Calculate patch-level average
+            cnn_preds_patch_norm = cnn_preds_norm.reshape(
+                cnn_preds_norm.shape[0], -1
+            ).mean(axis=1)
+            
+            cnn_preds_spatial_tta.append(cnn_preds_norm)
+            cnn_preds_patch_tta.append(cnn_preds_patch_norm)
+            gbm_preds_tta.append(gbm_preds_norm)
+        
+        # Average predictions across augmentations (STILL NORMALIZED)
+        cnn_preds_spatial_norm = np.mean(cnn_preds_spatial_tta, axis=0)
+        cnn_preds_patch_norm = np.mean(cnn_preds_patch_tta, axis=0)
+        gbm_preds_norm = np.mean(gbm_preds_tta, axis=0)
+        
+        # Calculate TTA uncertainty (std across augmentations)
+        cnn_tta_uncertainty = np.std(cnn_preds_spatial_tta, axis=0)
+        
+        logger.info(f"\n📊 TTA Statistics (NORMALIZED space):")
+        logger.info(f"  CNN spatial: mean={cnn_preds_spatial_norm.mean():.4f}, "
+                   f"TTA std={cnn_tta_uncertainty.mean():.4f}")
+        logger.info(f"  CNN patch: mean={cnn_preds_patch_norm.mean():.4f}")
+        logger.info(f"  GBM: mean={gbm_preds_norm.mean():.4f}")
+        
+        # Ensemble in NORMALIZED space
+        if use_spatial_ensemble and self.weights["cnn"] > 0:
+            logger.info("\n🔧 Using SPATIAL ensemble with TTA")
+            
+            # Broadcast GBM to spatial dimensions
+            gbm_spatial_norm = np.zeros_like(cnn_preds_spatial_norm)
+            for i in range(len(gbm_preds_norm)):
+                gbm_spatial_norm[i] = gbm_preds_norm[i]
+            
+            # Weighted combination
+            ensemble_preds_norm = (
+                self.weights["cnn"] * cnn_preds_spatial_norm +
+                self.weights["gbm"] * gbm_spatial_norm
+            )
+            
+            ensemble_preds_patch_norm = ensemble_preds_norm.reshape(
+                ensemble_preds_norm.shape[0], -1
+            ).mean(axis=1)
+            
+        else:
+            logger.info("\n🔧 Using PATCH-LEVEL ensemble with TTA")
+            
+            ensemble_preds_patch_norm = (
+                self.weights["cnn"] * cnn_preds_patch_norm +
+                self.weights["gbm"] * gbm_preds_norm
+            )
+            
+            ensemble_preds_norm = np.zeros_like(cnn_preds_spatial_norm)
+            for i in range(len(ensemble_preds_patch_norm)):
+                ensemble_preds_norm[i] = ensemble_preds_patch_norm[i]
+        
+        # DENORMALIZE to Celsius
+        logger.info("\n🔄 Denormalizing predictions to Celsius...")
+        
+        cnn_preds = self.normalizer.denormalize_predictions(
+            cnn_preds_spatial_norm, "target"
+        )
+        gbm_preds = self.normalizer.denormalize_predictions(
+            gbm_preds_norm, "target"
+        )
+        ensemble_preds = self.normalizer.denormalize_predictions(
+            ensemble_preds_norm, "target"
+        )
+        cnn_preds_patch = self.normalizer.denormalize_predictions(
+            cnn_preds_patch_norm, "target"
+        )
+        ensemble_preds_patch = self.normalizer.denormalize_predictions(
+            ensemble_preds_patch_norm, "target"
+        )
+        
+        # Denormalize TTA uncertainty
+        # Uncertainty is in terms of std, so only multiply by target_std
+        tta_uncertainty = cnn_tta_uncertainty * self.normalizer.stats['target']['std']
+        
+        logger.info(f"\n📈 Final Ensemble Statistics (CELSIUS):")
+        logger.info(f"  Mean: {ensemble_preds.mean():.2f}°C")
+        logger.info(f"  Std: {ensemble_preds.std():.2f}°C")
+        logger.info(f"  Range: [{ensemble_preds.min():.2f}, {ensemble_preds.max():.2f}]°C")
+        logger.info(f"  TTA Uncertainty: {tta_uncertainty.mean():.2f}°C")
+        
+        results = {
+            "ensemble": ensemble_preds,
+            "cnn": cnn_preds,
+            "gbm": gbm_preds,
+            "ensemble_patch": ensemble_preds_patch,
+            "cnn_patch": cnn_preds_patch,
+            "tta_uncertainty": tta_uncertainty
+        }
+        
+        # Optional: MC Dropout uncertainty (in addition to TTA)
+        if return_uncertainty:
+            logger.info("\n🎲 Computing MC Dropout uncertainty (in addition to TTA)...")
+            mc_uncertainty = self._compute_mc_dropout_uncertainty(
+                X, n_samples=30, batch_size=batch_size
+            )
+            results["mc_uncertainty"] = mc_uncertainty
+            
+            # Combined uncertainty (TTA + MC Dropout)
+            # Use root sum of squares
+            combined_uncertainty = np.sqrt(
+                tta_uncertainty**2 + mc_uncertainty**2
+            )
+            results["combined_uncertainty"] = combined_uncertainty
+            
+            logger.info(f"  TTA uncertainty: {tta_uncertainty.mean():.2f}°C")
+            logger.info(f"  MC uncertainty: {mc_uncertainty.mean():.2f}°C")
+            logger.info(f"  Combined uncertainty: {combined_uncertainty.mean():.2f}°C")
+        
+        logger.info(f"\n✅ TTA ensemble predictions complete")
+        logger.info("="*70 + "\n")
+        
+        return results
 
 
 class PostProcessor:

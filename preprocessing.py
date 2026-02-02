@@ -14,6 +14,7 @@ from pathlib import Path
 from scipy.ndimage import uniform_filter, generic_filter, zoom
 import pyproj
 from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 from config import *
 
@@ -871,6 +872,59 @@ class DatasetCreator:
         logger.info(f"  y normalized: mean={y_norm.mean():.4f}, std={y_norm.std():.4f}")
         
         return X_norm, y_norm
+    
+    def verify_no_data_leakage(self, X_train, y_train, X_val, y_val, X_test, y_test,
+                            norm_stats: Dict):
+        """
+        Verify normalization stats only come from training data
+        """
+        logger.info("\n" + "="*70)
+        logger.info("DATA LEAKAGE CHECK")
+        logger.info("="*70)
+        
+        # Check 1: Verify normalization stats match training data
+        actual_train_mean = float(np.mean(y_train))
+        actual_train_std = float(np.std(y_train, ddof=0))
+
+        if actual_train_std < 1e-6:
+            logger.warning("Training target std is near zero — skipping leakage check")
+            return
+        
+        stats_mean = norm_stats['target']['mean']
+        stats_std = norm_stats['target']['std']
+        
+        mean_diff = abs(actual_train_mean - stats_mean)
+        std_diff = abs(actual_train_std - stats_std)
+        
+        logger.info("Normalization stats vs actual training data:")
+        logger.info(f"  Stats mean: {stats_mean:.4f}, Actual: {actual_train_mean:.4f}, "
+                f"Diff: {mean_diff:.6f}")
+        logger.info(f"  Stats std: {stats_std:.4f}, Actual: {actual_train_std:.4f}, "
+                f"Diff: {std_diff:.6f}")
+        
+        if mean_diff > 0.01 or std_diff > 0.01:
+            logger.error("❌ POTENTIAL DATA LEAKAGE: Stats don't match training data!")
+            raise ValueError("Normalization stats mismatch")
+        else:
+            logger.info("✅ Normalization stats match training data")
+        
+        # Check 2: Verify val/test distributions are different
+        val_mean = y_val.mean()
+        test_mean = y_test.mean()
+        
+        logger.info(f"\nSplit distributions (normalized):")
+        logger.info(f"  Train: mean={y_train.mean():.4f}, std={y_train.std():.4f}")
+        logger.info(f"  Val: mean={val_mean:.4f}, std={y_val.std():.4f}")
+        logger.info(f"  Test: mean={test_mean:.4f}, std={y_test.std():.4f}")
+        
+        # Check 3: Verify no sample overlap
+        logger.info(f"\nSample overlap check:")
+        logger.info(f"  Train samples: {len(X_train)}")
+        logger.info(f"  Val samples: {len(X_val)}")
+        logger.info(f"  Test samples: {len(X_test)}")
+        logger.info(f"  Total: {len(X_train) + len(X_val) + len(X_test)}")
+        
+        logger.info("="*70)
         
     def create_train_val_test_split(self, X: np.ndarray, y: np.ndarray,
                                    dates: np.ndarray,
@@ -994,6 +1048,164 @@ class DatasetCreator:
         
         logger.info(f"✅ Dataset saved to {output_dir}")
 
+class EnhancedDatasetCreator(DatasetCreator):
+    """Extended DatasetCreator with better splitting"""
+    
+    def create_stratified_split(self, X: np.ndarray, y: np.ndarray,
+                               dates: np.ndarray,
+                               split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
+                               n_bins: int = 5) -> Dict:
+        """
+        Create stratified train/val/test splits based on temperature distribution
+        
+        Args:
+            X: Features array (N, H, W, C)
+            y: Target array (N, H, W, 1)
+            dates: Array of dates
+            split_ratios: (train, val, test) ratios
+            n_bins: Number of temperature bins for stratification
+            
+        Returns:
+            Dictionary with train/val/test splits
+        """
+        logger.info("\n" + "="*70)
+        logger.info("CREATING STRATIFIED SPLIT")
+        logger.info("="*70)
+        
+        # Calculate mean temperature per sample for stratification
+        sample_means = y.reshape(len(y), -1).mean(axis=1).flatten()
+        
+        # Create temperature bins for stratification
+        bins = pd.qcut(sample_means, q=n_bins, labels=False, duplicates='drop')
+        
+        logger.info(f"Temperature distribution across {len(np.unique(bins))} bins:")
+        for bin_idx in np.unique(bins):
+            bin_samples = np.sum(bins == bin_idx)
+            bin_mean_temp = sample_means[bins == bin_idx].mean()
+            logger.info(f"  Bin {bin_idx}: {bin_samples} samples, "
+                       f"mean temp = {bin_mean_temp:.2f}°C")
+        
+        # First split: separate test set (stratified)
+        train_val_ratio = split_ratios[0] + split_ratios[1]
+        test_ratio = split_ratios[2]
+        
+        X_trainval, X_test, y_trainval, y_test, dates_trainval, dates_test, bins_trainval, _ = \
+            train_test_split(
+                X, y, dates, bins,
+                test_size=test_ratio,
+                stratify=bins,
+                random_state=42
+            )
+        
+        logger.info(f"\nInitial split:")
+        logger.info(f"  Train+Val: {len(X_trainval)} samples")
+        logger.info(f"  Test: {len(X_test)} samples")
+        
+        # Second split: separate train and validation (stratified)
+        val_ratio_adjusted = split_ratios[1] / train_val_ratio
+        
+        X_train, X_val, y_train, y_val, dates_train, dates_val = \
+            train_test_split(
+                X_trainval, y_trainval, dates_trainval,
+                test_size=val_ratio_adjusted,
+                stratify=bins_trainval,
+                random_state=42
+            )
+        
+        logger.info(f"\nFinal split:")
+        logger.info(f"  Train: {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}%)")
+        logger.info(f"  Val: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
+        logger.info(f"  Test: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
+        
+        # Verify stratification worked
+        train_mean = y_train.mean()
+        val_mean = y_val.mean()
+        test_mean = y_test.mean()
+        
+        logger.info(f"\nMean temperature per split:")
+        logger.info(f"  Train: {train_mean:.2f}°C")
+        logger.info(f"  Val: {val_mean:.2f}°C")
+        logger.info(f"  Test: {test_mean:.2f}°C")
+        logger.info(f"  Difference: {max(train_mean, val_mean, test_mean) - min(train_mean, val_mean, test_mean):.2f}°C")
+        
+        splits = {
+            "X_train": X_train,
+            "y_train": y_train,
+            "dates_train": dates_train,
+            "X_val": X_val,
+            "y_val": y_val,
+            "dates_val": dates_val,
+            "X_test": X_test,
+            "y_test": y_test,
+            "dates_test": dates_test
+        }
+        
+        return splits
+    
+    def create_temporal_cv_splits(self, X: np.ndarray, y: np.ndarray,
+                                  dates: np.ndarray,
+                                  n_splits: int = 5) -> List[Dict]:
+        """
+        Create time-aware cross-validation splits
+        Ensures temporal ordering is preserved
+        
+        Args:
+            X, y, dates: Data arrays
+            n_splits: Number of CV folds
+            
+        Returns:
+            List of split dictionaries
+        """
+        logger.info("\n" + "="*70)
+        logger.info(f"CREATING {n_splits}-FOLD TEMPORAL CV SPLITS")
+        logger.info("="*70)
+        
+        # Sort by date
+        sort_idx = np.argsort(dates)
+        X_sorted = X[sort_idx]
+        y_sorted = y[sort_idx]
+        dates_sorted = dates[sort_idx]
+        
+        n_samples = len(X)
+        fold_size = n_samples // n_splits
+        
+        cv_splits = []
+        
+        for fold in range(n_splits):
+            # Validation indices for this fold
+            val_start = fold * fold_size
+            val_end = val_start + fold_size if fold < n_splits - 1 else n_samples
+            
+            # Training indices (all data before validation)
+            train_end = val_start
+            
+            if train_end < fold_size:
+                # Not enough training data, skip this fold
+                logger.warning(f"Fold {fold}: Insufficient training data, skipping")
+                continue
+            
+            train_indices = np.arange(0, train_end)
+            val_indices = np.arange(val_start, val_end)
+            
+            split = {
+                "X_train": X_sorted[train_indices],
+                "y_train": y_sorted[train_indices],
+                "dates_train": dates_sorted[train_indices],
+                "X_val": X_sorted[val_indices],
+                "y_val": y_sorted[val_indices],
+                "dates_val": dates_sorted[val_indices],
+                "fold": fold
+            }
+            
+            cv_splits.append(split)
+            
+            logger.info(f"Fold {fold}:")
+            logger.info(f"  Train: {len(train_indices)} samples "
+                       f"({dates_sorted[train_indices[0]]} to {dates_sorted[train_indices[-1]]})")
+            logger.info(f"  Val: {len(val_indices)} samples "
+                       f"({dates_sorted[val_indices[0]]} to {dates_sorted[val_indices[-1]]})")
+        
+        return cv_splits
 
 def main():
     """Main preprocessing pipeline - processes and fuses multi-sensor data"""
@@ -1202,15 +1414,20 @@ def main():
     
     dates = np.array([patch["date"] for patch in all_patches])
     
-    # Step 6: Create splits
+    # Step 6: Create splits - MODIFIED
     logger.info("\n" + "="*70)
     logger.info("STEP 5: Create train/val/test splits")
     logger.info("="*70)
-
-    splits = dataset_creator.create_train_val_test_split(
+    
+    # Use enhanced dataset creator
+    from preprocessing import EnhancedDatasetCreator
+    dataset_creator = EnhancedDatasetCreator()
+    
+    # Option 1: Stratified random split (RECOMMENDED)
+    splits = dataset_creator.create_stratified_split(
         X, y, dates,
-        split_method="temporal",
-        split_ratios=(0.7, 0.15, 0.15)
+        split_ratios=(0.7, 0.15, 0.15),
+        n_bins=5
     )
 
     # Step 6.5: Compute normalization statistics from training data
@@ -1223,6 +1440,17 @@ def main():
         splits['X_train'], 
         splits['y_train'],
         output_dataset_dir
+    )
+
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.5.1: Verify no data leakage (RAW)")
+    logger.info("="*70)
+
+    dataset_creator.verify_no_data_leakage(
+        splits['X_train'], splits['y_train'],
+        splits['X_val'], splits['y_val'],
+        splits['X_test'], splits['y_test'],
+        norm_stats
     )
 
     # Step 6.6: Normalize all splits

@@ -1,23 +1,56 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-01-25 09:03:02",
+  "date": "2026-02-01 16:31:29",
   "uhi_characterization": {
-    "maximum_intensity": "4.54\u00b0C",
-    "mean_intensity": "2.57\u00b0C",
-    "spatial_extent": "7.15 km\u00b2",
-    "magnitude": "10801.10\u00b0C\u00b7pixels"
+    "maximum_intensity": "2.63\u00b0C",
+    "mean_intensity": "0.89\u00b0C",
+    "spatial_extent": "0.54 km\u00b2",
+    "magnitude": "3770.85\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 0,
-    "total_hotspot_area": "0.00 km\u00b2",
-    "largest_hotspot": "N/A",
-    "highest_temperature": "N/A"
+    "total_hotspots": 2,
+    "total_hotspot_area": "0.02 km\u00b2",
+    "largest_hotspot": "0.013 km\u00b2",
+    "highest_temperature": "39.97\u00b0C"
   },
-  "top_priority_hotspots": [],
+  "top_priority_hotspots": [
+    {
+      "id": 1,
+      "n_pixels": 5,
+      "area_km2": 0.012500000000000002,
+      "centroid_y": 0.0,
+      "centroid_x": 41.0,
+      "mean_lst": 39.88666534423828,
+      "max_lst": 39.97083282470703,
+      "mean_gi_star": 2.099218778610229,
+      "max_gi_star": 2.197728395462036,
+      "intensity_score": 1.0,
+      "extent_score": 1.0,
+      "significance_score": 1.0,
+      "priority_score": 1.0,
+      "rank": 1
+    },
+    {
+      "id": 3,
+      "n_pixels": 4,
+      "area_km2": 0.010000000000000002,
+      "centroid_y": 5.75,
+      "centroid_x": 29.75,
+      "mean_lst": 39.798988342285156,
+      "max_lst": 39.85860824584961,
+      "mean_gi_star": 2.0363032579422,
+      "max_gi_star": 2.1563363075256348,
+      "intensity_score": 0.0,
+      "extent_score": 0.0,
+      "significance_score": 0.8258849648315931,
+      "priority_score": 0.24776548944947793,
+      "rank": 2
+    }
+  ],
   "validation": {
-    "r2_score": "0.5831",
-    "rmse": "3.6643\u00b0C",
-    "mae": "2.7954\u00b0C",
-    "bias": "0.5840\u00b0C"
+    "r2_score": "0.7490",
+    "rmse": "2.7088\u00b0C",
+    "mae": "2.0087\u00b0C",
+    "bias": "-0.1794\u00b0C"
   }
 }

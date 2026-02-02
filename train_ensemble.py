@@ -537,6 +537,23 @@ class EnsembleTrainer:
         
         return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
     
+    def _log_regularization_metrics(self, epoch):
+        """Log regularization metrics to monitor overfitting"""
+        # Calculate L2 norm of weights
+        total_norm = 0.0
+        for p in self.cnn_model.parameters():
+            if p.requires_grad:
+                param_norm = p.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        
+        logger.info(f"  L2 weight norm: {total_norm:.4f}")
+        
+        # Track in history
+        if 'weight_norms' not in self.history:
+            self.history['weight_norms'] = []
+        self.history['weight_norms'].append(total_norm)
+    
     def train_cnn_epoch(self, train_loader):
         """Train CNN for one epoch"""
         self.cnn_model.train()
@@ -556,6 +573,16 @@ class EnsembleTrainer:
                 logger.info(f"CNN Batch 0 - Output range: [{output.min():.4f}, {output.max():.4f}]")
             
             loss, components = self.criterion(output, target, data)
+
+            # Add gradient norm logging
+            if batch_idx == 0:
+                total_grad_norm = 0.0
+                for p in self.cnn_model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                logger.info(f"  Gradient norm (batch 0): {total_grad_norm:.4f}")
             
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.error(f"NaN/Inf loss detected at batch {batch_idx}!")
@@ -925,6 +952,9 @@ class EnsembleTrainer:
 
             # Update progressive loss weights
             self.criterion.set_training_progress(epoch, self.config["epochs"])
+
+            # Log regularization metrics
+            self._log_regularization_metrics(epoch)
             
             # Train CNN
             train_loss, train_components = self.train_cnn_epoch(train_loader)

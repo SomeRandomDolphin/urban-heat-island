@@ -141,7 +141,7 @@ CNN_CONFIG = {
     "architecture": "unet",
     "input_channels": 10,
     "filters": [32, 64, 128, 256, 512],  # REDUCED from [64, 128, 256, 512, 1024]
-    "dropout_rates": [0.1, 0.15, 0.2, 0.25, 0.3],
+    "dropout_rates": [0.2, 0.25, 0.3, 0.35, 0.4],
     "batch_norm": True,
     "activation": "relu",
     "use_attention": False,  # Keep simple initially
@@ -155,22 +155,22 @@ GBM_CONFIG = {
         "boosting_type": "gbdt",
         
         # Tree structure - MORE COMPLEX
-        "num_leaves": 255,  # INCREASED from 127
-        "max_depth": 15,  # INCREASED from 12
+        "num_leaves": 127,  # INCREASED from 127
+        "max_depth": 12,  # INCREASED from 12
         
         # Learning
-        "learning_rate": 0.03,  # REDUCED from 0.05 - more trees
+        "learning_rate": 0.02,  # REDUCED from 0.05 - more trees
         "n_estimators": 2000,  # INCREASED from 1000
         
         # Sampling
-        "subsample": 0.8,
+        "subsample": 0.7,
         "subsample_freq": 1,
-        "colsample_bytree": 0.8,
+        "colsample_bytree": 0.7,
         
         # Regularization
-        "reg_alpha": 0.05,  # REDUCED from 0.1
-        "reg_lambda": 0.05,  # REDUCED from 0.1
-        "min_child_samples": 50,  # REDUCED from 100 - allow more complex patterns
+        "reg_alpha": 0.1,  # REDUCED from 0.1
+        "reg_lambda": 0.1,  # REDUCED from 0.1
+        "min_child_samples": 100,  # REDUCED from 100 - allow more complex patterns
         
         # Convergence
         "early_stopping_rounds": 100,  # INCREASED from 50
@@ -200,12 +200,12 @@ TRAINING_CONFIG = {
     "warmup_epochs": 20,  # CHANGED: Longer warmup
     
     # Early stopping
-    "patience": 40,  # CHANGED: More patience
-    "min_delta": 0.0003,  # CHANGED: Smaller threshold
+    "patience": 50,  # CHANGED: More patience
+    "min_delta": 0.0005,  # CHANGED: Smaller threshold
     
     # Optimizer
     "optimizer": "adamw",
-    "weight_decay": 0.00001,
+    "weight_decay": 0.0001,
     
     # Loss weights (will be adjusted during training)
     "loss_weights": {
@@ -217,8 +217,8 @@ TRAINING_CONFIG = {
     },
     
     # Gradient control
-    "gradient_clip": 0.3,  # CHANGED: Tighter control
-    "min_delta": 0.0003
+    "gradient_clip": 0.5,  # CHANGED: Tighter control
+    "min_delta": 0.0005
 }
 
 # Data augmentation

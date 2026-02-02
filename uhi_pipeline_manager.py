@@ -319,6 +319,36 @@ def main():
             logger.info(f"  Valid pixels: {len(predictions_flat):,}")
             logger.info(f"  Predictions: mean={predictions_flat.mean():.2f}°C, std={predictions_flat.std():.2f}°C")
             logger.info(f"  Ground truth: mean={ground_truth_flat.mean():.2f}°C, std={ground_truth_flat.std():.2f}°C")
+
+            # Generate predictions with TTA
+            logger.info("\n" + "="*70)
+            logger.info("GENERATING PREDICTIONS WITH TTA")
+            logger.info("="*70)
+            logger.info(f"Processing {len(X_test)} test samples...")
+            logger.info("Note: Using Test-Time Augmentation for robust predictions")
+            
+            try:
+                results = predictor.predict_ensemble_with_tta(
+                    X_test,  # NORMALIZED data
+                    batch_size=args.batch_size,
+                    n_augmentations=8,  # Use 8 augmentations
+                    return_uncertainty=True,
+                    use_spatial_ensemble=args.use_spatial_ensemble
+                )
+                
+                logger.info("✅ Predictions generated successfully")
+                logger.info(f"  Shape: {results['ensemble'].shape}")
+                logger.info(f"  Range: [{results['ensemble'].min():.2f}, "
+                        f"{results['ensemble'].max():.2f}]°C")
+                logger.info(f"  Mean: {results['ensemble'].mean():.2f}°C ± "
+                        f"{results['ensemble'].std():.2f}°C")
+                logger.info(f"  TTA Uncertainty: {results['tta_uncertainty'].mean():.2f}°C")
+                
+            except Exception as e:
+                logger.error(f"❌ Prediction failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
             
             # Calculate metrics manually
             from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
