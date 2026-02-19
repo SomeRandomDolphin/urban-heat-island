@@ -1,6 +1,19 @@
 """
-Enhanced training pipeline with CNN + GBM ensemble - BEST MODELS VERSION
+Enhanced training pipeline with CNN + GBM ensemble - IMPROVED VERSION
 Uses BEST validation models for ensemble instead of final models
+
+IMPROVEMENTS (to fix overfitting and improve inference):
+1. ProgressiveLSTLoss - Prevents variance collapse and range compression
+2. Enhanced metrics - Tracks slope and std_ratio to detect issues
+3. Overfitting warnings - Alerts during training when issues detected
+4. Stronger augmentation - Better generalization to unseen data
+5. Diagnostic checks - Monitors training health every 10 epochs
+
+Expected improvements:
+- Reduce train-test gap from 17% to <10%
+- Improve inference R² from 0.75 to >0.85
+- Fix slope from 0.675 to >0.90 (no range compression)
+- Fix std_ratio to ≈1.0 (no variance collapse)
 """
 import sys
 import torch
@@ -20,7 +33,7 @@ import lightgbm as lgb
 import pickle
 
 from config import *
-from models import UNet, LSTLoss, EarlyStopping, initialize_weights, count_parameters
+from models import UNet, ProgressiveLSTLoss, EarlyStopping, initialize_weights, count_parameters
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -127,10 +140,13 @@ class UHIDataset(Dataset):
         return x, y
     
     def _augment(self, x, y):
-        """Enhanced augmentation preserving physical realism"""
+        """
+        IMPROVED: Stronger augmentation for better generalization
+        Simulates various atmospheric conditions, viewing angles, and noise
+        """
         
-        # 1. Geometric transformations (60% probability)
-        if torch.rand(1) > 0.4:
+        # 1. Geometric transformations (80% probability - INCREASED from 60%)
+        if torch.rand(1) > 0.2:  # Changed from 0.4
             # Horizontal flip
             if torch.rand(1) > 0.5:
                 x = torch.flip(x, dims=[2])
@@ -147,23 +163,27 @@ class UHIDataset(Dataset):
                 x = torch.rot90(x, k, dims=[1, 2])
                 y = torch.rot90(y, k, dims=[1, 2])
         
-        # 2. Brightness adjustment (30% probability)
-        if torch.rand(1) > 0.7:
-            brightness_factor = 1.0 + (torch.rand(1) - 0.5) * 0.15  # ±7.5%
+        # 2. Brightness adjustment (50% probability - INCREASED from 30%)
+        # Simulates different times of day / solar angles
+        if torch.rand(1) > 0.5:  # Changed from 0.7
+            brightness_factor = 1.0 + (torch.rand(1) - 0.5) * 0.3  # ±15% (was ±7.5%)
             x = x * brightness_factor
         
-        # 3. Contrast adjustment (30% probability)
-        if torch.rand(1) > 0.7:
-            contrast_factor = 1.0 + (torch.rand(1) - 0.5) * 0.15
+        # 3. Contrast adjustment (40% probability - INCREASED from 30%)
+        # Simulates different atmospheric conditions
+        if torch.rand(1) > 0.6:  # Changed from 0.7
+            contrast_factor = 1.0 + (torch.rand(1) - 0.5) * 0.3  # ±15%
             mean = x.mean(dim=[1, 2], keepdim=True)
             x = (x - mean) * contrast_factor + mean
         
-        # 4. Gaussian noise (25% probability)
-        if torch.rand(1) > 0.75:
-            noise = torch.randn_like(x) * 0.015
+        # 4. Gaussian noise (40% probability - INCREASED from 25%)
+        # Simulates sensor noise and atmospheric interference
+        if torch.rand(1) > 0.6:  # Changed from 0.75
+            noise = torch.randn_like(x) * 0.10  # INCREASED from 0.015
             x = x + noise
         
-        # 5. Regional dropout - simulates cloud patches (20% probability)
+        # 5. Regional dropout (20% probability)
+        # Simulates cloud patches or missing data
         if torch.rand(1) > 0.8:
             h, w = x.shape[1], x.shape[2]
             cut_h = int(h * 0.25)
@@ -173,6 +193,24 @@ class UHIDataset(Dataset):
             
             # Fill with mean instead of zeros (more realistic)
             x[:, cy:cy+cut_h, cx:cx+cut_w] = x.mean(dim=[1, 2], keepdim=True)
+        
+        # 6. IMPROVED: MixUp augmentation (20% probability - NEW)
+        # Helps model learn smoother decision boundaries
+        if torch.rand(1) > 0.8:
+            alpha = 0.2
+            lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+            
+            # Create permuted version
+            perm_h = torch.randperm(x.shape[1])
+            perm_w = torch.randperm(x.shape[2])
+            x_perm = x[:, perm_h, :]
+            x_perm = x_perm[:, :, perm_w]
+            y_perm = y[:, perm_h, :]
+            y_perm = y_perm[:, :, perm_w]
+            
+            # Mix
+            x = lam * x + (1 - lam) * x_perm
+            y = lam * y + (1 - lam) * y_perm
         
         return x, y
 
@@ -481,9 +519,9 @@ class EnsembleTrainer:
         self.device = device
         self.config = config
         
-        # CNN components
-        from models import ProgressiveLSTLoss
+        # CNN components - IMPROVED LOSS FUNCTION
         self.criterion = ProgressiveLSTLoss()
+        logger.info("✓ Using ProgressiveLSTLoss for variance/range preservation")
         
         if config["optimizer"] == "adamw":
             self.optimizer = optim.AdamW(
@@ -637,6 +675,67 @@ class EnsembleTrainer:
         metrics = self._calculate_metrics(preds, targets, "CNN")
         
         return avg_loss, metrics, all_preds
+    
+    def _check_for_overfitting_warnings(self, train_metrics, val_metrics):
+        """
+        IMPROVED: Check for overfitting and other performance issues
+        Warns about variance collapse, range compression, and overfitting
+        """
+        warnings_found = False
+        
+        # Warning 1: Overfitting (train-val gap)
+        if 'r2' in train_metrics and 'r2' in val_metrics:
+            train_r2 = train_metrics['r2']
+            val_r2 = val_metrics['r2']
+            gap = train_r2 - val_r2
+            
+            if gap > 0.10:
+                logger.warning(f"⚠️ OVERFITTING DETECTED!")
+                logger.warning(f"   Train R²: {train_r2:.3f}")
+                logger.warning(f"   Val R²: {val_r2:.3f}")
+                logger.warning(f"   Gap: {gap:.3f} (should be < 0.10)")
+                warnings_found = True
+        
+        # Warning 2: Variance Collapse
+        if 'std_ratio' in val_metrics:
+            std_ratio = val_metrics['std_ratio']
+            if std_ratio < 0.80:
+                logger.warning(f"⚠️ VARIANCE COLLAPSE!")
+                logger.warning(f"   Std ratio: {std_ratio:.3f} (should be ≈1.0)")
+                logger.warning(f"   Predictions are too clustered around mean")
+                warnings_found = True
+        
+        # Warning 3: Range Compression (regression to mean)
+        if 'slope' in val_metrics:
+            slope = val_metrics['slope']
+            if slope < 0.85:
+                logger.warning(f"⚠️ RANGE COMPRESSION!")
+                logger.warning(f"   Slope: {slope:.3f} (should be ≈1.0)")
+                logger.warning(f"   Model is regressing to the mean")
+                warnings_found = True
+        
+        # Warning 4: Systematic Bias
+        if 'mbe' in val_metrics:
+            mbe = val_metrics['mbe']
+            if abs(mbe) > 1.0:
+                logger.warning(f"⚠️ SYSTEMATIC BIAS!")
+                logger.warning(f"   MBE: {mbe:+.3f}°C (should be ≈0)")
+                warnings_found = True
+        
+        # Warning 5: Mean Shift
+        if 'pred_mean' in val_metrics and 'target_mean' in val_metrics:
+            mean_diff = abs(val_metrics['pred_mean'] - val_metrics['target_mean'])
+            if mean_diff > 1.5:
+                logger.warning(f"⚠️ MEAN SHIFT!")
+                logger.warning(f"   Pred mean: {val_metrics['pred_mean']:.2f}°C")
+                logger.warning(f"   Target mean: {val_metrics['target_mean']:.2f}°C")
+                logger.warning(f"   Difference: {mean_diff:.2f}°C (should be < 1.5)")
+                warnings_found = True
+        
+        if not warnings_found:
+            logger.info("✓ No major issues detected")
+        
+        return warnings_found
     
     def train_gbm(self, X_train, y_train, X_val, y_val):
         """Train GBM model"""
@@ -894,7 +993,11 @@ class EnsembleTrainer:
             return cnn_metrics
     
     def _calculate_metrics(self, preds, targets, name=""):
-        """Calculate evaluation metrics"""
+        """
+        Calculate comprehensive evaluation metrics
+        IMPROVED: Now includes slope and std_ratio to detect range compression and variance collapse
+        """
+        from scipy.stats import linregress
         
         # Load normalization stats for denormalization
         norm_stats = load_normalization_stats()
@@ -918,6 +1021,7 @@ class EnsembleTrainer:
         if name and pred_var < 1e-8:
             logger.warning(f"⚠️ {name} predictions have near-zero variance!")
         
+        # Basic accuracy metrics
         try:
             r2 = r2_score(targets_denorm, preds_denorm)
         except Exception as e:
@@ -928,7 +1032,33 @@ class EnsembleTrainer:
         mae = mean_absolute_error(targets_denorm, preds_denorm)
         mbe = np.mean(preds_denorm - targets_denorm)
         
-        return {"r2": r2, "rmse": rmse, "mae": mae, "mbe": mbe}
+        # IMPROVED: Add regression analysis to detect range compression
+        slope, intercept, r_value, p_value, std_err = linregress(
+            targets_denorm.flatten(), preds_denorm.flatten()
+        )
+        
+        # IMPROVED: Add distribution metrics to detect variance collapse
+        pred_std = np.std(preds_denorm)
+        target_std = np.std(targets_denorm)
+        std_ratio = pred_std / target_std if target_std > 0 else 0.0
+        
+        metrics = {
+            "r2": r2, 
+            "rmse": rmse, 
+            "mae": mae, 
+            "mbe": mbe,
+            # IMPROVED: Additional diagnostic metrics
+            "slope": slope,           # Should be ≈1.0 (no range compression)
+            "intercept": intercept,   # Should be ≈0.0 (no bias)
+            "correlation": r_value,
+            "std_ratio": std_ratio,   # Should be ≈1.0 (no variance collapse)
+            "pred_mean": preds_denorm.mean(),
+            "pred_std": pred_std,
+            "target_mean": targets_denorm.mean(),
+            "target_std": target_std,
+        }
+        
+        return metrics
     
     def train(self, train_loader, val_loader, X_train, y_train, X_val, y_val, save_dir: Path):
         """Full training loop for ensemble - Uses BEST models"""
@@ -961,6 +1091,26 @@ class EnsembleTrainer:
             
             # Validate CNN
             val_loss, cnn_metrics, _ = self.evaluate_cnn(val_loader)
+            
+            # IMPROVED: Check for overfitting and performance issues every 10 epochs
+            if epoch % 10 == 0 or epoch == self.config["epochs"] - 1:
+                # Need train metrics for comparison
+                self.cnn_model.eval()
+                train_preds_list = []
+                train_targets_list = []
+                with torch.no_grad():
+                    for data, target in train_loader:
+                        data = data.to(self.device)
+                        output = self.cnn_model(data)
+                        train_preds_list.append(output.cpu().numpy())
+                        train_targets_list.append(target.cpu().numpy())
+                train_preds = np.concatenate(train_preds_list, axis=0).flatten()
+                train_targets = np.concatenate(train_targets_list, axis=0).flatten()
+                train_metrics = self._calculate_metrics(train_preds, train_targets, "Train")
+                
+                logger.info("\n--- Diagnostic Check ---")
+                self._check_for_overfitting_warnings(train_metrics, cnn_metrics)
+                logger.info("------------------------\n")
             
             # Track best CNN performance
             if cnn_metrics['r2'] > best_cnn_r2:

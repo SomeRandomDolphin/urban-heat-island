@@ -1053,80 +1053,155 @@ class EnhancedDatasetCreator(DatasetCreator):
     
     def create_stratified_split(self, X: np.ndarray, y: np.ndarray,
                                dates: np.ndarray,
-                               split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
-                               n_bins: int = 5) -> Dict:
+                               split_ratios: Tuple[float, float, float] = (0.65, 0.15, 0.20),
+                               random_seed: int = 42) -> Dict:
         """
-        Create stratified train/val/test splits based on temperature distribution
+        Create train/val/test split that maintains:
+        1. Temporal distribution (all seasons in all splits)
+        2. Spatial distribution (all areas in all splits)
         
         Args:
             X: Features array (N, H, W, C)
             y: Target array (N, H, W, 1)
-            dates: Array of dates
+            dates: Array of dates for each sample
             split_ratios: (train, val, test) ratios
-            n_bins: Number of temperature bins for stratification
+            random_seed: Random seed for reproducibility
             
         Returns:
             Dictionary with train/val/test splits
         """
         logger.info("\n" + "="*70)
-        logger.info("CREATING STRATIFIED SPLIT")
+        logger.info("CREATING STRATIFIED SPLIT WITH SPATIAL-TEMPORAL DISTRIBUTION")
         logger.info("="*70)
         
-        # Calculate mean temperature per sample for stratification
-        sample_means = y.reshape(len(y), -1).mean(axis=1).flatten()
+        np.random.seed(random_seed)
         
-        # Create temperature bins for stratification
-        bins = pd.qcut(sample_means, q=n_bins, labels=False, duplicates='drop')
+        # Extract data dimensions
+        n_samples = len(X)
+        train_ratio, val_ratio, test_ratio = split_ratios
         
-        logger.info(f"Temperature distribution across {len(np.unique(bins))} bins:")
-        for bin_idx in np.unique(bins):
-            bin_samples = np.sum(bins == bin_idx)
-            bin_mean_temp = sample_means[bins == bin_idx].mean()
-            logger.info(f"  Bin {bin_idx}: {bin_samples} samples, "
-                       f"mean temp = {bin_mean_temp:.2f}°C")
+        # Create season labels (0=winter, 1=spring, 2=summer, 3=fall)
+        # Winter: Dec-Feb (12,1,2), Spring: Mar-May (3,4,5), 
+        # Summer: Jun-Aug (6,7,8), Fall: Sep-Nov (9,10,11)
+        dates_dt = pd.to_datetime(dates)
+        seasons = (dates_dt.month % 12 // 3).values
         
-        # First split: separate test set (stratified)
-        train_val_ratio = split_ratios[0] + split_ratios[1]
-        test_ratio = split_ratios[2]
+        logger.info(f"\nTemporal distribution:")
+        season_names = ['Winter (DJF)', 'Spring (MAM)', 'Summer (JJA)', 'Fall (SON)']
+        for season_idx in range(4):
+            count = np.sum(seasons == season_idx)
+            logger.info(f"  {season_names[season_idx]}: {count} samples ({count/n_samples*100:.1f}%)")
         
-        X_trainval, X_test, y_trainval, y_test, dates_trainval, dates_test, bins_trainval, _ = \
-            train_test_split(
-                X, y, dates, bins,
-                test_size=test_ratio,
-                stratify=bins,
-                random_state=42
-            )
+        # Create spatial blocks by clustering patch center locations
+        # Extract center coordinates from each patch
+        logger.info(f"\nCreating spatial blocks...")
+        
+        # For patches, we need to extract spatial information
+        # We'll use NDVI spatial patterns as a proxy for location
+        # (higher variation in certain channels indicates different regions)
+        spatial_features = []
+        for i in range(n_samples):
+            # Use mean values of key indices as spatial signature
+            # NDVI, NDBI, MNDWI are typically in channels 0, 1, 2
+            if X.shape[-1] >= 3:
+                ndvi_mean = X[i, :, :, 0].mean()
+                ndbi_mean = X[i, :, :, 1].mean()
+                mndwi_mean = X[i, :, :, 2].mean()
+                spatial_features.append([ndvi_mean, ndbi_mean, mndwi_mean])
+            else:
+                # Fallback: use first 3 channels
+                spatial_features.append([X[i, :, :, ch].mean() for ch in range(min(3, X.shape[-1]))])
+        
+        spatial_features = np.array(spatial_features)
+        
+        # Cluster locations into spatial blocks
+        from sklearn.cluster import KMeans
+        n_spatial_blocks = 5
+        kmeans = KMeans(n_clusters=n_spatial_blocks, random_state=random_seed)
+        spatial_blocks = kmeans.fit_predict(spatial_features)
+        
+        logger.info(f"Spatial distribution:")
+        for block_idx in range(n_spatial_blocks):
+            count = np.sum(spatial_blocks == block_idx)
+            logger.info(f"  Block {block_idx}: {count} samples ({count/n_samples*100:.1f}%)")
+        
+        # Combine season and spatial stratification
+        # Each sample gets a unique stratum ID combining season and spatial block
+        strata = seasons * n_spatial_blocks + spatial_blocks
+        unique_strata = len(np.unique(strata))
+        
+        logger.info(f"\nCombined stratification: {unique_strata} unique strata")
+        
+        # First split: train+val vs test
+        train_val_idx, test_idx = train_test_split(
+            np.arange(n_samples),
+            test_size=test_ratio,
+            stratify=strata,
+            random_state=random_seed
+        )
         
         logger.info(f"\nInitial split:")
-        logger.info(f"  Train+Val: {len(X_trainval)} samples")
-        logger.info(f"  Test: {len(X_test)} samples")
+        logger.info(f"  Train+Val: {len(train_val_idx)} samples")
+        logger.info(f"  Test: {len(test_idx)} samples")
         
-        # Second split: separate train and validation (stratified)
-        val_ratio_adjusted = split_ratios[1] / train_val_ratio
+        # Second split: train vs val
+        strata_train_val = strata[train_val_idx]
+        train_idx, val_idx = train_test_split(
+            train_val_idx,
+            test_size=val_ratio / (train_ratio + val_ratio),
+            stratify=strata_train_val,
+            random_state=random_seed
+        )
         
-        X_train, X_val, y_train, y_val, dates_train, dates_val = \
-            train_test_split(
-                X_trainval, y_trainval, dates_trainval,
-                test_size=val_ratio_adjusted,
-                stratify=bins_trainval,
-                random_state=42
-            )
+        # Create the splits
+        X_train = X[train_idx]
+        y_train = y[train_idx]
+        dates_train = dates[train_idx]
         
-        logger.info(f"\nFinal split:")
-        logger.info(f"  Train: {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}%)")
-        logger.info(f"  Val: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
-        logger.info(f"  Test: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
+        X_val = X[val_idx]
+        y_val = y[val_idx]
+        dates_val = dates[val_idx]
         
-        # Verify stratification worked
+        X_test = X[test_idx]
+        y_test = y[test_idx]
+        dates_test = dates[test_idx]
+        
+        # Verify distribution
+        logger.info("\n" + "="*70)
+        logger.info("DATA SPLIT VERIFICATION")
+        logger.info("="*70)
+        logger.info(f"Train: {len(train_idx)} samples ({len(train_idx)/n_samples*100:.1f}%)")
+        logger.info(f"Val:   {len(val_idx)} samples ({len(val_idx)/n_samples*100:.1f}%)")
+        logger.info(f"Test:  {len(test_idx)} samples ({len(test_idx)/n_samples*100:.1f}%)")
+        
+        # Check season distribution for each split
+        for split_name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
+            split_seasons = seasons[idx]
+            season_dist = pd.Series(split_seasons).value_counts(normalize=True).sort_index()
+            logger.info(f"\n{split_name} season distribution:")
+            for season_idx, pct in season_dist.items():
+                logger.info(f"  {season_names[season_idx]}: {pct*100:.1f}%")
+        
+        # Check spatial distribution for each split
+        for split_name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
+            split_blocks = spatial_blocks[idx]
+            block_dist = pd.Series(split_blocks).value_counts(normalize=True).sort_index()
+            logger.info(f"\n{split_name} spatial block distribution:")
+            for block_idx, pct in block_dist.items():
+                logger.info(f"  Block {block_idx}: {pct*100:.1f}%")
+        
+        # Check temperature distribution
         train_mean = y_train.mean()
         val_mean = y_val.mean()
         test_mean = y_test.mean()
         
         logger.info(f"\nMean temperature per split:")
-        logger.info(f"  Train: {train_mean:.2f}°C")
-        logger.info(f"  Val: {val_mean:.2f}°C")
-        logger.info(f"  Test: {test_mean:.2f}°C")
-        logger.info(f"  Difference: {max(train_mean, val_mean, test_mean) - min(train_mean, val_mean, test_mean):.2f}°C")
+        logger.info(f"  Train: {train_mean:.2f}°C (std: {y_train.std():.2f}°C)")
+        logger.info(f"  Val:   {val_mean:.2f}°C (std: {y_val.std():.2f}°C)")
+        logger.info(f"  Test:  {test_mean:.2f}°C (std: {y_test.std():.2f}°C)")
+        logger.info(f"  Max difference: {max(train_mean, val_mean, test_mean) - min(train_mean, val_mean, test_mean):.2f}°C")
+        
+        logger.info("="*70 + "\n")
         
         splits = {
             "X_train": X_train,
@@ -1423,11 +1498,12 @@ def main():
     from preprocessing import EnhancedDatasetCreator
     dataset_creator = EnhancedDatasetCreator()
     
-    # Option 1: Stratified random split (RECOMMENDED)
+    # Stratified split with spatial-temporal distribution
+    # NEW: 65% train, 15% val, 20% test (was 70/15/15)
     splits = dataset_creator.create_stratified_split(
         X, y, dates,
-        split_ratios=(0.7, 0.15, 0.15),
-        n_bins=5
+        split_ratios=(0.65, 0.15, 0.20),
+        random_seed=42
     )
 
     # Step 6.5: Compute normalization statistics from training data

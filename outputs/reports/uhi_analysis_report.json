@@ -1,56 +1,72 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-02-01 16:31:29",
+  "date": "2026-02-19 09:13:05",
   "uhi_characterization": {
-    "maximum_intensity": "2.63\u00b0C",
-    "mean_intensity": "0.89\u00b0C",
-    "spatial_extent": "0.54 km\u00b2",
-    "magnitude": "3770.85\u00b0C\u00b7pixels"
+    "maximum_intensity": "2.76\u00b0C",
+    "mean_intensity": "0.86\u00b0C",
+    "spatial_extent": "1.33 km\u00b2",
+    "magnitude": "3592.57\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 2,
-    "total_hotspot_area": "0.02 km\u00b2",
-    "largest_hotspot": "0.013 km\u00b2",
-    "highest_temperature": "39.97\u00b0C"
+    "total_hotspots": 3,
+    "total_hotspot_area": "0.07 km\u00b2",
+    "largest_hotspot": "0.028 km\u00b2",
+    "highest_temperature": "39.67\u00b0C"
   },
   "top_priority_hotspots": [
     {
-      "id": 1,
-      "n_pixels": 5,
-      "area_km2": 0.012500000000000002,
-      "centroid_y": 0.0,
-      "centroid_x": 41.0,
-      "mean_lst": 39.88666534423828,
-      "max_lst": 39.97083282470703,
-      "mean_gi_star": 2.099218778610229,
-      "max_gi_star": 2.197728395462036,
+      "id": 4,
+      "n_pixels": 11,
+      "area_km2": 0.027500000000000004,
+      "centroid_y": 60.0,
+      "centroid_x": 30.0,
+      "mean_lst": 39.453643798828125,
+      "max_lst": 39.653045654296875,
+      "mean_gi_star": 2.0791294357993384,
+      "max_gi_star": 2.2570266723632812,
       "intensity_score": 1.0,
-      "extent_score": 1.0,
+      "extent_score": 0.8333333333333333,
       "significance_score": 1.0,
-      "priority_score": 1.0,
+      "priority_score": 0.95,
       "rank": 1
     },
     {
-      "id": 3,
-      "n_pixels": 4,
-      "area_km2": 0.010000000000000002,
-      "centroid_y": 5.75,
-      "centroid_x": 29.75,
-      "mean_lst": 39.798988342285156,
-      "max_lst": 39.85860824584961,
-      "mean_gi_star": 2.0363032579422,
-      "max_gi_star": 2.1563363075256348,
+      "id": 2,
+      "n_pixels": 12,
+      "area_km2": 0.030000000000000006,
+      "centroid_y": 5.0,
+      "centroid_x": 30.5,
+      "mean_lst": 39.43959426879883,
+      "max_lst": 39.47639846801758,
+      "mean_gi_star": 2.0383555412292482,
+      "max_gi_star": 2.089297294616699,
+      "intensity_score": 0.46615451514712275,
+      "extent_score": 1.0,
+      "significance_score": 0.4353053333155245,
+      "priority_score": 0.6170534060535064,
+      "rank": 2
+    },
+    {
+      "id": 1,
+      "n_pixels": 6,
+      "area_km2": 0.015000000000000003,
+      "centroid_y": 4.833333333333333,
+      "centroid_x": 56.666666666666664,
+      "mean_lst": 39.42732620239258,
+      "max_lst": 39.66776657104492,
+      "mean_gi_star": 1.969399162133535,
+      "max_gi_star": 1.9774736166000366,
       "intensity_score": 0.0,
       "extent_score": 0.0,
-      "significance_score": 0.8258849648315931,
-      "priority_score": 0.24776548944947793,
-      "rank": 2
+      "significance_score": 0.05882844278262453,
+      "priority_score": 0.01764853283478736,
+      "rank": 3
     }
   ],
   "validation": {
-    "r2_score": "0.7490",
-    "rmse": "2.7088\u00b0C",
-    "mae": "2.0087\u00b0C",
-    "bias": "-0.1794\u00b0C"
+    "r2_score": "0.7226",
+    "rmse": "2.8568\u00b0C",
+    "mae": "2.1259\u00b0C",
+    "bias": "-0.0019\u00b0C"
   }
 }
