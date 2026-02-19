@@ -277,56 +277,73 @@ class GBMTrainer:
     """Trainer for Gradient Boosting Model - Tracks BEST model"""
     
     def __init__(self, config=None):
-        self.config = config or {
-            "objective": "regression",
-            "metric": "rmse",
-            "boosting_type": "gbdt",
-            "num_leaves": 127,
-            "max_depth": 12,
-            "learning_rate": 0.05,
-            "n_estimators": 1000,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "reg_alpha": 0.1,
-            "reg_lambda": 0.1,
-            "min_child_samples": 100,
-            "verbose": -1
-        }
+        # FIX: Use GBM_CONFIG from config.py, not hardcoded defaults.
+        # Previously this defaulted to num_leaves=127, max_depth=12 which caused
+        # severe overfitting (val R²=0.90 → test R²=0.73).
+        # GBM_CONFIG specifies num_leaves=31, max_depth=6 for better generalization.
+        if config is None:
+            raw = dict(GBM_CONFIG["params"])
+            # lgb.train() uses num_boost_round, not n_estimators
+            self.num_boost_round = raw.pop("n_estimators", 500)
+            self.config = raw
+        else:
+            self.num_boost_round = config.pop("n_estimators", 500)
+            self.config = config
         self.model = None
-        self.best_model = None  # ADDED: Track best model
-        self.best_score = float('inf')  # ADDED: Track best validation RMSE
+        self.best_model = None
+        self.best_score = float('inf')
         
     def train(self, X_train: pd.DataFrame, y_train: np.ndarray,
               X_val: pd.DataFrame, y_val: np.ndarray):
-        """Train GBM model and track best version"""
+        """Train GBM model and track best version.
+        
+        FIX B: Use a held-out split of the TRAINING data for GBM early stopping,
+        not the ensemble validation set. This prevents the GBM from being tuned to 
+        the val distribution, which inflated val R² to 0.90 while test R² was 0.73.
+        
+        The ensemble val set is only used for REPORTING, not for stopping decisions.
+        """
         logger.info("Training GBM model...")
+        logger.info(f"  Config: num_leaves={self.config.get('num_leaves')}, "
+                   f"max_depth={self.config.get('max_depth')}, "
+                   f"num_boost_round={self.num_boost_round}")
         
-        train_data = lgb.Dataset(X_train, label=y_train)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        # FIX B: Split training data 90/10 for GBM internal early stopping.
+        # This keeps the ensemble val set truly held-out.
+        from sklearn.model_selection import train_test_split as _tts
+        X_gbm_tr, X_gbm_es, y_gbm_tr, y_gbm_es = _tts(
+            X_train, y_train, test_size=0.10, random_state=42
+        )
+        logger.info(f"  GBM internal split: {len(X_gbm_tr)} train, {len(X_gbm_es)} early-stop")
         
+        train_data = lgb.Dataset(X_gbm_tr, label=y_gbm_tr)
+        es_data    = lgb.Dataset(X_gbm_es, label=y_gbm_es, reference=train_data)
+        
+        early_stopping_rounds = self.config.pop("early_stopping_rounds", 50)
         callbacks = [
-            lgb.early_stopping(stopping_rounds=50),
+            lgb.early_stopping(stopping_rounds=early_stopping_rounds),
             lgb.log_evaluation(period=100)
         ]
         
         self.model = lgb.train(
             self.config,
             train_data,
-            valid_sets=[train_data, val_data],
-            valid_names=['train', 'val'],
+            num_boost_round=self.num_boost_round,
+            valid_sets=[train_data, es_data],
+            valid_names=['train', 'early_stop'],
             callbacks=callbacks
         )
         
         logger.info(f"GBM training complete. Best iteration: {self.model.best_iteration}")
         
-        # ADDED: Evaluate and save as best if it's better
+        # Evaluate on the ENSEMBLE val set for reporting only (not for stopping)
         val_preds = self.model.predict(X_val, num_iteration=self.model.best_iteration)
         val_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
         
         if val_rmse < self.best_score:
             self.best_score = val_rmse
             self.best_model = self.model
-            logger.info(f"✅ New best GBM model: RMSE={val_rmse:.4f} (normalized)")
+            logger.info(f"New best GBM model: RMSE={val_rmse:.4f} (normalized, on ensemble val set)")
         
         return self.model
     

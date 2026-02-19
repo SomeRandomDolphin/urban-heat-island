@@ -152,9 +152,18 @@ class EnsemblePredictor:
                    f"GBM: {self.weights['gbm']:.3f}")
         
         # Load base CNN model
+        # Handle both checkpoint dicts (from CheckpointManager) and plain state_dicts (final_cnn.pth)
         logger.info("Loading CNN model...")
         base_model = UNet(in_channels=CNN_CONFIG["input_channels"], out_channels=1)
-        base_model.load_state_dict(torch.load(cnn_model_path, map_location=self.device))
+        raw = torch.load(cnn_model_path, map_location=self.device, weights_only=False)
+        if isinstance(raw, dict) and "model_state_dict" in raw:
+            # Full checkpoint saved by CheckpointManager (best_r2.pth)
+            base_model.load_state_dict(raw["model_state_dict"])
+            logger.info(f"  Loaded from checkpoint dict (epoch {raw.get('epoch', '?')+1})")
+        else:
+            # Plain state dict (final_cnn.pth)
+            base_model.load_state_dict(raw)
+            logger.info("  Loaded from plain state dict")
         
         # Wrap with MC Dropout
         self.cnn_model = MCDropoutUNet(base_model, dropout_rate=mc_dropout_rate)
@@ -166,6 +175,23 @@ class EnsemblePredictor:
         with open(gbm_model_path, 'rb') as f:
             self.gbm_model = pickle.load(f)
         logger.info("✅ GBM model loaded")
+        
+        # ── Load post-hoc linear calibration (fitted on val set during training) ──
+        # Fixes the systematic range compression observed at inference (slope ≈ 0.65).
+        # Applied in NORMALIZED space before denormalization.
+        cal_path = Path(cnn_model_path).parent / "calibration_params.json"
+        if cal_path.exists():
+            with open(cal_path, 'r') as f:
+                cal = json.load(f)
+            self.cal_slope     = float(cal.get("slope",     1.0))
+            self.cal_intercept = float(cal.get("intercept", 0.0))
+            logger.info(f"✅ Loaded calibration params: slope={self.cal_slope:.4f}, "
+                       f"intercept={self.cal_intercept:.4f}")
+        else:
+            logger.warning(f"⚠️  calibration_params.json not found at {cal_path}. "
+                           "Predictions will NOT be calibrated. Run train_ensemble.py to generate it.")
+            self.cal_slope     = 1.0
+            self.cal_intercept = 0.0
     
     def validate_input(self, X: np.ndarray) -> bool:
         """Validate that input data is properly normalized"""
@@ -228,7 +254,16 @@ class EnsemblePredictor:
         logger.info(f"  CNN raw predictions (normalized): "
                    f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
         
-        return predictions  # Return NORMALIZED predictions
+        # ── Apply post-hoc linear calibration in NORMALIZED space ─────────
+        # y_cal = cal_slope * y_pred + cal_intercept
+        # This corrects the systematic range compression (slope < 1) seen at inference.
+        if self.cal_slope != 1.0 or self.cal_intercept != 0.0:
+            predictions = self.cal_slope * predictions + self.cal_intercept
+            logger.info(f"  CNN calibrated predictions (normalized): "
+                       f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
+        # ──────────────────────────────────────────────────────────────────
+        
+        return predictions  # Return NORMALIZED (calibrated) predictions
     
     def _predict_gbm_normalized(self, X: np.ndarray) -> np.ndarray:
         """
@@ -751,13 +786,32 @@ class PostProcessor:
         
         return np.clip(lst_map, self.config["temp_min"], self.config["temp_max"])
     
-    def process(self, lst_map: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
-        """Apply full post-processing pipeline"""
+    def process(self, lst_map: np.ndarray, mask: Optional[np.ndarray] = None,
+                apply_filter: bool = False) -> np.ndarray:
+        """Apply full post-processing pipeline.
+        
+        Args:
+            lst_map: LST predictions in Celsius
+            mask: Optional validity mask
+            apply_filter: Whether to apply bilateral filter.
+                          Default False — bilateral filtering reduces spatial variance
+                          which worsens the prediction slope (range compression).
+                          Only enable for visualization purposes, not for evaluation.
+        """
         logger.info("Post-processing LST predictions...")
         logger.info(f"  Input: mean={lst_map.mean():.2f}°C, std={lst_map.std():.2f}°C")
         
         processed = self.fill_nodata(lst_map, mask)
-        processed = self.apply_bilateral_filter(processed)
+        
+        if apply_filter:
+            # ⚠️  Bilateral filter reduces variance — only use for visual output,
+            # never when computing metrics or calibrating.
+            logger.warning("⚠️  Bilateral filter enabled. This reduces spatial variance "
+                           "and will worsen slope/std_ratio metrics. Use only for visualization.")
+            processed = self.apply_bilateral_filter(processed)
+        else:
+            logger.info("  Bilateral filter skipped (use apply_filter=True for visualization)")
+        
         processed = self.clip_values(processed)
         
         logger.info(f"  Output: mean={processed.mean():.2f}°C, std={processed.std():.2f}°C")

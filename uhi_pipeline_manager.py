@@ -81,10 +81,27 @@ def main():
     test_data_dir = Path(args.test_data)
     normalization_stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
     
+    # Resolve CNN path: prefer best_r2 checkpoint (saved by CheckpointManager)
+    # over final_cnn.pth (last epoch, may be overfit).
+    best_cnn_path   = model_dir / "checkpoints" / "best_r2.pth"
+    final_cnn_path  = model_dir / "final_cnn.pth"
+    cnn_path_to_use = best_cnn_path if best_cnn_path.exists() else final_cnn_path
+    if best_cnn_path.exists():
+        logger.info(f"Using BEST CNN checkpoint: {best_cnn_path}")
+    else:
+        logger.warning("checkpoints/best_r2.pth not found, falling back to final_cnn.pth")
+
+    # Also prefer best GBM model if available
+    best_gbm_path   = model_dir / "best_gbm_model.pkl"
+    final_gbm_path  = model_dir / "gbm_model.pkl"
+    gbm_path_to_use = best_gbm_path if best_gbm_path.exists() else final_gbm_path
+    if best_gbm_path.exists():
+        logger.info(f"Using BEST GBM model: {best_gbm_path}")
+
     # Verify required files exist
     required_files = [
-        model_dir / "final_cnn.pth",
-        model_dir / "gbm_model.pkl",
+        cnn_path_to_use,
+        gbm_path_to_use,
         model_dir / "ensemble_config.json",
         normalization_stats_path
     ]
@@ -156,8 +173,8 @@ def main():
     
     try:
         predictor = EnsemblePredictor(
-            cnn_model_path=model_dir / "final_cnn.pth",
-            gbm_model_path=model_dir / "gbm_model.pkl",
+            cnn_model_path=cnn_path_to_use,
+            gbm_model_path=gbm_path_to_use,
             ensemble_config_path=model_dir / "ensemble_config.json",
             normalization_stats_path=normalization_stats_path,
             device="cuda",
@@ -304,55 +321,51 @@ def main():
             logger.info(f"  Denormalized ground truth: "
                     f"mean={y_test_celsius.mean():.2f}°C")
             
-            # CRITICAL FIX: Compare ALL samples, not just the first one!
-            logger.info(f"\n  Comparing all {len(results['ensemble'])} test samples...")
+            # Run TTA predictions (these are the authoritative predictions for metrics)
+            # BUG FIX: Previously, predictions_flat was captured from the first predict_ensemble()
+            # call, then TTA ran and overwrote `results`, but metrics were still computed from the
+            # stale predictions_flat. Now TTA runs first, then predictions_flat is captured from it.
+            logger.info("\n" + "="*70)
+            logger.info("GENERATING PREDICTIONS WITH TTA")
+            logger.info("="*70)
+            logger.info(f"Processing {len(X_test)} test samples with 8 augmentations...")
             
-            # Flatten all predictions and ground truth
+            try:
+                results = predictor.predict_ensemble_with_tta(
+                    X_test,
+                    batch_size=args.batch_size,
+                    n_augmentations=8,
+                    return_uncertainty=True,
+                    use_spatial_ensemble=args.use_spatial_ensemble
+                )
+                logger.info("TTA predictions generated successfully")
+                logger.info(f"  Shape: {results['ensemble'].shape}")
+                logger.info(f"  Range: [{results['ensemble'].min():.2f}, {results['ensemble'].max():.2f}]°C")
+                logger.info(f"  Mean: {results['ensemble'].mean():.2f}°C +/- {results['ensemble'].std():.2f}°C")
+                logger.info(f"  TTA Uncertainty: {results['tta_uncertainty'].mean():.2f}°C")
+            except Exception as e:
+                logger.error(f"TTA prediction failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+
+            # Now capture predictions from TTA results (not the earlier predict_ensemble call)
+            logger.info(f"\n  Comparing all {len(results['ensemble'])} test samples...")
             predictions_flat = results["ensemble"].flatten()
             ground_truth_flat = y_test_celsius.flatten()
-            
+
             # Remove NaN values
             mask = ~(np.isnan(predictions_flat) | np.isnan(ground_truth_flat))
             predictions_flat = predictions_flat[mask]
             ground_truth_flat = ground_truth_flat[mask]
-            
+
             logger.info(f"  Valid pixels: {len(predictions_flat):,}")
             logger.info(f"  Predictions: mean={predictions_flat.mean():.2f}°C, std={predictions_flat.std():.2f}°C")
             logger.info(f"  Ground truth: mean={ground_truth_flat.mean():.2f}°C, std={ground_truth_flat.std():.2f}°C")
 
-            # Generate predictions with TTA
-            logger.info("\n" + "="*70)
-            logger.info("GENERATING PREDICTIONS WITH TTA")
-            logger.info("="*70)
-            logger.info(f"Processing {len(X_test)} test samples...")
-            logger.info("Note: Using Test-Time Augmentation for robust predictions")
-            
-            try:
-                results = predictor.predict_ensemble_with_tta(
-                    X_test,  # NORMALIZED data
-                    batch_size=args.batch_size,
-                    n_augmentations=8,  # Use 8 augmentations
-                    return_uncertainty=True,
-                    use_spatial_ensemble=args.use_spatial_ensemble
-                )
-                
-                logger.info("✅ Predictions generated successfully")
-                logger.info(f"  Shape: {results['ensemble'].shape}")
-                logger.info(f"  Range: [{results['ensemble'].min():.2f}, "
-                        f"{results['ensemble'].max():.2f}]°C")
-                logger.info(f"  Mean: {results['ensemble'].mean():.2f}°C ± "
-                        f"{results['ensemble'].std():.2f}°C")
-                logger.info(f"  TTA Uncertainty: {results['tta_uncertainty'].mean():.2f}°C")
-                
-            except Exception as e:
-                logger.error(f"❌ Prediction failed: {e}")
-                import traceback
-                traceback.print_exc()
-                return 1
-            
-            # Calculate metrics manually
+            # Calculate metrics
             from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-            
+
             r2 = r2_score(ground_truth_flat, predictions_flat)
             rmse = np.sqrt(mean_squared_error(ground_truth_flat, predictions_flat))
             mae = mean_absolute_error(ground_truth_flat, predictions_flat)

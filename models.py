@@ -1,10 +1,3 @@
-"""
-Deep Learning models for Urban Heat Island detection with Ensemble support - FIXED VERSION
-Key fixes:
-1. Added bias penalty to LSTLoss
-2. Added variance penalty to prevent constant predictions
-3. Improved loss monitoring
-"""
 import sys
 import torch
 import torch.nn as nn
@@ -200,32 +193,45 @@ class ProgressiveLSTLoss(nn.Module):
         mse = F.mse_loss(pred, target)
         components['mse'] = mse.item()
         
-        # 2. Variance Preservation - Prevent clustering
-        pred_var = torch.var(pred)
-        target_var = torch.var(target)
-        variance_loss = (pred_var - target_var) ** 2
+        # 2. Variance Preservation (NORMALIZED: relative ratio, not raw squared diff)
+        # Penalizes when pred_std / target_std deviates from 1.0
+        # This is scale-invariant, so the weight is stable across datasets
+        pred_std = pred.std() + 1e-8
+        target_std = target.std() + 1e-8
+        std_ratio = pred_std / target_std
+        # Use log ratio: 0 when ratio=1, symmetric, scale-invariant
+        variance_loss = torch.log(std_ratio) ** 2
         components['variance'] = variance_loss.item()
+        components['std_ratio'] = std_ratio.item()
         
-        # 3. Range Preservation - Prevent compression
-        pred_range = pred.max() - pred.min()
-        target_range = target.max() - target.min()
-        range_loss = (pred_range - target_range) ** 2
-        components['range'] = range_loss.item()
+        # 3. Slope Penalty - directly punishes range compression (pred = slope * target + intercept)
+        # Calculated via covariance: slope = cov(pred, target) / var(target)
+        pred_flat = pred.flatten()
+        target_flat = target.flatten()
+        pred_centered = pred_flat - pred_flat.mean()
+        target_centered = target_flat - target_flat.mean()
+        cov = (pred_centered * target_centered).mean()
+        target_var = (target_centered ** 2).mean() + 1e-8
+        slope = cov / target_var
+        # Penalize slope deviating from 1.0
+        slope_loss = (slope - 1.0) ** 2
+        components['slope'] = slope.item()
+        components['range'] = slope_loss.item()
         
-        # 4. Bias Penalty
-        bias_loss = (pred.mean() - target.mean()) ** 2
+        # 4. Bias Penalty (NORMALIZED: relative to target std for scale stability)
+        bias = (pred_flat.mean() - target_flat.mean()) / target_std
+        bias_loss = bias ** 2
         components['bias'] = bias_loss.item()
         
         # Track distribution metrics
-        components['pred_std'] = pred.std().item()
-        components['target_std'] = target.std().item()
-        components['std_ratio'] = (pred.std() / target.std()).item() if target.std() > 0 else 0
+        components['pred_std'] = pred_std.item()
+        components['target_std'] = target_std.item()
         
         # Total loss
         total = (
             self.mse_weight * mse +
             self.variance_weight * variance_loss +
-            self.range_weight * range_loss +
+            self.range_weight * slope_loss +
             self.bias_weight * bias_loss
         )
         
