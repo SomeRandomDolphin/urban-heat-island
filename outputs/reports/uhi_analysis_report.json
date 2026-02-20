@@ -1,23 +1,72 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-02-19 17:37:09",
+  "date": "2026-02-20 13:39:03",
   "uhi_characterization": {
-    "maximum_intensity": "2.83\u00b0C",
-    "mean_intensity": "1.00\u00b0C",
-    "spatial_extent": "1.76 km\u00b2",
-    "magnitude": "4260.67\u00b0C\u00b7pixels"
+    "maximum_intensity": "3.10\u00b0C",
+    "mean_intensity": "0.99\u00b0C",
+    "spatial_extent": "1.72 km\u00b2",
+    "magnitude": "4155.09\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 0,
-    "total_hotspot_area": "0.00 km\u00b2",
-    "largest_hotspot": "N/A",
-    "highest_temperature": "N/A"
+    "total_hotspots": 3,
+    "total_hotspot_area": "0.12 km\u00b2",
+    "largest_hotspot": "0.070 km\u00b2",
+    "highest_temperature": "40.23\u00b0C"
   },
-  "top_priority_hotspots": [],
+  "top_priority_hotspots": [
+    {
+      "id": 1,
+      "n_pixels": 28,
+      "area_km2": 0.07,
+      "centroid_y": 3.607142857142857,
+      "centroid_x": 56.964285714285715,
+      "mean_lst": 40.164913177490234,
+      "max_lst": 40.22549819946289,
+      "mean_gi_star": 2.1224599875722614,
+      "max_gi_star": 2.2990028858184814,
+      "intensity_score": 1.0,
+      "extent_score": 1.0,
+      "significance_score": 1.0,
+      "priority_score": 1.0,
+      "rank": 1
+    },
+    {
+      "id": 2,
+      "n_pixels": 14,
+      "area_km2": 0.035,
+      "centroid_y": 5.0,
+      "centroid_x": 33.5,
+      "mean_lst": 39.95343017578125,
+      "max_lst": 40.033016204833984,
+      "mean_gi_star": 2.0807855844497682,
+      "max_gi_star": 2.1659703254699707,
+      "intensity_score": 0.012398681749354235,
+      "extent_score": 0.41666666666666663,
+      "significance_score": 0.6075769088887851,
+      "priority_score": 0.31223254536637723,
+      "rank": 2
+    },
+    {
+      "id": 3,
+      "n_pixels": 4,
+      "area_km2": 0.010000000000000002,
+      "centroid_y": 60.0,
+      "centroid_x": 29.5,
+      "mean_lst": 39.950775146484375,
+      "max_lst": 39.98355484008789,
+      "mean_gi_star": 2.014094692468643,
+      "max_gi_star": 2.0703396797180176,
+      "intensity_score": 0.0,
+      "extent_score": 0.0,
+      "significance_score": 0.3254830101272318,
+      "priority_score": 0.09764490303816954,
+      "rank": 3
+    }
+  ],
   "validation": {
-    "r2_score": "0.7191",
-    "rmse": "2.8745\u00b0C",
-    "mae": "2.1667\u00b0C",
-    "bias": "-0.0367\u00b0C"
+    "r2_score": "0.7397",
+    "rmse": "2.7670\u00b0C",
+    "mae": "2.0550\u00b0C",
+    "bias": "-0.0261\u00b0C"
   }
 }

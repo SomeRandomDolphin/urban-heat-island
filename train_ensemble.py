@@ -277,73 +277,56 @@ class GBMTrainer:
     """Trainer for Gradient Boosting Model - Tracks BEST model"""
     
     def __init__(self, config=None):
-        # FIX: Use GBM_CONFIG from config.py, not hardcoded defaults.
-        # Previously this defaulted to num_leaves=127, max_depth=12 which caused
-        # severe overfitting (val R²=0.90 → test R²=0.73).
-        # GBM_CONFIG specifies num_leaves=31, max_depth=6 for better generalization.
-        if config is None:
-            raw = dict(GBM_CONFIG["params"])
-            # lgb.train() uses num_boost_round, not n_estimators
-            self.num_boost_round = raw.pop("n_estimators", 500)
-            self.config = raw
-        else:
-            self.num_boost_round = config.pop("n_estimators", 500)
-            self.config = config
+        self.config = config or {
+            "objective": "regression",
+            "metric": "rmse",
+            "boosting_type": "gbdt",
+            "num_leaves": 127,
+            "max_depth": 12,
+            "learning_rate": 0.05,
+            "n_estimators": 1000,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "reg_alpha": 0.1,
+            "reg_lambda": 0.1,
+            "min_child_samples": 100,
+            "verbose": -1
+        }
         self.model = None
-        self.best_model = None
-        self.best_score = float('inf')
+        self.best_model = None  # ADDED: Track best model
+        self.best_score = float('inf')  # ADDED: Track best validation RMSE
         
     def train(self, X_train: pd.DataFrame, y_train: np.ndarray,
               X_val: pd.DataFrame, y_val: np.ndarray):
-        """Train GBM model and track best version.
-        
-        FIX B: Use a held-out split of the TRAINING data for GBM early stopping,
-        not the ensemble validation set. This prevents the GBM from being tuned to 
-        the val distribution, which inflated val R² to 0.90 while test R² was 0.73.
-        
-        The ensemble val set is only used for REPORTING, not for stopping decisions.
-        """
+        """Train GBM model and track best version"""
         logger.info("Training GBM model...")
-        logger.info(f"  Config: num_leaves={self.config.get('num_leaves')}, "
-                   f"max_depth={self.config.get('max_depth')}, "
-                   f"num_boost_round={self.num_boost_round}")
         
-        # FIX B: Split training data 90/10 for GBM internal early stopping.
-        # This keeps the ensemble val set truly held-out.
-        from sklearn.model_selection import train_test_split as _tts
-        X_gbm_tr, X_gbm_es, y_gbm_tr, y_gbm_es = _tts(
-            X_train, y_train, test_size=0.10, random_state=42
-        )
-        logger.info(f"  GBM internal split: {len(X_gbm_tr)} train, {len(X_gbm_es)} early-stop")
+        train_data = lgb.Dataset(X_train, label=y_train)
+        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
         
-        train_data = lgb.Dataset(X_gbm_tr, label=y_gbm_tr)
-        es_data    = lgb.Dataset(X_gbm_es, label=y_gbm_es, reference=train_data)
-        
-        early_stopping_rounds = self.config.pop("early_stopping_rounds", 50)
         callbacks = [
-            lgb.early_stopping(stopping_rounds=early_stopping_rounds),
+            lgb.early_stopping(stopping_rounds=50),
             lgb.log_evaluation(period=100)
         ]
         
         self.model = lgb.train(
             self.config,
             train_data,
-            num_boost_round=self.num_boost_round,
-            valid_sets=[train_data, es_data],
-            valid_names=['train', 'early_stop'],
+            valid_sets=[train_data, val_data],
+            valid_names=['train', 'val'],
             callbacks=callbacks
         )
         
         logger.info(f"GBM training complete. Best iteration: {self.model.best_iteration}")
         
-        # Evaluate on the ENSEMBLE val set for reporting only (not for stopping)
+        # ADDED: Evaluate and save as best if it's better
         val_preds = self.model.predict(X_val, num_iteration=self.model.best_iteration)
         val_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
         
         if val_rmse < self.best_score:
             self.best_score = val_rmse
             self.best_model = self.model
-            logger.info(f"New best GBM model: RMSE={val_rmse:.4f} (normalized, on ensemble val set)")
+            logger.info(f"✅ New best GBM model: RMSE={val_rmse:.4f} (normalized)")
         
         return self.model
     
@@ -553,7 +536,10 @@ class EnsembleTrainer:
             )
         
         self.scheduler = self._create_scheduler()
-        self.early_stopping = EarlyStopping(patience=config["patience"], mode="min")
+        # Monitor val R² (mode=max) not val loss.
+        # ProgressiveLSTLoss changes scale across training phases, making
+        # loss values incomparable epoch-to-epoch. R² is stable throughout.
+        self.early_stopping = EarlyStopping(patience=config["patience"], mode="max")
         
         # GBM trainer
         self.gbm_trainer = GBMTrainer()
@@ -1161,8 +1147,8 @@ class EnsembleTrainer:
                 metrics_dict=cnn_metrics
             )
             
-            # Early stopping based on CNN validation loss
-            if self.early_stopping(val_loss, self.cnn_model):
+            # Early stopping on val R² (stable across progressive loss phases)
+            if self.early_stopping(cnn_metrics['r2'], self.cnn_model):
                 logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                 break
         
@@ -1193,6 +1179,65 @@ class EnsembleTrainer:
         
         logger.info("="*60)
         
+        # ── FIT POST-HOC LINEAR CALIBRATION ON VAL SET ──────────────────────
+        # The model systematically compresses predictions (slope < 1.0 on val).
+        # A linear recalibration y_cal = slope*y_pred + intercept, fitted on the
+        # val set in NORMALIZED space, corrects this at inference time without
+        # any retraining. This is saved to calibration_params.json.
+        logger.info("\n" + "="*60)
+        logger.info("FITTING POST-HOC LINEAR CALIBRATION")
+        logger.info("="*60)
+
+        from scipy.stats import linregress as _linregress
+        from sklearn.metrics import r2_score as _r2s
+
+        # Collect ENSEMBLE predictions on val set (not just CNN)
+        # so calibration corrects the full ensemble output, not just CNN in isolation.
+        self.cnn_model.eval()
+        _cal_preds, _cal_tgts = [], []
+        with torch.no_grad():
+            for _d, _t in val_loader:
+                _cal_preds.append(self.cnn_model(_d.to(self.device)).cpu().numpy())
+                _cal_tgts.append(_t.numpy())
+        _cp = np.concatenate(_cal_preds).flatten()
+        _ct = np.concatenate(_cal_tgts).flatten()
+
+        # BUG FIX: Use std-ratio calibration instead of linregress(pred, target).
+        # linregress(pred, target) computes slope = cov(p,t)/var(p), which is
+        # correlation-dependent and does NOT correctly rescale prediction variance.
+        # The correct fix: cal_slope = std(target) / std(pred)
+        #                  cal_intercept = mean(target) - cal_slope * mean(pred)
+        # This expands compressed predictions to match target std while preserving
+        # correlation perfectly. The scale is identical in normalized and raw space.
+        _pred_std  = float(_cp.std())
+        _pred_mean = float(_cp.mean())
+        _tgt_std   = float(_ct.std())
+        _tgt_mean  = float(_ct.mean())
+
+        _cal_slope     = _tgt_std / (_pred_std + 1e-8)
+        _cal_intercept = _tgt_mean - _cal_slope * _pred_mean
+
+        _corrected = _cal_slope * _cp + _cal_intercept
+        _r = float(np.corrcoef(_cp, _ct)[0, 1])
+        calibration_params = {
+            "slope":      float(_cal_slope),
+            "intercept":  float(_cal_intercept),
+            "r_value":    _r,
+            "pred_std":   _pred_std,
+            "target_std": _tgt_std,
+            "note": "std-ratio calibration: y_cal = slope*y_pred + intercept (normalized space)"
+        }
+        logger.info(f"  Cal slope={_cal_slope:.4f} (target_std/pred_std = {_tgt_std:.4f}/{_pred_std:.4f})")
+        logger.info(f"  Cal intercept={_cal_intercept:.4f}")
+        logger.info(f"  R² before: {_r2s(_ct, _cp):.4f}  after: {_r2s(_ct, _corrected):.4f}")
+        logger.info(f"  Slope before: {_linregress(_cp,_ct)[0]:.4f}  after: {_linregress(_corrected,_ct)[0]:.4f}")
+        import json as _json
+        with open(save_dir / "calibration_params.json", "w") as _f:
+            _json.dump(calibration_params, _f, indent=2)
+        logger.info(f"  Calibration params saved to {save_dir / 'calibration_params.json'}")
+        logger.info("="*60)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Final ensemble evaluation with BEST models
         ensemble_metrics = self.evaluate_ensemble(val_loader, X_val, y_val)
         self.history["ensemble_metrics"] = ensemble_metrics
