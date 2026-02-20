@@ -1,23 +1,56 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-02-20 15:49:21",
+  "date": "2026-02-20 18:29:14",
   "uhi_characterization": {
-    "maximum_intensity": "3.68\u00b0C",
-    "mean_intensity": "1.82\u00b0C",
-    "spatial_extent": "5.67 km\u00b2",
-    "magnitude": "7657.06\u00b0C\u00b7pixels"
+    "maximum_intensity": "1.18\u00b0C",
+    "mean_intensity": "0.16\u00b0C",
+    "spatial_extent": "0.00 km\u00b2",
+    "magnitude": "684.11\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 0,
-    "total_hotspot_area": "0.00 km\u00b2",
-    "largest_hotspot": "N/A",
-    "highest_temperature": "N/A"
+    "total_hotspots": 2,
+    "total_hotspot_area": "0.62 km\u00b2",
+    "largest_hotspot": "0.613 km\u00b2",
+    "highest_temperature": "33.87\u00b0C"
   },
-  "top_priority_hotspots": [],
+  "top_priority_hotspots": [
+    {
+      "id": 1,
+      "n_pixels": 245,
+      "area_km2": 0.6125000000000002,
+      "centroid_y": 38.118367346938776,
+      "centroid_x": 5.4,
+      "mean_lst": 33.4927978515625,
+      "max_lst": 33.87382125854492,
+      "mean_gi_star": 2.940263439516328,
+      "max_gi_star": 4.906692028045654,
+      "intensity_score": 1.0,
+      "extent_score": 1.0,
+      "significance_score": 1.0,
+      "priority_score": 1.0,
+      "rank": 1
+    },
+    {
+      "id": 2,
+      "n_pixels": 4,
+      "area_km2": 0.010000000000000002,
+      "centroid_y": 58.5,
+      "centroid_x": 0.0,
+      "mean_lst": 33.26551818847656,
+      "max_lst": 33.32710266113281,
+      "mean_gi_star": 2.143842804431915,
+      "max_gi_star": 2.2594666481018066,
+      "intensity_score": 0.0,
+      "extent_score": 0.0,
+      "significance_score": 0.10162807828289509,
+      "priority_score": 0.030488423484868528,
+      "rank": 2
+    }
+  ],
   "validation": {
-    "r2_score": "0.7485",
-    "rmse": "2.7315\u00b0C",
-    "mae": "2.0358\u00b0C",
-    "bias": "0.0462\u00b0C"
+    "r2_score": "0.7531",
+    "rmse": "2.6136\u00b0C",
+    "mae": "1.9509\u00b0C",
+    "bias": "0.0289\u00b0C"
   }
 }
