@@ -1125,13 +1125,61 @@ class EnhancedDatasetCreator(DatasetCreator):
             count = np.sum(spatial_blocks == block_idx)
             logger.info(f"  Block {block_idx}: {count} samples ({count/n_samples*100:.1f}%)")
         
-        # Combine season and spatial stratification
-        # Each sample gets a unique stratum ID combining season and spatial block
-        strata = seasons * n_spatial_blocks + spatial_blocks
+        # ── LST VARIANCE STRATIFICATION (key fix) ─────────────────────────────
+        # The original split stratified only by season+spatial block, which left
+        # the test set with ~16% wider LST temperature range than val. This caused
+        # a persistent val→test R² gap of ~0.17 across all model changes.
+        # Fix: bin each patch by its LST std (temperature spread) and include that
+        # bin in the stratification key so all splits have the same variance profile.
+        lst_stds = np.array([y[i].std() for i in range(n_samples)])
+        # Use 4 variance bins (quartile-based on training population)
+        lst_std_bins = pd.qcut(lst_stds, q=4, labels=False, duplicates='drop')
+        n_variance_bins = len(np.unique(lst_std_bins))
+        logger.info(f"\nLST variance bins ({n_variance_bins} quartile bins):")
+        for b in range(n_variance_bins):
+            mask = lst_std_bins == b
+            logger.info(f"  Bin {b}: {mask.sum()} patches, "
+                       f"LST std range [{lst_stds[mask].min():.2f}, {lst_stds[mask].max():.2f}]°C")
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Combine season, spatial block, AND LST variance bin into stratum key
+        strata = (seasons * n_spatial_blocks * n_variance_bins
+                + spatial_blocks * n_variance_bins
+                + lst_std_bins)
+
         unique_strata = len(np.unique(strata))
-        
-        logger.info(f"\nCombined stratification: {unique_strata} unique strata")
-        
+        logger.info(f"\nCombined stratification (season × spatial × LST-var): {unique_strata} unique strata")
+
+        from collections import Counter
+
+        class_counts = Counter(strata)
+
+        valid_indices = np.array([
+            i for i, label in enumerate(strata)
+            if class_counts[label] >= 2
+        ])
+
+        if len(valid_indices) < len(strata):
+            removed = len(strata) - len(valid_indices)
+            logger.warning(
+                f"Removing {removed} samples from rare strata (<2 samples)"
+            )
+
+        # Filter everything consistently
+        X = X[valid_indices]
+        y = y[valid_indices]
+        dates = dates[valid_indices]
+        seasons = seasons[valid_indices]
+        spatial_blocks = spatial_blocks[valid_indices]
+        lst_std_bins = lst_std_bins[valid_indices]
+        strata = strata[valid_indices]
+
+        # Update sample count after filtering
+        n_samples = len(X)
+
+        logger.info(f"Samples after rare-strata removal: {n_samples}")
+        # ==========================================================
+
         # First split: train+val vs test
         train_val_idx, test_idx = train_test_split(
             np.arange(n_samples),
@@ -1139,11 +1187,13 @@ class EnhancedDatasetCreator(DatasetCreator):
             stratify=strata,
             random_state=random_seed
         )
-        
+
         logger.info(f"\nInitial split:")
         logger.info(f"  Train+Val: {len(train_val_idx)} samples")
         logger.info(f"  Test: {len(test_idx)} samples")
-        
+        logger.info(f"  LST std — all: {lst_stds.mean():.3f}°C, "
+                   f"test: {lst_stds[test_idx].mean():.3f}°C")
+
         # Second split: train vs val
         strata_train_val = strata[train_val_idx]
         train_idx, val_idx = train_test_split(
@@ -1190,16 +1240,26 @@ class EnhancedDatasetCreator(DatasetCreator):
             for block_idx, pct in block_dist.items():
                 logger.info(f"  Block {block_idx}: {pct*100:.1f}%")
         
-        # Check temperature distribution
+        # Check temperature distribution — now includes per-patch LST std balance check
         train_mean = y_train.mean()
-        val_mean = y_val.mean()
-        test_mean = y_test.mean()
-        
-        logger.info(f"\nMean temperature per split:")
-        logger.info(f"  Train: {train_mean:.2f}°C (std: {y_train.std():.2f}°C)")
-        logger.info(f"  Val:   {val_mean:.2f}°C (std: {y_val.std():.2f}°C)")
-        logger.info(f"  Test:  {test_mean:.2f}°C (std: {y_test.std():.2f}°C)")
-        logger.info(f"  Max difference: {max(train_mean, val_mean, test_mean) - min(train_mean, val_mean, test_mean):.2f}°C")
+        val_mean   = y_val.mean()
+        test_mean  = y_test.mean()
+
+        logger.info(f"\nTemperature distribution per split:")
+        logger.info(f"  Train: mean={train_mean:.2f}°C  std={y_train.std():.3f}°C  "
+                   f"patch-std-mean={lst_stds[train_idx].mean():.3f}°C")
+        logger.info(f"  Val:   mean={val_mean:.2f}°C  std={y_val.std():.3f}°C  "
+                   f"patch-std-mean={lst_stds[val_idx].mean():.3f}°C")
+        logger.info(f"  Test:  mean={test_mean:.2f}°C  std={y_test.std():.3f}°C  "
+                   f"patch-std-mean={lst_stds[test_idx].mean():.3f}°C")
+
+        # Warn if LST variance is still imbalanced (>5% difference)
+        patch_stds = [lst_stds[train_idx].mean(), lst_stds[val_idx].mean(), lst_stds[test_idx].mean()]
+        pct_range = (max(patch_stds) - min(patch_stds)) / np.mean(patch_stds) * 100
+        if pct_range > 5:
+            logger.warning(f"  LST patch-std spread: {pct_range:.1f}% — consider more variance bins")
+        else:
+            logger.info(f"  LST variance balanced across splits (spread: {pct_range:.1f}%) ✓")
         
         logger.info("="*70 + "\n")
         
