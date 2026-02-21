@@ -1,56 +1,23 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-02-21 07:12:04",
+  "date": "2026-02-21 11:20:08",
   "uhi_characterization": {
-    "maximum_intensity": "6.01\u00b0C",
-    "mean_intensity": "2.00\u00b0C",
-    "spatial_extent": "4.12 km\u00b2",
-    "magnitude": "8407.88\u00b0C\u00b7pixels"
+    "maximum_intensity": "4.80\u00b0C",
+    "mean_intensity": "1.70\u00b0C",
+    "spatial_extent": "3.72 km\u00b2",
+    "magnitude": "7212.12\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 2,
-    "total_hotspot_area": "0.17 km\u00b2",
-    "largest_hotspot": "0.075 km\u00b2",
-    "highest_temperature": "44.02\u00b0C"
+    "total_hotspots": 0,
+    "total_hotspot_area": "0.00 km\u00b2",
+    "largest_hotspot": "N/A",
+    "highest_temperature": "N/A"
   },
-  "top_priority_hotspots": [
-    {
-      "id": 1,
-      "n_pixels": 30,
-      "area_km2": 0.07500000000000001,
-      "centroid_y": 51.06666666666667,
-      "centroid_x": 37.86666666666667,
-      "mean_lst": 43.73997116088867,
-      "max_lst": 44.01849365234375,
-      "mean_gi_star": 2.0644680242538453,
-      "max_gi_star": 2.224759101867676,
-      "intensity_score": 1.0,
-      "extent_score": 0.0,
-      "significance_score": 1.0,
-      "priority_score": 0.7,
-      "rank": 1
-    },
-    {
-      "id": 2,
-      "n_pixels": 36,
-      "area_km2": 0.09000000000000002,
-      "centroid_y": 58.888888888888886,
-      "centroid_x": 39.22222222222222,
-      "mean_lst": 43.61224365234375,
-      "max_lst": 43.89567184448242,
-      "mean_gi_star": 2.0625958792368575,
-      "max_gi_star": 2.169135093688965,
-      "intensity_score": 0.0,
-      "extent_score": 1.0,
-      "significance_score": 0.7899070974847493,
-      "priority_score": 0.5369721292454248,
-      "rank": 2
-    }
-  ],
+  "top_priority_hotspots": [],
   "validation": {
-    "r2_score": "0.8102",
-    "rmse": "2.7489\u00b0C",
-    "mae": "2.0344\u00b0C",
-    "bias": "-0.1322\u00b0C"
+    "r2_score": "0.8027",
+    "rmse": "2.8022\u00b0C",
+    "mae": "2.0751\u00b0C",
+    "bias": "-0.0013\u00b0C"
   }
 }

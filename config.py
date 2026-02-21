@@ -207,7 +207,7 @@ TRAINING_CONFIG = {
     "batch_size": 16,  # Was 12 - larger for better gradient estimates
     
     # Training duration
-    "epochs": 200,  # Was 200 - rely more on early stopping
+    "epochs": 500,  # Was 200 - rely more on early stopping
     
     # Learning rate
     "initial_lr": 0.001,  # Was 0.0015 - slightly more conservative
