@@ -28,4 +28,4 @@
 - **Temperature Heatmap** - Smooth temperature gradient
 - **Hotspot Markers** - Top priority hotspots
 
-Generated: 2026-02-20 18:30:47
+Generated: 2026-02-21 07:13:37

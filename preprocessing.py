@@ -918,7 +918,7 @@ class PreprocessingDiagnostics:
                 arr = np.random.default_rng(42).choice(arr, 100_000, replace=False)
             data_lists.append(arr)
 
-        bp = ax.boxplot(data_lists, labels=band_order, patch_artist=True,
+        bp = ax.boxplot(data_lists, tick_labels=band_order, patch_artist=True,
                         showfliers=False, notch=False)
         band_colors = ["#1565C0","#388E3C","#C62828","#7B1FA2","#E65100","#4E342E"]
         for patch, col in zip(bp["boxes"], band_colors[:len(band_order)]):
@@ -1759,27 +1759,39 @@ class SatellitePreprocessor:
         
         return lst_celsius
     
-    def validate_lst(self, lst: np.ndarray, 
-                    min_temp: float = 20, 
-                    max_temp: float = 50) -> Tuple[np.ndarray, Dict]:
+    def validate_lst(self, lst: np.ndarray,
+                    min_temp: float = 10,
+                    max_temp: float = 65) -> Tuple[np.ndarray, Dict]:
         """
-        Validate and clean LST data for Jakarta climate
-        
+        Validate and clean LST data for Jakarta climate.
+
+        Bounds rationale (temperature gate tier 1 — pixel level):
+          min_temp = 10°C  Sub-10°C is unambiguously cloud shadow / instrument
+                           noise at this latitude; Jakarta water bodies stay >20°C.
+          max_temp = 65°C  Tropical impervious surfaces (dark asphalt, metal
+                           roofing) can reach ~60-63°C at midday dry season.
+                           Keeping these pixels lets the model learn the correct
+                           hot-end mapping and corrects slope compression
+                           (observed slope=0.855 → target 1.0).
+                           Values above 65°C are retrieval failures.
+
+        NaN (not clip): clipping would compress real extremes to the boundary
+        value, creating artificial pile-up and biasing UHI magnitude estimates.
+
         Args:
-            lst: Land Surface Temperature array
-            min_temp: Minimum realistic temperature (°C) - default 20°C for Jakarta
-            max_temp: Maximum realistic temperature (°C) - default 50°C for Jakarta (urban surfaces can be hot)
-            
+            lst:      Land Surface Temperature array (°C)
+            min_temp: Minimum physically plausible pixel temperature (°C)
+            max_temp: Maximum physically plausible pixel temperature (°C)
+
         Returns:
             Tuple of (cleaned LST, validation stats)
         """
         lst_clean = lst.copy()
-        
+
         # Count original valid pixels
         original_valid = np.isfinite(lst).sum()
-        
-        # Filter unrealistic values for Jakarta's tropical climate
-        # Jakarta ambient: 24-34°C, but urban surfaces can reach 40-50°C
+
+        # Null out physically impossible values — NaN, not clip.
         lst_clean[(lst < min_temp) | (lst > max_temp)] = np.nan
         
         # Calculate statistics
@@ -1853,9 +1865,25 @@ class SatellitePreprocessor:
         indices["BSI"] = ((swir1 + red) - (nir + blue)) / ((swir1 + red) + (nir + blue) + eps)
         indices["UI"] = (swir2 - nir) / (swir2 + nir + eps)
         
-        # Albedo (simplified surface albedo)
-        albedo = (0.356 * blue + 0.130 * red + 0.373 * nir + 
-                  0.085 * swir1 + 0.072 * swir2 - 0.0018)
+        # Albedo (simplified broadband surface albedo — Liang 2001)
+        # FIX: Landsat Collection 2 Level-2 SR bands are scaled integers.
+        #   Reflectance = DN * 0.0000275 − 0.2   (USGS Collection 2 scaling)
+        #   Sentinel-2 bands are already in surface reflectance (0–1).
+        # Without this conversion Landsat albedo ≈ 0.51 vs S2 ≈ 0.001,
+        # giving sensor-agreement r = 0.687 and a large bias in the fused
+        # albedo channel after multi-sensor fusion.
+        if self.satellite_type == "landsat":
+            blue_r  = np.clip(blue  * 0.0000275 - 0.2, 0.0, 1.0)
+            red_r   = np.clip(red   * 0.0000275 - 0.2, 0.0, 1.0)
+            nir_r   = np.clip(nir   * 0.0000275 - 0.2, 0.0, 1.0)
+            swir1_r = np.clip(swir1 * 0.0000275 - 0.2, 0.0, 1.0)
+            swir2_r = np.clip(swir2 * 0.0000275 - 0.2, 0.0, 1.0)
+        else:
+            # Sentinel-2 is already in reflectance (0–1)
+            blue_r, red_r, nir_r, swir1_r, swir2_r = blue, red, nir, swir1, swir2
+
+        albedo = (0.356 * blue_r + 0.130 * red_r + 0.373 * nir_r +
+                  0.085 * swir1_r + 0.072 * swir2_r - 0.0018)
         indices["albedo"] = np.clip(albedo, 0, 1)
         
         logger.info(f"  Calculated {len(indices)} spectral indices")
@@ -2219,22 +2247,36 @@ class DatasetCreator:
     def extract_patches(self, raster_data: Dict[str, np.ndarray],
                     patch_size: int = 64,
                     stride: int = 32,
-                    min_valid_ratio: float = 0.95,   # RAISED from 0.8: fewer NaN-filled pixels → no spike at normalised 0
-                    min_variance: float = 0.5,    # CHANGED: from 1.0
-                    min_temp: float = 22.0,       # CHANGED: from 24.0
-                    max_temp: float = 48.0) -> List[Dict]:  # CHANGED: from 45.0
+                    min_valid_ratio: float = 0.95,  # RAISED from 0.8: eliminates NaN-heavy patches
+                                                    # that caused the central spike at normalised LST ≈ 0
+                    min_variance: float = 0.5,
+                    min_temp: float = 20.0,         # Patch-mean lower bound (°C)
+                    max_temp: float = 58.0) -> List[Dict]:  # Patch-mean upper bound (°C)
         """
-        Extract patches from raster data with quality control for Jakarta climate
-        
+        Extract patches from raster data with quality control for Jakarta climate.
+
+        Three-tier temperature gate:
+          Tier 1 — pixel level  (validate_lst):    10–65°C  → NaN impossible pixels
+          Tier 2 — patch mean   (here):            20–58°C  → reject artifact-dominated patches
+          Tier 3 — safety clip  (create_training): 10–65°C  → final safety net
+
+        Ceiling rationale (58°C patch mean):
+          The patch mean ceiling was previously 48°C, which excluded genuinely
+          hot dense-urban patches in Jakarta's industrial zones.  Those patches
+          are exactly where UHI signal is strongest; losing them contributes to
+          the observed slope compression (slope=0.855 instead of 1.0).
+          No legitimate 64×64 patch averages above 58°C over Jakarta.
+
         Args:
-            raster_data: Dictionary of raster arrays
-            patch_size: Size of patches (pixels)
-            stride: Stride between patches (pixels)
-            min_valid_ratio: Minimum ratio of valid pixels required
-            min_variance: Minimum LST variance (°C) required
-            min_temp: Minimum mean temperature for Jakarta (°C)
-            max_temp: Maximum mean temperature for Jakarta (°C)
-            
+            raster_data:     Dictionary of raster arrays
+            patch_size:      Size of patches in pixels
+            stride:          Stride between patches
+            min_valid_ratio: Minimum fraction of finite LST pixels (0.95 cuts
+                             edge/cloud patches that caused NaN spike at 0)
+            min_variance:    Minimum LST std (°C); rejects uniform patches
+            min_temp:        Minimum acceptable patch-mean LST (°C)
+            max_temp:        Maximum acceptable patch-mean LST (°C)
+
         Returns:
             List of patch dictionaries
         """
@@ -2312,31 +2354,31 @@ class DatasetCreator:
                         filtered_by_variance += 1
                         continue
                     
-                    # RELAXED: Only check mean temperature, allow pixel variation
+                    # Only check the patch MEAN, not individual pixels, so extreme
+                    # urban heat pixels (dark rooftops, asphalt) are preserved.
                     valid_temps = patch_lst[np.isfinite(patch_lst)]
                     if len(valid_temps) == 0:
                         continue
 
-                    # Calculate patch statistics
                     lst_mean = np.nanmean(patch_lst)
-                    lst_std = np.nanstd(patch_lst)
+                    lst_std  = np.nanstd(patch_lst)
 
-                    # Only reject if MEAN is extreme (not individual pixels)
-                    # Relaxed from 24-45 to 22-48 to include more edge cases
-                    if lst_mean < 22.0 or lst_mean > 48.0:
+                    # Tier 2 patch-mean gate (see docstring for ceiling rationale)
+                    if lst_mean < min_temp or lst_mean > max_temp:
                         filtered_by_temp += 1
                         continue
 
-                    # Remove completely uniform patches (likely bad data)
-                    # Reduced from 1.0 to 0.3 to be less strict
+                    # Reject spatially uniform patches (cloud decks, water, bad data)
                     if lst_std < 0.3:
                         filtered_by_variance += 1
                         continue
 
-                    # OPTIONAL: Keep some samples with extreme pixels for better training
-                    # This helps the model learn to handle hot urban surfaces and cool water bodies
-                    extreme_pixel_ratio = np.sum((valid_temps < 20.0) | (valid_temps > 50.0)) / len(valid_temps)
-                    if extreme_pixel_ratio > 0.3:  # More than 30% extreme pixels - likely bad data
+                    # Reject patches where >20% of pixels are outside the pixel-level
+                    # plausible range [10, 65°C] — matches validate_lst tier bounds.
+                    extreme_pixel_ratio = (
+                        np.sum((valid_temps < 10.0) | (valid_temps > 65.0)) / len(valid_temps)
+                    )
+                    if extreme_pixel_ratio > 0.20:
                         filtered_by_temp += 1
                         continue
                     
@@ -2415,21 +2457,18 @@ class DatasetCreator:
             lst_patch = patch["data"]["LST"].astype(np.float32)
             y[idx, :, :, 0] = lst_patch
 
-            # ── FIX: validate on the ACTUAL patch values, not the zero-initialised array ──
-            # Check valid (non-NaN) pixels only; require at least min_valid_ratio coverage
-            valid_mask = np.isfinite(lst_patch)
-            valid_ratio = valid_mask.mean()
-            if valid_ratio < 0.95:
-                # logger.warning(f"Sample {idx} has low valid ratio ({valid_ratio:.2f}), skipping")
+            # FIX: validate on the actual patch values, NOT the zero-initialised array.
+            # Previously y was checked while still containing zeros for NaN pixels,
+            # so every patch with any NaN was falsely flagged as < 20°C and discarded.
+            valid_fin = np.isfinite(lst_patch)
+            if valid_fin.mean() < 0.95:
+                logger.warning(f"Sample {idx} low valid ratio ({valid_fin.mean():.2f}), skipping")
                 continue
-
-            valid_temps = lst_patch[valid_mask]
-            # Reject if mean is out of range (individual pixels may vary)
-            lst_mean = valid_temps.mean()
-            if lst_mean < 20.0 or lst_mean > 50.0:
-                logger.warning(f"Sample {idx} has out-of-range mean temp ({lst_mean:.1f}°C), marking for removal")
+            valid_temps_s = lst_patch[valid_fin]
+            lst_mean_s = float(valid_temps_s.mean()) if valid_temps_s.size > 0 else 0.0
+            if lst_mean_s < 20.0 or lst_mean_s > 58.0:
+                logger.warning(f"Sample {idx} implausible mean temp ({lst_mean_s:.1f}°C), removing")
                 continue
-            # ──────────────────────────────────────────────────────────────────
 
             valid_samples.append(idx)
 
@@ -2440,34 +2479,56 @@ class DatasetCreator:
             y = y[valid_samples]
             n_samples = len(valid_samples)
 
-        # ── FIX: interpolate residual NaN pixels spatially rather than filling with a constant ──
-        # A constant fill (e.g. 35°C = the global median) collapses to a single value after
-        # z-score normalisation (≈ 0), producing the spike seen in the LST histograms.
-        # Strategy: fill each NaN pixel with the mean of the valid pixels in that same patch.
-        # For features, use per-channel per-patch mean (semantically neutral for normalised indices).
-        n_channels_x = X.shape[-1]
+        # FIX: fill residual NaN pixels with the per-patch mean rather than a global
+        # constant (e.g. 35°C median). A global constant collapses to ~0 after z-score
+        # normalisation, producing the central spike in val/test LST histograms.
+        # Per-patch mean preserves local temperature context with no systematic bias.
+        n_ch = X.shape[-1]
         for s in range(n_samples):
-            # Features
-            for ch in range(n_channels_x):
-                ch_slice = X[s, :, :, ch]
-                nan_mask = ~np.isfinite(ch_slice)
-                if nan_mask.any():
-                    valid_vals = ch_slice[~nan_mask]
-                    fill_val = float(valid_vals.mean()) if valid_vals.size > 0 else 0.0
-                    ch_slice[nan_mask] = fill_val
-                    X[s, :, :, ch] = ch_slice
-            # Target (LST)
-            lst_slice = y[s, :, :, 0]
-            nan_mask = ~np.isfinite(lst_slice)
-            if nan_mask.any():
-                valid_vals = lst_slice[~nan_mask]
-                fill_val = float(valid_vals.mean()) if valid_vals.size > 0 else 35.0
-                lst_slice[nan_mask] = fill_val
-                y[s, :, :, 0] = lst_slice
-        # ───────────────────────────────────────────────────────────────────────────────
+            for ch in range(n_ch):                      # features: per-channel mean fill
+                sl = X[s, :, :, ch]
+                nm = ~np.isfinite(sl)
+                if nm.any():
+                    sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
+                    X[s, :, :, ch] = sl
+            sl = y[s, :, :, 0]                         # LST target: per-patch mean fill
+            nm = ~np.isfinite(sl)
+            if nm.any():
+                sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
+                y[s, :, :, 0] = sl
 
-        # Final sanity clip (should rarely trigger after the above)
-        y = np.clip(y, 20.0, 50.0)
+        # Tier 3 safety clip — matches validate_lst pixel bounds [10, 65°C].
+        # Should rarely trigger; preserves real extreme urban heat values.
+        y = np.clip(y, 10.0, 65.0)
+
+        # ── SAMPLE WEIGHTS for tail upweighting ───────────────────────────────
+        # The model shows slope compression (slope=0.855, std_ratio=0.893):
+        # it under-predicts hot surfaces and over-predicts cool ones.  The root
+        # cause is that mid-range patches (30–38°C) heavily outnumber tail patches
+        # (<28°C or >42°C) in a balanced city-wide dataset.
+        #
+        # Fix: compute a per-sample inverse-frequency weight based on each patch's
+        # mean LST, so the loss sees equal effective representation across the
+        # temperature distribution.  Weights are saved as weights_train.npy for use
+        # in the model trainer (pass to sample_weight= or WeightedRandomSampler).
+        #
+        # Weight formula: w_i = 1 / p(bin_i), normalised so mean(w) = 1.0
+        # Uses 10 equal-width bins across the training LST range.
+        patch_means = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+        n_weight_bins = 10
+        bin_edges = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_weight_bins + 1)
+        bin_ids = np.digitize(patch_means, bin_edges) - 1
+        bin_ids = np.clip(bin_ids, 0, n_weight_bins - 1)
+        bin_counts = np.bincount(bin_ids, minlength=n_weight_bins).astype(float)
+        bin_counts = np.maximum(bin_counts, 1)          # avoid divide-by-zero for empty bins
+        raw_weights = 1.0 / bin_counts[bin_ids]
+        sample_weights = raw_weights / raw_weights.mean()  # normalise: mean weight = 1
+
+        logger.info("  Sample weights for tail upweighting:")
+        logger.info(f"    Weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+        logger.info(f"    Bins: {bin_counts.astype(int).tolist()}")
+        logger.info(f"    Weight per bin: {(1.0/bin_counts/((1.0/bin_counts).mean())).round(2).tolist()}")
+        # ──────────────────────────────────────────────────────────────────────
         
         metadata = {
             "n_samples": n_samples,
@@ -2480,7 +2541,8 @@ class DatasetCreator:
                 "max": float(np.max(y)),
                 "mean": float(np.mean(y)),
                 "std": float(np.std(y))
-            }
+            },
+            "sample_weights": sample_weights,  # shape (N,) — use in trainer for tail upweighting
         }
         
         logger.info(f"Created training samples: X={X.shape}, y={y.shape}")
@@ -2868,14 +2930,10 @@ class EnhancedDatasetCreator(DatasetCreator):
             count = np.sum(spatial_blocks == block_idx)
             logger.info(f"  Block {block_idx}: {count} samples ({count/n_samples*100:.1f}%)")
         
-        # ── LST VARIANCE STRATIFICATION (key fix) ─────────────────────────────
-        # The original split stratified only by season+spatial block, which left
-        # the test set with ~16% wider LST temperature range than val. This caused
-        # a persistent val→test R² gap of ~0.17 across all model changes.
-        # Fix: bin each patch by its LST std (temperature spread) and include that
-        # bin in the stratification key so all splits have the same variance profile.
+        # ── LST VARIANCE STRATIFICATION ───────────────────────────────────────
+        # Bin each patch by LST std so all splits share the same variance profile.
+        # Without this the test set had ~16% wider LST range than val.
         lst_stds = np.array([y[i].std() for i in range(n_samples)])
-        # Use 4 variance bins (quartile-based on training population)
         lst_std_bins = pd.qcut(lst_stds, q=4, labels=False, duplicates='drop')
         n_variance_bins = len(np.unique(lst_std_bins))
         logger.info(f"\nLST variance bins ({n_variance_bins} quartile bins):")
@@ -2884,14 +2942,14 @@ class EnhancedDatasetCreator(DatasetCreator):
             logger.info(f"  Bin {b}: {mask.sum()} patches, "
                        f"LST std range [{lst_stds[mask].min():.2f}, {lst_stds[mask].max():.2f}]°C")
 
-        # ── VALID-PIXEL RATIO STRATIFICATION (new fix) ────────────────────────
-        # Patches with residual NaN pixels were previously not included in the
-        # stratification key.  This caused NaN-heavy patches (clouds/edges) to
-        # cluster non-uniformly across splits, amplifying the central spike in
-        # the val/test LST histograms after normalization.
+        # ── VALID-PIXEL RATIO STRATIFICATION ──────────────────────────────────
+        # NaN-heavy patches (cloud edges, raster borders) were not included in the
+        # stratification key, causing them to cluster non-uniformly in val/test.
+        # After global-constant NaN fill (→ median ≈ 0 normalised) this produced
+        # the central spike in val/test LST histograms. Including a valid-ratio
+        # bin ensures NaN-heavy patches are distributed evenly across splits.
         valid_ratios = np.array([np.isfinite(y[i]).mean() for i in range(n_samples)])
-        # 2 bins: fully-valid (≥0.99) vs. has-some-NaN (<0.99)
-        valid_ratio_bins = (valid_ratios < 0.99).astype(int)
+        valid_ratio_bins = (valid_ratios < 0.99).astype(int)  # 0=fully-valid, 1=has-NaN
         n_valid_bins = len(np.unique(valid_ratio_bins))
         logger.info(f"\nValid-pixel ratio bins ({n_valid_bins} bins):")
         for b in range(n_valid_bins):
@@ -2900,7 +2958,7 @@ class EnhancedDatasetCreator(DatasetCreator):
             logger.info(f"  Bin {b} ({label}): {mask.sum()} patches")
         # ──────────────────────────────────────────────────────────────────────
 
-        # Combine season, spatial block, LST variance bin, AND valid-pixel-ratio bin into stratum key
+        # Combine season × spatial × LST-variance × valid-pixel-ratio into stratum key
         strata = (seasons * n_spatial_blocks * n_variance_bins * n_valid_bins
                 + spatial_blocks * n_variance_bins * n_valid_bins
                 + lst_std_bins * n_valid_bins
@@ -2924,7 +2982,8 @@ class EnhancedDatasetCreator(DatasetCreator):
                 f"Removing {removed} samples from rare strata (<2 samples)"
             )
 
-        # Filter everything consistently
+        # Filter every parallel array consistently — missing a slice here causes
+        # an IndexError or silent shape mismatch in the logging / split code below.
         X = X[valid_indices]
         y = y[valid_indices]
         dates = dates[valid_indices]
@@ -3410,10 +3469,10 @@ def main():
             fused_data,
             patch_size=64,
             stride=24,  # CHANGED: 75% overlap → 3x more patches
-            min_valid_ratio=0.8,  # CHANGED: Higher quality
-            min_variance=0.3,  # CHANGED: Accept more variation
-            min_temp=22.0,
-            max_temp=48.0
+            min_valid_ratio=0.95,  # RAISED: strict NaN filter prevents central LST spike
+            min_variance=0.3,
+            min_temp=20.0,           # Patch-mean lower bound (cloud/shadow below this)
+            max_temp=58.0            # Patch-mean upper bound (raised to admit hot urban patches)
         )
         
         for patch in patches:
@@ -3442,32 +3501,34 @@ def main():
     logger.info("="*70)
     
     temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
-    # Build dates BEFORE create_training_samples so we can filter them in sync with X/y
+    # Build dates BEFORE create_training_samples so they can be filtered in sync
+    # with X/y. If built afterwards from all_patches it stays at full length
+    # (e.g. 9187) while X/y are already reduced (e.g. 7520), causing a
+    # ValueError: operands could not be broadcast together in create_stratified_split.
     dates_all = np.array([patch["date"] for patch in all_patches])
     X, y, metadata = dataset_creator.create_training_samples(all_patches, temporal_features)
 
-    # create_training_samples may drop samples (invalid temperature / low valid-pixel ratio).
-    # Trim dates to the same length so they stay in sync with X and y.
     n_kept = metadata["n_samples"]
     if len(dates_all) != n_kept:
         logger.warning(
             f"create_training_samples dropped {len(dates_all) - n_kept} samples; "
-            f"trimming dates {len(dates_all)} -> {n_kept} to match X/y."
+            f"trimming dates {len(dates_all)} → {n_kept} to match X/y."
         )
-        # Reproduce the same valid_samples mask used inside create_training_samples
+        # Reproduce the acceptance mask used inside create_training_samples:
+        # valid-pixel ratio >= 0.95  AND  patch-mean LST in [20, 58]°C
         valid_mask = []
         for patch in all_patches:
-            lst_patch = patch["data"]["LST"].astype("float32")
-            fin = np.isfinite(lst_patch)
+            lst_p = patch["data"]["LST"].astype("float32")
+            fin = np.isfinite(lst_p)
             if fin.mean() < 0.95:
                 valid_mask.append(False)
                 continue
-            mean_t = float(lst_patch[fin].mean()) if fin.any() else 0.0
-            valid_mask.append(20.0 <= mean_t <= 50.0)
+            mean_t = float(lst_p[fin].mean()) if fin.any() else 0.0
+            valid_mask.append(20.0 <= mean_t <= 58.0)
         dates = dates_all[np.array(valid_mask)]
     else:
         dates = dates_all
-
+    
     # Step 6: Create splits - MODIFIED
     logger.info("\n" + "="*70)
     logger.info("STEP 5: Create train/val/test splits")
@@ -3569,6 +3630,28 @@ def main():
         'sentinel2_files': len(sentinel2_processed) if has_sentinel2 else 0,
         'fused_datasets': len(all_fused_data)
     }
+
+    # Save sample weights for the training split (used for tail upweighting in trainer)
+    sample_weights = metadata.pop("sample_weights", None)
+    if sample_weights is not None:
+        # Align weights with the train split indices used by create_stratified_split.
+        # splits contains 'X_train' etc already subset; we need the weights for those rows.
+        # create_stratified_split does not re-order samples, so train_idx into the
+        # post-rare-strata-filter array is not directly accessible here.
+        # Safe approach: recompute weights from the normalised y_train directly.
+        y_train_raw = splits['y_train']  # already normalised at this point
+        patch_means_train = y_train_raw[:, :, :, 0].reshape(len(y_train_raw), -1).mean(axis=1)
+        n_wb = 10
+        be = np.linspace(patch_means_train.min(), patch_means_train.max() + 1e-6, n_wb + 1)
+        bids = np.clip(np.digitize(patch_means_train, be) - 1, 0, n_wb - 1)
+        bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(float), 1)
+        rw = 1.0 / bc[bids]
+        train_weights = rw / rw.mean()
+        weights_path = output_dataset_dir / "train" / "weights_train.npy"
+        np.save(weights_path, train_weights.astype(np.float32))
+        logger.info(f"✅ Saved sample weights → {weights_path}")
+        logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]  "
+                    f"mean={train_weights.mean():.3f}")
 
     # Save the NORMALIZED dataset
     dataset_creator.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
