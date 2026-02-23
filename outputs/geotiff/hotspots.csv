@@ -1,0 +1,2 @@
+id,n_pixels,area_km2,centroid_y,centroid_x,mean_lst,max_lst,mean_gi_star,max_gi_star,intensity_score,extent_score,significance_score,priority_score,rank
+1,72,0.18000000000000005,53.81944444444444,38.80555555555556,44.16600036621094,44.49160385131836,2.0354824160204994,2.13594126701355,0.0,0.0,0.0,0.0,1

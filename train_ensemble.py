@@ -1,20 +1,3 @@
-"""
-Enhanced training pipeline with CNN + GBM ensemble - IMPROVED VERSION
-Uses BEST validation models for ensemble instead of final models
-
-IMPROVEMENTS (to fix overfitting and improve inference):
-1. ProgressiveLSTLoss - Prevents variance collapse and range compression
-2. Enhanced metrics - Tracks slope and std_ratio to detect issues
-3. Overfitting warnings - Alerts during training when issues detected
-4. Stronger augmentation - Better generalization to unseen data
-5. Diagnostic checks - Monitors training health every 10 epochs
-
-Expected improvements:
-- Reduce train-test gap from 17% to <10%
-- Improve inference R² from 0.75 to >0.85
-- Fix slope from 0.675 to >0.90 (no range compression)
-- Fix std_ratio to ≈1.0 (no variance collapse)
-"""
 import sys
 import torch
 import torch.nn as nn
@@ -32,7 +15,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import lightgbm as lgb
 import pickle
 import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend – safe for headless runs
+matplotlib.use("Agg")  # Non-interactive backend — safe for headless/Windows runs
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import TwoSlopeNorm
@@ -105,9 +88,10 @@ def check_disk_space(path: Path, required_mb: int = 1000) -> bool:
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DIAGNOSTIC PLOTTING MODULE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 class DiagnosticsPlotter:
     """
@@ -115,566 +99,572 @@ class DiagnosticsPlotter:
 
     All figures are saved under `save_dir` (default: MODEL_DIR / "diagnostics").
     Call individual plot_* methods at the right moment in training, or call
-    `plot_all_post_training` once training is finished.
+    `plot_all_post_training` once training is complete.
+
+    Style note: uses seaborn-v0_8-darkgrid when available (matplotlib ≥ 3.6),
+    falls back to ggplot, then plain default — so it works on any matplotlib version.
     """
 
-    STYLE = "seaborn-v0_8-darkgrid"
+    # Ordered preference list — first one that exists wins
+    _STYLE_CANDIDATES = [
+        "seaborn-v0_8-darkgrid",   # matplotlib ≥ 3.6
+        "seaborn-darkgrid",        # matplotlib < 3.6
+        "ggplot",                  # always available
+        "default",
+    ]
 
     def __init__(self, save_dir: Path = None):
         self.save_dir = Path(save_dir) if save_dir else MODEL_DIR / "diagnostics"
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"📊 DiagnosticsPlotter initialised – figures → {self.save_dir}")
+        self._style = self._resolve_style()
+        logger.info(f"📊 DiagnosticsPlotter initialised — style='{self._style}' → {self.save_dir}")
 
-    # ─── helpers ─────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
+    @classmethod
+    def _resolve_style(cls) -> str:
+        """Return the first available matplotlib style from the candidate list."""
+        available = set(plt.style.available)
+        for style in cls._STYLE_CANDIDATES:
+            if style in available:
+                return style
+        return "default"
+
+    def _use_style(self):
+        """Apply the resolved style, swallowing any errors gracefully."""
+        try:
+            plt.style.use(self._style)
+        except Exception:
+            pass  # proceed with whatever style is active
+
     def _save(self, fig, name: str):
         path = self.save_dir / f"{name}.png"
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logger.info(f"  ✅ Saved: {path.name}")
-
-    @staticmethod
-    def _try_style():
         try:
-            plt.style.use(DiagnosticsPlotter.STYLE)
-        except Exception:
-            plt.style.use("ggplot")
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            logger.info(f"  ✅ Saved: {path.name}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not save {path.name}: {e}")
+        finally:
+            plt.close(fig)
 
-    # ─── 1. Training curves ───────────────────────────────────────────────────
+    # ── 1. Training curves ────────────────────────────────────────────────────
     def plot_training_curves(self, history: dict):
-        """
-        4-panel figure:
-          • Train vs Val loss
-          • Val R² over epochs
-          • Learning rate schedule
-          • Weight-norm evolution
-        """
-        self._try_style()
-        epochs = range(1, len(history["train_loss"]) + 1)
+        """4-panel: train/val loss · val R² · LR schedule · weight-norm."""
+        try:
+            self._use_style()
+            epochs = range(1, len(history["train_loss"]) + 1)
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            fig.suptitle("Training Curves", fontsize=16, fontweight="bold")
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle("Training Curves", fontsize=16, fontweight="bold")
-
-        # -- Loss
-        ax = axes[0, 0]
-        ax.plot(epochs, history["train_loss"], label="Train Loss", color="#2196F3")
-        ax.plot(epochs, history["val_loss"],   label="Val Loss",   color="#F44336")
-        ax.set_title("Train vs Validation Loss")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
-        ax.legend()
-
-        # -- R²
-        ax = axes[0, 1]
-        if history["cnn_metrics"]:
-            r2_scores  = [m["r2"]   for m in history["cnn_metrics"]]
-            std_ratios = [m.get("std_ratio", float("nan")) for m in history["cnn_metrics"]]
-            slopes     = [m.get("slope",     float("nan")) for m in history["cnn_metrics"]]
-            ax.plot(epochs, r2_scores,  label="Val R²",     color="#4CAF50")
-            ax.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target (0.85)")
-            ax.set_title("CNN Validation R²")
-            ax.set_xlabel("Epoch"); ax.set_ylabel("R²")
-            ax.set_ylim([-0.1, 1.05])
+            # Loss
+            ax = axes[0, 0]
+            ax.plot(epochs, history["train_loss"], label="Train Loss", color="#2196F3")
+            ax.plot(epochs, history["val_loss"],   label="Val Loss",   color="#F44336")
+            ax.set_title("Train vs Validation Loss"); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
             ax.legend()
 
-        # -- LR
-        ax = axes[1, 0]
-        ax.plot(epochs, history["lr"], color="#FF9800")
-        ax.set_title("Learning Rate Schedule")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("LR")
-        ax.set_yscale("log")
+            # R²
+            ax = axes[0, 1]
+            if history["cnn_metrics"]:
+                r2_scores = [m["r2"] for m in history["cnn_metrics"]]
+                ax.plot(epochs, r2_scores, label="Val R²", color="#4CAF50")
+                ax.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target (0.85)")
+                ax.set_title("CNN Validation R²"); ax.set_xlabel("Epoch"); ax.set_ylabel("R²")
+                ax.set_ylim([-0.1, 1.05]); ax.legend()
 
-        # -- Weight norm
-        ax = axes[1, 1]
-        if "weight_norms" in history and history["weight_norms"]:
-            wn_epochs = range(1, len(history["weight_norms"]) + 1)
-            ax.plot(wn_epochs, history["weight_norms"], color="#9C27B0")
-            ax.set_title("L2 Weight Norm")
-            ax.set_xlabel("Epoch"); ax.set_ylabel("Norm")
-        else:
-            ax.text(0.5, 0.5, "No weight-norm data", ha="center", va="center",
-                    transform=ax.transAxes)
-            ax.set_title("L2 Weight Norm")
+            # LR
+            ax = axes[1, 0]
+            ax.plot(epochs, history["lr"], color="#FF9800")
+            ax.set_title("Learning Rate Schedule"); ax.set_xlabel("Epoch"); ax.set_ylabel("LR")
+            ax.set_yscale("log")
 
-        plt.tight_layout()
-        self._save(fig, "01_training_curves")
+            # Weight norm
+            ax = axes[1, 1]
+            if "weight_norms" in history and history["weight_norms"]:
+                wn_epochs = range(1, len(history["weight_norms"]) + 1)
+                ax.plot(wn_epochs, history["weight_norms"], color="#9C27B0")
+                ax.set_title("L2 Weight Norm"); ax.set_xlabel("Epoch"); ax.set_ylabel("Norm")
+            else:
+                ax.text(0.5, 0.5, "No weight-norm data", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_title("L2 Weight Norm")
 
-    # ─── 2. Regression diagnostics per model ─────────────────────────────────
+            plt.tight_layout()
+            self._save(fig, "01_training_curves")
+        except Exception as e:
+            logger.warning(f"plot_training_curves failed: {e}")
+
+    # ── 2. Predicted vs Actual ────────────────────────────────────────────────
     def plot_pred_vs_actual(self, preds: np.ndarray, targets: np.ndarray,
                             label: str = "Model", metrics: dict = None):
-        """
-        2-panel scatter + residual plot (denormalized °C values).
-        """
-        from scipy.stats import linregress
-        self._try_style()
+        """Scatter + residual plot (denormalised °C values)."""
+        try:
+            from scipy.stats import linregress
+            self._use_style()
 
-        preds   = np.asarray(preds).flatten()
-        targets = np.asarray(targets).flatten()
+            preds   = np.asarray(preds).flatten()
+            targets = np.asarray(targets).flatten()
+            mask    = np.isfinite(preds) & np.isfinite(targets)
+            preds, targets = preds[mask], targets[mask]
 
-        mask = np.isfinite(preds) & np.isfinite(targets)
-        preds, targets = preds[mask], targets[mask]
+            slope, intercept, r_val, *_ = linregress(targets, preds)
+            residuals = preds - targets
 
-        slope, intercept, r_val, *_ = linregress(targets, preds)
-        residuals = preds - targets
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle(f"{label} – Predicted vs Actual", fontsize=14, fontweight="bold")
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f"{label} – Predicted vs Actual", fontsize=14, fontweight="bold")
+            ax = axes[0]
+            sc = ax.scatter(targets, preds, alpha=0.35, s=12,
+                            c=np.abs(residuals), cmap="RdYlGn_r", label="Samples")
+            plt.colorbar(sc, ax=ax, label="|Residual| (°C)")
+            lo = min(targets.min(), preds.min()); hi = max(targets.max(), preds.max())
+            ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect (slope=1)")
+            fit_x = np.linspace(lo, hi, 200)
+            ax.plot(fit_x, slope * fit_x + intercept, "r-", lw=1.5,
+                    label=f"Fit  slope={slope:.3f}")
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Predicted (°C)")
+            ax.legend(fontsize=8)
+            info = [f"R²={r_val**2:.4f}", f"RMSE={np.sqrt(np.mean(residuals**2)):.3f}°C",
+                    f"MAE={np.mean(np.abs(residuals)):.3f}°C",
+                    f"slope={slope:.3f}", f"intercept={intercept:.3f}"]
+            if metrics:
+                info += [f"std_ratio={metrics.get('std_ratio', float('nan')):.3f}",
+                         f"MBE={metrics.get('mbe', float('nan')):.3f}°C"]
+            ax.text(0.03, 0.97, "\n".join(info), transform=ax.transAxes,
+                    fontsize=8, va="top", bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
 
-        # -- Scatter
-        ax = axes[0]
-        sc = ax.scatter(targets, preds, alpha=0.35, s=12, c=np.abs(residuals),
-                        cmap="RdYlGn_r", label="Samples")
-        plt.colorbar(sc, ax=ax, label="|Residual| (°C)")
-        lo = min(targets.min(), preds.min())
-        hi = max(targets.max(), preds.max())
-        ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect (slope=1)")
-        fit_x = np.linspace(lo, hi, 200)
-        ax.plot(fit_x, slope * fit_x + intercept, "r-", lw=1.5,
-                label=f"Fit  slope={slope:.3f}")
-        ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Predicted (°C)")
-        ax.legend(fontsize=8)
+            ax = axes[1]
+            ax.scatter(targets, residuals, alpha=0.35, s=12, color="#5C6BC0")
+            ax.axhline(0, color="black", lw=1.2)
+            ax.axhline(+np.std(residuals), color="orange", ls="--", lw=0.9, label="±1σ")
+            ax.axhline(-np.std(residuals), color="orange", ls="--", lw=0.9)
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Residual (°C)")
+            ax.set_title("Residuals vs Actual"); ax.legend(fontsize=8)
 
-        info_lines = [f"R²={r_val**2:.4f}", f"RMSE={np.sqrt(np.mean(residuals**2)):.3f}°C",
-                      f"MAE={np.mean(np.abs(residuals)):.3f}°C",
-                      f"slope={slope:.3f}", f"intercept={intercept:.3f}"]
-        if metrics:
-            info_lines += [f"std_ratio={metrics.get('std_ratio', float('nan')):.3f}",
-                           f"MBE={metrics.get('mbe', float('nan')):.3f}°C"]
-        ax.text(0.03, 0.97, "\n".join(info_lines), transform=ax.transAxes,
-                fontsize=8, va="top", bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"02_pred_vs_actual_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_pred_vs_actual failed: {e}")
 
-        # -- Residuals
-        ax = axes[1]
-        ax.scatter(targets, residuals, alpha=0.35, s=12, color="#5C6BC0")
-        ax.axhline(0, color="black", lw=1.2)
-        ax.axhline(+np.std(residuals), color="orange", ls="--", lw=0.9, label="±1σ")
-        ax.axhline(-np.std(residuals), color="orange", ls="--", lw=0.9)
-        ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Residual (°C)")
-        ax.set_title("Residuals vs Actual")
-        ax.legend(fontsize=8)
-
-        plt.tight_layout()
-        safe_label = label.replace(" ", "_").replace("(", "").replace(")", "")
-        self._save(fig, f"02_pred_vs_actual_{safe_label}")
-
-    # ─── 3. Residual distribution ─────────────────────────────────────────────
+    # ── 3. Residual distribution ──────────────────────────────────────────────
     def plot_residual_distribution(self, preds: np.ndarray, targets: np.ndarray,
                                    label: str = "Model"):
         """Histogram + Q-Q plot of residuals."""
-        from scipy import stats
-        self._try_style()
+        try:
+            from scipy import stats
+            self._use_style()
+            residuals = (np.asarray(preds) - np.asarray(targets)).flatten()
+            residuals = residuals[np.isfinite(residuals)]
 
-        residuals = (np.asarray(preds) - np.asarray(targets)).flatten()
-        residuals = residuals[np.isfinite(residuals)]
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            fig.suptitle(f"{label} – Residual Distribution", fontsize=14, fontweight="bold")
 
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-        fig.suptitle(f"{label} – Residual Distribution", fontsize=14, fontweight="bold")
-
-        # Histogram
-        ax = axes[0]
-        ax.hist(residuals, bins=60, color="#42A5F5", edgecolor="white", linewidth=0.3,
-                density=True, alpha=0.75, label="Residuals")
-        mu, sigma = residuals.mean(), residuals.std()
-        x_pdf = np.linspace(residuals.min(), residuals.max(), 300)
-        ax.plot(x_pdf, stats.norm.pdf(x_pdf, mu, sigma), "r-", lw=2,
-                label=f"N({mu:.3f}, {sigma:.3f})")
-        ax.axvline(0, color="black", lw=1.2, ls="--")
-        ax.set_xlabel("Residual (°C)"); ax.set_ylabel("Density")
-        ax.legend()
-
-        skew  = stats.skew(residuals)
-        kurt  = stats.kurtosis(residuals)
-        _, p_norm = stats.normaltest(residuals)
-        ax.text(0.97, 0.97,
-                f"skew={skew:.3f}\nkurt={kurt:.3f}\np_norm={p_norm:.3e}",
-                transform=ax.transAxes, fontsize=8, ha="right", va="top",
-                bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
-
-        # Q-Q
-        ax = axes[1]
-        (osm, osr), (slope, intercept, r) = stats.probplot(residuals, dist="norm")
-        ax.scatter(osm, osr, s=6, alpha=0.4, color="#EF5350")
-        qq_line = np.array([osm[0], osm[-1]])
-        ax.plot(qq_line, slope * qq_line + intercept, "k-", lw=1.2)
-        ax.set_xlabel("Theoretical quantiles"); ax.set_ylabel("Sample quantiles")
-        ax.set_title(f"Q-Q  (r={r:.4f})")
-
-        plt.tight_layout()
-        safe_label = label.replace(" ", "_").replace("(", "").replace(")", "")
-        self._save(fig, f"03_residual_dist_{safe_label}")
-
-    # ─── 4. Ensemble weight comparison ───────────────────────────────────────
-    def plot_ensemble_comparison(self, comparison: dict):
-        """
-        Bar chart + radar chart comparing CNN, GBM, and ensemble strategies.
-        `comparison` should be a dict of {strategy_name: metrics_dict}.
-        """
-        self._try_style()
-        names   = list(comparison.keys())
-        metrics_keys = ["r2", "rmse", "mae", "slope", "std_ratio"]
-        labels  = ["R²", "RMSE (°C)", "MAE (°C)", "Slope", "Std Ratio"]
-
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle("Ensemble Strategy Comparison", fontsize=14, fontweight="bold")
-
-        colors = plt.cm.tab10(np.linspace(0, 0.6, len(names)))
-
-        for idx, (metric_key, metric_label) in enumerate(zip(["r2", "rmse", "mae"], ["R²", "RMSE (°C)", "MAE (°C)"])):
-            ax = axes[idx]
-            vals = [comparison[n].get(metric_key, 0) for n in names]
-            bars = ax.bar(names, vals, color=colors, edgecolor="white")
-            ax.set_title(metric_label)
-            ax.set_ylabel(metric_label)
-            ax.set_xticks(range(len(names)))
-            ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
-            for bar, v in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
-                        f"{v:.4f}", ha="center", va="bottom", fontsize=8)
-
-        plt.tight_layout()
-        self._save(fig, "04_ensemble_comparison")
-
-    # ─── 5. Feature importance (GBM) ─────────────────────────────────────────
-    def plot_gbm_feature_importance(self, gbm_model, top_n: int = 30):
-        """Horizontal bar chart of LightGBM feature importances."""
-        if gbm_model is None:
-            logger.warning("No GBM model provided – skipping feature importance plot")
-            return
-
-        self._try_style()
-        imp = gbm_model.feature_importance(importance_type="gain")
-        names = gbm_model.feature_name()
-        order = np.argsort(imp)[-top_n:]
-
-        fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.35)))
-        ax.barh(range(len(order)), imp[order], color="#26C6DA")
-        ax.set_yticks(range(len(order)))
-        ax.set_yticklabels([names[i] for i in order], fontsize=8)
-        ax.set_xlabel("Feature Importance (Gain)")
-        ax.set_title(f"GBM Feature Importance (top {top_n})")
-        plt.tight_layout()
-        self._save(fig, "05_gbm_feature_importance")
-
-    # ─── 6. Data distribution overview ───────────────────────────────────────
-    def plot_data_distribution(self, y_train: np.ndarray, y_val: np.ndarray,
-                               norm_stats: dict = None):
-        """
-        Compare the target distribution of train vs validation sets.
-        Shows both normalized and (if stats available) denormalized temperatures.
-        """
-        self._try_style()
-        train_flat = y_train.flatten()
-        val_flat   = y_val.flatten()
-
-        n_panels = 2 if norm_stats else 1
-        fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5))
-        fig.suptitle("Target (LST) Distribution – Train vs Val", fontsize=14, fontweight="bold")
-        if n_panels == 1:
-            axes = [axes]
-
-        # Normalised space
-        ax = axes[0]
-        ax.hist(train_flat, bins=80, alpha=0.55, color="#1E88E5", label=f"Train  n={len(train_flat):,}", density=True)
-        ax.hist(val_flat,   bins=80, alpha=0.55, color="#E53935", label=f"Val    n={len(val_flat):,}",   density=True)
-        ax.set_xlabel("Normalised LST"); ax.set_ylabel("Density")
-        ax.set_title("Normalised Space")
-        ax.legend()
-
-        # Denormalised
-        if norm_stats and "target" in norm_stats:
-            mean = norm_stats["target"]["mean"]
-            std  = norm_stats["target"]["std"]
-            train_c = train_flat * std + mean
-            val_c   = val_flat   * std + mean
-            ax = axes[1]
-            ax.hist(train_c, bins=80, alpha=0.55, color="#1E88E5", label="Train", density=True)
-            ax.hist(val_c,   bins=80, alpha=0.55, color="#E53935", label="Val",   density=True)
-            ax.set_xlabel("LST (°C)"); ax.set_ylabel("Density")
-            ax.set_title("Denormalised (°C)")
-            ax.legend()
-            ax.text(0.97, 0.97, f"Train: {train_c.mean():.1f}±{train_c.std():.1f}°C\n"
-                                 f"Val:   {val_c.mean():.1f}±{val_c.std():.1f}°C",
+            ax = axes[0]
+            ax.hist(residuals, bins=60, color="#42A5F5", edgecolor="white",
+                    linewidth=0.3, density=True, alpha=0.75, label="Residuals")
+            mu, sigma = residuals.mean(), residuals.std()
+            x_pdf = np.linspace(residuals.min(), residuals.max(), 300)
+            ax.plot(x_pdf, stats.norm.pdf(x_pdf, mu, sigma), "r-", lw=2,
+                    label=f"N({mu:.3f}, {sigma:.3f})")
+            ax.axvline(0, color="black", lw=1.2, ls="--")
+            ax.set_xlabel("Residual (°C)"); ax.set_ylabel("Density"); ax.legend()
+            skew = stats.skew(residuals)
+            kurt = stats.kurtosis(residuals)
+            _, p_norm = stats.normaltest(residuals)
+            ax.text(0.97, 0.97, f"skew={skew:.3f}\nkurt={kurt:.3f}\np_norm={p_norm:.3e}",
                     transform=ax.transAxes, fontsize=8, ha="right", va="top",
                     bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
 
-        plt.tight_layout()
-        self._save(fig, "06_data_distribution")
+            ax = axes[1]
+            (osm, osr), (sl, ic, r) = stats.probplot(residuals, dist="norm")
+            ax.scatter(osm, osr, s=6, alpha=0.4, color="#EF5350")
+            qq_line = np.array([osm[0], osm[-1]])
+            ax.plot(qq_line, sl * qq_line + ic, "k-", lw=1.2)
+            ax.set_xlabel("Theoretical quantiles"); ax.set_ylabel("Sample quantiles")
+            ax.set_title(f"Q-Q  (r={r:.4f})")
 
-    # ─── 7. Slope / std_ratio health over epochs ─────────────────────────────
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"03_residual_dist_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_residual_distribution failed: {e}")
+
+    # ── 4. Ensemble strategy comparison ──────────────────────────────────────
+    def plot_ensemble_comparison(self, comparison: dict):
+        """Bar charts comparing R², RMSE, MAE across strategies."""
+        try:
+            self._use_style()
+            names  = list(comparison.keys())
+            colors = plt.cm.tab10(np.linspace(0, 0.6, len(names)))
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            fig.suptitle("Ensemble Strategy Comparison", fontsize=14, fontweight="bold")
+            for idx, (mkey, mlabel) in enumerate(
+                    zip(["r2", "rmse", "mae"], ["R²", "RMSE (°C)", "MAE (°C)"])):
+                ax = axes[idx]
+                vals = [comparison[n].get(mkey, 0) for n in names]
+                bars = ax.bar(names, vals, color=colors, edgecolor="white")
+                ax.set_title(mlabel); ax.set_ylabel(mlabel)
+                ax.set_xticks(range(len(names)))
+                ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
+                for bar, v in zip(bars, vals):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + 0.001, f"{v:.4f}",
+                            ha="center", va="bottom", fontsize=8)
+            plt.tight_layout()
+            self._save(fig, "04_ensemble_comparison")
+        except Exception as e:
+            logger.warning(f"plot_ensemble_comparison failed: {e}")
+
+    # ── 5. GBM feature importance ─────────────────────────────────────────────
+    def plot_gbm_feature_importance(self, gbm_model, top_n: int = 30):
+        """Horizontal bar chart of LightGBM feature importances."""
+        try:
+            if gbm_model is None:
+                return
+            self._use_style()
+            imp   = gbm_model.feature_importance(importance_type="gain")
+            names = gbm_model.feature_name()
+            order = np.argsort(imp)[-top_n:]
+            fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.35)))
+            ax.barh(range(len(order)), imp[order], color="#26C6DA")
+            ax.set_yticks(range(len(order)))
+            ax.set_yticklabels([names[i] for i in order], fontsize=8)
+            ax.set_xlabel("Feature Importance (Gain)")
+            ax.set_title(f"GBM Feature Importance (top {top_n})")
+            plt.tight_layout()
+            self._save(fig, "05_gbm_feature_importance")
+        except Exception as e:
+            logger.warning(f"plot_gbm_feature_importance failed: {e}")
+
+    # ── 6. Data distribution ──────────────────────────────────────────────────
+    def plot_data_distribution(self, y_train: np.ndarray, y_val: np.ndarray,
+                               norm_stats: dict = None):
+        """Train vs Val LST histogram in normalised and °C space."""
+        try:
+            self._use_style()
+            train_flat = y_train.flatten(); val_flat = y_val.flatten()
+            n_panels = 2 if norm_stats else 1
+            fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5))
+            fig.suptitle("Target (LST) Distribution – Train vs Val",
+                         fontsize=14, fontweight="bold")
+            if n_panels == 1:
+                axes = [axes]
+
+            ax = axes[0]
+            ax.hist(train_flat, bins=80, alpha=0.55, color="#1E88E5",
+                    label=f"Train  n={len(train_flat):,}", density=True)
+            ax.hist(val_flat,   bins=80, alpha=0.55, color="#E53935",
+                    label=f"Val    n={len(val_flat):,}",  density=True)
+            ax.set_xlabel("Normalised LST"); ax.set_ylabel("Density")
+            ax.set_title("Normalised Space"); ax.legend()
+
+            if norm_stats and "target" in norm_stats:
+                mean = norm_stats["target"]["mean"]; std = norm_stats["target"]["std"]
+                train_c = train_flat * std + mean; val_c = val_flat * std + mean
+                ax = axes[1]
+                ax.hist(train_c, bins=80, alpha=0.55, color="#1E88E5",
+                        label="Train", density=True)
+                ax.hist(val_c,   bins=80, alpha=0.55, color="#E53935",
+                        label="Val",   density=True)
+                ax.set_xlabel("LST (°C)"); ax.set_ylabel("Density")
+                ax.set_title("Denormalised (°C)"); ax.legend()
+                ax.text(0.97, 0.97,
+                        f"Train: {train_c.mean():.1f}±{train_c.std():.1f}°C\n"
+                        f"Val:   {val_c.mean():.1f}±{val_c.std():.1f}°C",
+                        transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                        bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            plt.tight_layout()
+            self._save(fig, "06_data_distribution")
+        except Exception as e:
+            logger.warning(f"plot_data_distribution failed: {e}")
+
+    # ── 7. Diagnostic metrics over epochs ────────────────────────────────────
     def plot_diagnostic_metrics_over_epochs(self, history: dict):
-        """
-        Track slope, std_ratio, and MBE across epochs to visualise regression-to-mean
-        and variance collapse trends during training.
-        """
-        if not history.get("cnn_metrics"):
-            logger.warning("No cnn_metrics in history – skipping diagnostic-metrics plot")
-            return
-
-        self._try_style()
-        epochs  = range(1, len(history["cnn_metrics"]) + 1)
-        slopes     = [m.get("slope",     float("nan")) for m in history["cnn_metrics"]]
-        std_ratios = [m.get("std_ratio", float("nan")) for m in history["cnn_metrics"]]
-        mbe_vals   = [m.get("mbe",       float("nan")) for m in history["cnn_metrics"]]
-        r2_vals    = [m.get("r2",        float("nan")) for m in history["cnn_metrics"]]
-
-        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-        fig.suptitle("CNN Diagnostic Metrics Over Training Epochs", fontsize=14, fontweight="bold")
-
-        def _plot(ax, data, title, ylabel, target=None, danger=None):
-            ax.plot(epochs, data, lw=1.5, color="#29B6F6")
-            if target is not None:
-                ax.axhline(target, color="green",  ls="--", lw=1, label=f"Target ({target})")
-            if danger is not None:
-                ax.axhline(danger, color="red",    ls=":",  lw=1, label=f"Danger ({danger})")
-            ax.set_title(title); ax.set_xlabel("Epoch"); ax.set_ylabel(ylabel)
-            if target or danger:
-                ax.legend(fontsize=8)
-
-        _plot(axes[0, 0], r2_vals,    "Validation R²",       "R²",        target=0.85)
-        _plot(axes[0, 1], slopes,     "Prediction Slope",    "Slope",     target=1.0, danger=0.85)
-        _plot(axes[1, 0], std_ratios, "Std Ratio (pred/tgt)","Std Ratio", target=1.0, danger=0.80)
-        _plot(axes[1, 1], mbe_vals,   "Mean Bias Error",     "MBE (°C)")
-        axes[1, 1].axhline(0, color="green", ls="--", lw=1, label="Target (0)")
-        axes[1, 1].legend(fontsize=8)
-
-        plt.tight_layout()
-        self._save(fig, "07_diagnostic_metrics_epochs")
-
-    # ─── 8. Error heat-map (spatial) ─────────────────────────────────────────
-    def plot_spatial_error_map(self, preds_4d: np.ndarray, targets_4d: np.ndarray,
-                               label: str = "Model", n_samples: int = 6):
-        """
-        For the first n_samples patches, show target / prediction / error side-by-side.
-        preds_4d and targets_4d are (N, 1, H, W) or (N, H, W, 1).
-        """
-        self._try_style()
-
-        def _squeeze(arr):
-            arr = np.asarray(arr)
-            if arr.ndim == 4 and arr.shape[1] == 1:   # (N,1,H,W)
-                arr = arr[:, 0, :, :]
-            elif arr.ndim == 4 and arr.shape[3] == 1: # (N,H,W,1)
-                arr = arr[:, :, :, 0]
-            return arr
-
-        preds_sq   = _squeeze(preds_4d)[:n_samples]
-        targets_sq = _squeeze(targets_4d)[:n_samples]
-        errors     = preds_sq - targets_sq
-
-        fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
-        if n_samples == 1:
-            axes = axes[np.newaxis, :]
-        fig.suptitle(f"{label} – Spatial Error Maps (first {n_samples} patches)",
-                     fontsize=13, fontweight="bold")
-
-        vmin = min(targets_sq.min(), preds_sq.min())
-        vmax = max(targets_sq.max(), preds_sq.max())
-        err_abs = np.abs(errors).max()
-        norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
-
-        for i in range(n_samples):
-            axes[i, 0].imshow(targets_sq[i], vmin=vmin, vmax=vmax, cmap="hot")
-            axes[i, 0].set_title(f"Sample {i+1} – Actual", fontsize=8)
-            axes[i, 0].axis("off")
-
-            axes[i, 1].imshow(preds_sq[i], vmin=vmin, vmax=vmax, cmap="hot")
-            axes[i, 1].set_title(f"Sample {i+1} – Predicted", fontsize=8)
-            axes[i, 1].axis("off")
-
-            im = axes[i, 2].imshow(errors[i], norm=norm_err, cmap="RdBu_r")
-            axes[i, 2].set_title(f"Sample {i+1} – Error", fontsize=8)
-            axes[i, 2].axis("off")
-            plt.colorbar(im, ax=axes[i, 2], shrink=0.8)
-
-        plt.tight_layout()
-        safe_label = label.replace(" ", "_").replace("(", "").replace(")", "")
-        self._save(fig, f"08_spatial_error_{safe_label}")
-
-    # ─── 9. Temperature-stratified error analysis ─────────────────────────────
-    def plot_stratified_error(self, preds: np.ndarray, targets: np.ndarray,
-                              label: str = "Model", n_bins: int = 10):
-        """
-        Show how RMSE and bias vary across the temperature range.
-        Useful to spot if the model is better/worse at extreme temps.
-        """
-        self._try_style()
-        preds   = np.asarray(preds).flatten()
-        targets = np.asarray(targets).flatten()
-        mask = np.isfinite(preds) & np.isfinite(targets)
-        preds, targets = preds[mask], targets[mask]
-
-        bins = np.percentile(targets, np.linspace(0, 100, n_bins + 1))
-        bin_centers, bin_rmse, bin_mae, bin_mbe, bin_counts = [], [], [], [], []
-
-        for lo, hi in zip(bins[:-1], bins[1:]):
-            idx = (targets >= lo) & (targets <= hi)
-            if idx.sum() < 5:
-                continue
-            p, t = preds[idx], targets[idx]
-            bin_centers.append((lo + hi) / 2)
-            bin_rmse.append(np.sqrt(np.mean((p - t) ** 2)))
-            bin_mae.append(np.mean(np.abs(p - t)))
-            bin_mbe.append(np.mean(p - t))
-            bin_counts.append(idx.sum())
-
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        fig.suptitle(f"{label} – Stratified Error Analysis", fontsize=13, fontweight="bold")
-
-        def _bar(ax, y, title, ylabel, color):
-            ax.bar(range(len(bin_centers)), y, color=color, edgecolor="white", alpha=0.8)
-            ax.set_xticks(range(len(bin_centers)))
-            ax.set_xticklabels([f"{c:.1f}" for c in bin_centers], rotation=45, ha="right", fontsize=7)
-            ax.set_xlabel("Temperature Bin Centre (°C)")
-            ax.set_ylabel(ylabel); ax.set_title(title)
-
-        _bar(axes[0], bin_rmse,   "RMSE by Temperature Bin",  "RMSE (°C)", "#EF5350")
-        _bar(axes[1], bin_mae,    "MAE by Temperature Bin",   "MAE (°C)",  "#FFA726")
-        axes[2].bar(range(len(bin_centers)), bin_mbe,
-                    color=["#1E88E5" if v >= 0 else "#E53935" for v in bin_mbe],
-                    edgecolor="white", alpha=0.8)
-        axes[2].axhline(0, color="black", lw=1)
-        axes[2].set_xticks(range(len(bin_centers)))
-        axes[2].set_xticklabels([f"{c:.1f}" for c in bin_centers], rotation=45, ha="right", fontsize=7)
-        axes[2].set_xlabel("Temperature Bin Centre (°C)")
-        axes[2].set_ylabel("MBE (°C)"); axes[2].set_title("MBE by Temperature Bin")
-
-        # sample counts on RMSE chart
-        for i, cnt in enumerate(bin_counts):
-            axes[0].text(i, bin_rmse[i] + 0.01, f"n={cnt}", ha="center", fontsize=6)
-
-        plt.tight_layout()
-        safe_label = label.replace(" ", "_").replace("(", "").replace(")", "")
-        self._save(fig, f"09_stratified_error_{safe_label}")
-
-    # ─── 10. Summary dashboard ────────────────────────────────────────────────
-    def plot_summary_dashboard(self, history: dict, ensemble_metrics: dict,
-                               cnn_metrics: dict, gbm_metrics: dict,
-                               ensemble_weights: dict):
-        """
-        One-page overview: key metrics table + loss curves + R² + weight pie.
-        """
-        self._try_style()
-        fig = plt.figure(figsize=(18, 11))
-        gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.45, wspace=0.38)
-        fig.suptitle("Ensemble Training – Summary Dashboard", fontsize=16, fontweight="bold")
-
-        # -- Metrics table (top-left, spans 2 cols)
-        ax_tbl = fig.add_subplot(gs[0, :2])
-        ax_tbl.axis("off")
-        rows = [
-            ["Model", "R²", "RMSE (°C)", "MAE (°C)", "Slope", "Std Ratio"],
-            ["CNN",
-             f"{cnn_metrics.get('r2',0):.4f}",
-             f"{cnn_metrics.get('rmse',0):.4f}",
-             f"{cnn_metrics.get('mae',0):.4f}",
-             f"{cnn_metrics.get('slope',float('nan')):.3f}",
-             f"{cnn_metrics.get('std_ratio',float('nan')):.3f}"],
-            ["GBM",
-             f"{gbm_metrics.get('r2',0):.4f}",
-             f"{gbm_metrics.get('rmse',0):.4f}",
-             f"{gbm_metrics.get('mae',0):.4f}",
-             f"{gbm_metrics.get('slope',float('nan')):.3f}",
-             f"{gbm_metrics.get('std_ratio',float('nan')):.3f}"],
-            ["Ensemble",
-             f"{ensemble_metrics.get('r2',0):.4f}",
-             f"{ensemble_metrics.get('rmse',0):.4f}",
-             f"{ensemble_metrics.get('mae',0):.4f}",
-             f"{ensemble_metrics.get('slope',float('nan')):.3f}",
-             f"{ensemble_metrics.get('std_ratio',float('nan')):.3f}"],
-        ]
-        tbl = ax_tbl.table(cellText=rows[1:], colLabels=rows[0],
-                           cellLoc="center", loc="center")
-        tbl.auto_set_font_size(False); tbl.set_fontsize(9)
-        tbl.scale(1, 1.6)
-        # highlight best R²
-        best_r2_row = max([(i, float(rows[i+1][1])) for i in range(3)], key=lambda x: x[1])[0]
-        for col in range(6):
-            tbl[best_r2_row + 1, col].set_facecolor("#C8E6C9")
-        ax_tbl.set_title("Validation Metrics Comparison", fontsize=10, pad=4)
-
-        # -- Ensemble weight pie (top-right)
-        ax_pie = fig.add_subplot(gs[0, 2])
-        wts = [ensemble_weights.get("cnn", 0), ensemble_weights.get("gbm", 0)]
-        ax_pie.pie(wts, labels=["CNN", "GBM"], autopct="%1.1f%%",
-                   colors=["#42A5F5", "#EF5350"], startangle=90)
-        ax_pie.set_title("Final Ensemble Weights", fontsize=10)
-
-        # -- R² target meter (top-far-right)
-        ax_r2 = fig.add_subplot(gs[0, 3])
-        r2_val = ensemble_metrics.get("r2", 0)
-        colors_r2 = ["#F44336", "#FF9800", "#4CAF50"]
-        bar_val = min(max(r2_val, 0), 1)
-        color_r2 = colors_r2[0] if r2_val < 0.7 else (colors_r2[1] if r2_val < 0.85 else colors_r2[2])
-        ax_r2.barh(["R²"], [bar_val], color=color_r2)
-        ax_r2.axvline(0.85, color="black", ls="--", lw=1.2, label="Target (0.85)")
-        ax_r2.set_xlim([0, 1]); ax_r2.legend(fontsize=8)
-        ax_r2.set_title(f"Ensemble R² = {r2_val:.4f}", fontsize=10)
-
-        # -- Loss curves (middle row, 2 cols)
-        ax_loss = fig.add_subplot(gs[1, :2])
-        epochs = range(1, len(history["train_loss"]) + 1)
-        ax_loss.plot(epochs, history["train_loss"], label="Train", color="#2196F3")
-        ax_loss.plot(epochs, history["val_loss"],   label="Val",   color="#F44336")
-        ax_loss.set_title("Loss Curves"); ax_loss.set_xlabel("Epoch")
-        ax_loss.set_ylabel("Loss"); ax_loss.legend()
-
-        # -- R² over epochs (middle row, 2 cols)
-        ax_r2_curve = fig.add_subplot(gs[1, 2:])
-        if history["cnn_metrics"]:
-            r2s = [m["r2"] for m in history["cnn_metrics"]]
-            ax_r2_curve.plot(epochs, r2s, color="#4CAF50", lw=1.5)
-            ax_r2_curve.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target")
-            ax_r2_curve.set_title("CNN Val R²"); ax_r2_curve.set_xlabel("Epoch")
-            ax_r2_curve.set_ylabel("R²"); ax_r2_curve.legend()
-
-        # -- Diagnostic metrics (bottom row)
-        if history["cnn_metrics"]:
+        """Slope, std_ratio, MBE, R² across every epoch."""
+        try:
+            if not history.get("cnn_metrics"):
+                return
+            self._use_style()
+            epochs     = range(1, len(history["cnn_metrics"]) + 1)
             slopes     = [m.get("slope",     float("nan")) for m in history["cnn_metrics"]]
             std_ratios = [m.get("std_ratio", float("nan")) for m in history["cnn_metrics"]]
             mbe_vals   = [m.get("mbe",       float("nan")) for m in history["cnn_metrics"]]
-            lrs        = history["lr"]
+            r2_vals    = [m.get("r2",        float("nan")) for m in history["cnn_metrics"]]
 
-            for col_idx, (data, title, target) in enumerate(zip(
-                [slopes, std_ratios, mbe_vals, lrs],
-                ["Slope", "Std Ratio", "MBE (°C)", "Learning Rate"],
-                [1.0, 1.0, 0.0, None]
-            )):
-                ax_d = fig.add_subplot(gs[2, col_idx])
-                ax_d.plot(epochs if col_idx < 3 else range(1, len(lrs)+1),
-                          data, lw=1.2, color="#FF7043")
+            fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+            fig.suptitle("CNN Diagnostic Metrics Over Training Epochs",
+                         fontsize=14, fontweight="bold")
+
+            def _plot(ax, data, title, ylabel, target=None, danger=None):
+                ax.plot(epochs, data, lw=1.5, color="#29B6F6")
                 if target is not None:
-                    ax_d.axhline(target, color="green", ls="--", lw=0.9)
-                ax_d.set_title(title, fontsize=9)
-                ax_d.set_xlabel("Epoch", fontsize=8)
-                if col_idx == 3:
-                    ax_d.set_yscale("log")
+                    ax.axhline(target, color="green", ls="--", lw=1,
+                               label=f"Target ({target})")
+                if danger is not None:
+                    ax.axhline(danger, color="red",   ls=":",  lw=1,
+                               label=f"Danger ({danger})")
+                ax.set_title(title); ax.set_xlabel("Epoch"); ax.set_ylabel(ylabel)
+                if target is not None or danger is not None:
+                    ax.legend(fontsize=8)
 
-        self._save(fig, "10_summary_dashboard")
+            _plot(axes[0, 0], r2_vals,    "Validation R²",        "R²",
+                  target=0.85)
+            _plot(axes[0, 1], slopes,     "Prediction Slope",     "Slope",
+                  target=1.0, danger=0.85)
+            _plot(axes[1, 0], std_ratios, "Std Ratio (pred/tgt)", "Std Ratio",
+                  target=1.0, danger=0.80)
+            _plot(axes[1, 1], mbe_vals,   "Mean Bias Error",      "MBE (°C)")
+            axes[1, 1].axhline(0, color="green", ls="--", lw=1, label="Target (0)")
+            axes[1, 1].legend(fontsize=8)
 
-    # ─── convenience: run all post-training plots ─────────────────────────────
+            plt.tight_layout()
+            self._save(fig, "07_diagnostic_metrics_epochs")
+        except Exception as e:
+            logger.warning(f"plot_diagnostic_metrics_over_epochs failed: {e}")
+
+    # ── 8. Spatial error maps ─────────────────────────────────────────────────
+    def plot_spatial_error_map(self, preds_4d: np.ndarray, targets_4d: np.ndarray,
+                               label: str = "Model", n_samples: int = 6):
+        """Actual / Predicted / Error side-by-side for first n_samples patches."""
+        try:
+            self._use_style()
+
+            def _sq(arr):
+                arr = np.asarray(arr)
+                if arr.ndim == 4 and arr.shape[1] == 1:
+                    return arr[:, 0, :, :]
+                if arr.ndim == 4 and arr.shape[3] == 1:
+                    return arr[:, :, :, 0]
+                return arr
+
+            P = _sq(preds_4d)[:n_samples]
+            T = _sq(targets_4d)[:n_samples]
+            E = P - T
+
+            fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
+            if n_samples == 1:
+                axes = axes[np.newaxis, :]
+            fig.suptitle(f"{label} – Spatial Error Maps (first {n_samples} patches)",
+                         fontsize=13, fontweight="bold")
+
+            vmin = min(T.min(), P.min()); vmax = max(T.max(), P.max())
+            err_abs = max(np.abs(E).max(), 1e-6)
+            norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+
+            for i in range(n_samples):
+                axes[i, 0].imshow(T[i], vmin=vmin, vmax=vmax, cmap="hot")
+                axes[i, 0].set_title(f"Sample {i+1} – Actual",    fontsize=8)
+                axes[i, 0].axis("off")
+                axes[i, 1].imshow(P[i], vmin=vmin, vmax=vmax, cmap="hot")
+                axes[i, 1].set_title(f"Sample {i+1} – Predicted", fontsize=8)
+                axes[i, 1].axis("off")
+                im = axes[i, 2].imshow(E[i], norm=norm_err, cmap="RdBu_r")
+                axes[i, 2].set_title(f"Sample {i+1} – Error",     fontsize=8)
+                axes[i, 2].axis("off")
+                plt.colorbar(im, ax=axes[i, 2], shrink=0.8)
+
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"08_spatial_error_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_spatial_error_map failed: {e}")
+
+    # ── 9. Temperature-stratified error ──────────────────────────────────────
+    def plot_stratified_error(self, preds: np.ndarray, targets: np.ndarray,
+                              label: str = "Model", n_bins: int = 10):
+        """RMSE, MAE, MBE bucketed by temperature percentile bins."""
+        try:
+            self._use_style()
+            preds   = np.asarray(preds).flatten()
+            targets = np.asarray(targets).flatten()
+            mask    = np.isfinite(preds) & np.isfinite(targets)
+            preds, targets = preds[mask], targets[mask]
+
+            bins = np.percentile(targets, np.linspace(0, 100, n_bins + 1))
+            centers, rmse_v, mae_v, mbe_v, counts = [], [], [], [], []
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                idx = (targets >= lo) & (targets <= hi)
+                if idx.sum() < 5:
+                    continue
+                p, t = preds[idx], targets[idx]
+                centers.append((lo + hi) / 2)
+                rmse_v.append(np.sqrt(np.mean((p - t) ** 2)))
+                mae_v.append(np.mean(np.abs(p - t)))
+                mbe_v.append(np.mean(p - t))
+                counts.append(idx.sum())
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            fig.suptitle(f"{label} – Stratified Error Analysis",
+                         fontsize=13, fontweight="bold")
+
+            def _bar(ax, y, title, ylabel, color):
+                ax.bar(range(len(centers)), y, color=color, edgecolor="white", alpha=0.8)
+                ax.set_xticks(range(len(centers)))
+                ax.set_xticklabels([f"{c:.1f}" for c in centers],
+                                   rotation=45, ha="right", fontsize=7)
+                ax.set_xlabel("Temperature Bin Centre (°C)")
+                ax.set_ylabel(ylabel); ax.set_title(title)
+
+            _bar(axes[0], rmse_v, "RMSE by Temperature Bin", "RMSE (°C)", "#EF5350")
+            _bar(axes[1], mae_v,  "MAE by Temperature Bin",  "MAE (°C)",  "#FFA726")
+            axes[2].bar(range(len(centers)), mbe_v,
+                        color=["#1E88E5" if v >= 0 else "#E53935" for v in mbe_v],
+                        edgecolor="white", alpha=0.8)
+            axes[2].axhline(0, color="black", lw=1)
+            axes[2].set_xticks(range(len(centers)))
+            axes[2].set_xticklabels([f"{c:.1f}" for c in centers],
+                                    rotation=45, ha="right", fontsize=7)
+            axes[2].set_xlabel("Temperature Bin Centre (°C)")
+            axes[2].set_ylabel("MBE (°C)"); axes[2].set_title("MBE by Temperature Bin")
+            for i, cnt in enumerate(counts):
+                axes[0].text(i, rmse_v[i] + 0.01, f"n={cnt}", ha="center", fontsize=6)
+
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"09_stratified_error_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_stratified_error failed: {e}")
+
+    # ── 10. Summary dashboard ─────────────────────────────────────────────────
+    def plot_summary_dashboard(self, history: dict, ensemble_metrics: dict,
+                               cnn_metrics: dict, gbm_metrics: dict,
+                               ensemble_weights: dict):
+        """One-page overview: metrics table · weight pie · loss curves · trends."""
+        try:
+            self._use_style()
+            fig = plt.figure(figsize=(18, 11))
+            gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.45, wspace=0.38)
+            fig.suptitle("Ensemble Training – Summary Dashboard",
+                         fontsize=16, fontweight="bold")
+
+            epochs = range(1, len(history["train_loss"]) + 1)
+
+            # Metrics table
+            ax_tbl = fig.add_subplot(gs[0, :2]); ax_tbl.axis("off")
+            rows = [
+                ["Model", "R²", "RMSE (°C)", "MAE (°C)", "Slope", "Std Ratio"],
+                ["CNN",
+                 f"{cnn_metrics.get('r2',0):.4f}",
+                 f"{cnn_metrics.get('rmse',0):.4f}",
+                 f"{cnn_metrics.get('mae',0):.4f}",
+                 f"{cnn_metrics.get('slope',float('nan')):.3f}",
+                 f"{cnn_metrics.get('std_ratio',float('nan')):.3f}"],
+                ["GBM",
+                 f"{gbm_metrics.get('r2',0):.4f}",
+                 f"{gbm_metrics.get('rmse',0):.4f}",
+                 f"{gbm_metrics.get('mae',0):.4f}",
+                 f"{gbm_metrics.get('slope',float('nan')):.3f}",
+                 f"{gbm_metrics.get('std_ratio',float('nan')):.3f}"],
+                ["Ensemble",
+                 f"{ensemble_metrics.get('r2',0):.4f}",
+                 f"{ensemble_metrics.get('rmse',0):.4f}",
+                 f"{ensemble_metrics.get('mae',0):.4f}",
+                 f"{ensemble_metrics.get('slope',float('nan')):.3f}",
+                 f"{ensemble_metrics.get('std_ratio',float('nan')):.3f}"],
+            ]
+            tbl = ax_tbl.table(cellText=rows[1:], colLabels=rows[0],
+                               cellLoc="center", loc="center")
+            tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1, 1.6)
+            best_r2_row = max([(i, float(rows[i+1][1])) for i in range(3)],
+                              key=lambda x: x[1])[0]
+            for col in range(6):
+                tbl[best_r2_row + 1, col].set_facecolor("#C8E6C9")
+            ax_tbl.set_title("Validation Metrics Comparison", fontsize=10, pad=4)
+
+            # Weight pie
+            ax_pie = fig.add_subplot(gs[0, 2])
+            wts = [ensemble_weights.get("cnn", 0), ensemble_weights.get("gbm", 0)]
+            if sum(wts) > 0:
+                ax_pie.pie(wts, labels=["CNN", "GBM"], autopct="%1.1f%%",
+                           colors=["#42A5F5", "#EF5350"], startangle=90)
+            ax_pie.set_title("Final Ensemble Weights", fontsize=10)
+
+            # R² gauge
+            ax_r2 = fig.add_subplot(gs[0, 3])
+            r2_val = ensemble_metrics.get("r2", 0)
+            color_r2 = "#F44336" if r2_val < 0.7 else ("#FF9800" if r2_val < 0.85 else "#4CAF50")
+            ax_r2.barh(["R²"], [min(max(r2_val, 0), 1)], color=color_r2)
+            ax_r2.axvline(0.85, color="black", ls="--", lw=1.2, label="Target (0.85)")
+            ax_r2.set_xlim([0, 1]); ax_r2.legend(fontsize=8)
+            ax_r2.set_title(f"Ensemble R² = {r2_val:.4f}", fontsize=10)
+
+            # Loss curves
+            ax_loss = fig.add_subplot(gs[1, :2])
+            ax_loss.plot(epochs, history["train_loss"], label="Train", color="#2196F3")
+            ax_loss.plot(epochs, history["val_loss"],   label="Val",   color="#F44336")
+            ax_loss.set_title("Loss Curves"); ax_loss.set_xlabel("Epoch")
+            ax_loss.set_ylabel("Loss"); ax_loss.legend()
+
+            # R² over epochs
+            ax_r2c = fig.add_subplot(gs[1, 2:])
+            if history["cnn_metrics"]:
+                r2s = [m["r2"] for m in history["cnn_metrics"]]
+                ax_r2c.plot(epochs, r2s, color="#4CAF50", lw=1.5)
+                ax_r2c.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target")
+                ax_r2c.set_title("CNN Val R²"); ax_r2c.set_xlabel("Epoch")
+                ax_r2c.set_ylabel("R²"); ax_r2c.legend()
+
+            # Bottom row diagnostics
+            if history["cnn_metrics"]:
+                slopes     = [m.get("slope",     float("nan")) for m in history["cnn_metrics"]]
+                std_ratios = [m.get("std_ratio",  float("nan")) for m in history["cnn_metrics"]]
+                mbe_vals   = [m.get("mbe",        float("nan")) for m in history["cnn_metrics"]]
+                lrs        = history["lr"]
+                for col_idx, (data, title, target, use_log) in enumerate(zip(
+                        [slopes, std_ratios, mbe_vals, lrs],
+                        ["Slope", "Std Ratio", "MBE (°C)", "Learning Rate"],
+                        [1.0, 1.0, 0.0, None],
+                        [False, False, False, True])):
+                    ax_d = fig.add_subplot(gs[2, col_idx])
+                    ep_d = epochs if col_idx < 3 else range(1, len(lrs) + 1)
+                    ax_d.plot(ep_d, data, lw=1.2, color="#FF7043")
+                    if target is not None:
+                        ax_d.axhline(target, color="green", ls="--", lw=0.9)
+                    ax_d.set_title(title, fontsize=9)
+                    ax_d.set_xlabel("Epoch", fontsize=8)
+                    if use_log:
+                        ax_d.set_yscale("log")
+
+            self._save(fig, "10_summary_dashboard")
+        except Exception as e:
+            logger.warning(f"plot_summary_dashboard failed: {e}")
+
+    # ── convenience: all post-training plots ──────────────────────────────────
     def plot_all_post_training(self, history: dict, ensemble_metrics: dict,
-                                cnn_metrics: dict, gbm_metrics: dict,
-                                ensemble_weights: dict,
-                                cnn_preds_flat: np.ndarray = None,
-                                targets_flat: np.ndarray = None,
-                                gbm_model=None,
-                                y_train: np.ndarray = None,
-                                y_val: np.ndarray = None,
-                                norm_stats: dict = None):
-        """Convenience wrapper that calls every available plot method."""
+                               cnn_metrics: dict, gbm_metrics: dict,
+                               ensemble_weights: dict,
+                               cnn_preds_flat: np.ndarray = None,
+                               targets_flat: np.ndarray = None,
+                               gbm_preds_flat: np.ndarray = None,
+                               gbm_targets_flat: np.ndarray = None,
+                               gbm_model=None,
+                               y_train: np.ndarray = None,
+                               y_val: np.ndarray = None,
+                               norm_stats: dict = None,
+                               ensemble_comparison: dict = None):
+        """Convenience wrapper — calls every available plot method."""
         logger.info("\n📊 Generating all post-training diagnostic plots...")
         self.plot_training_curves(history)
         self.plot_diagnostic_metrics_over_epochs(history)
         self.plot_summary_dashboard(history, ensemble_metrics, cnn_metrics,
                                     gbm_metrics, ensemble_weights)
+        # FIX 3: generate ensemble strategy comparison chart when data is available
+        if ensemble_comparison is not None:
+            self.plot_ensemble_comparison(ensemble_comparison)
         if cnn_preds_flat is not None and targets_flat is not None:
             self.plot_pred_vs_actual(cnn_preds_flat, targets_flat, "CNN")
             self.plot_residual_distribution(cnn_preds_flat, targets_flat, "CNN")
             self.plot_stratified_error(cnn_preds_flat, targets_flat, "CNN")
+        if gbm_preds_flat is not None and gbm_targets_flat is not None:
+            self.plot_pred_vs_actual(gbm_preds_flat, gbm_targets_flat, "GBM")
+            self.plot_residual_distribution(gbm_preds_flat, gbm_targets_flat, "GBM")
+            self.plot_stratified_error(gbm_preds_flat, gbm_targets_flat, "GBM")
         if gbm_model is not None:
             self.plot_gbm_feature_importance(gbm_model)
         if y_train is not None and y_val is not None:
             self.plot_data_distribution(y_train, y_val, norm_stats)
         logger.info(f"✅ All plots saved to: {self.save_dir}")
-
 
 
 class UHIDataset(Dataset):
@@ -795,83 +785,149 @@ class UHIDataset(Dataset):
         return x, y
 
 
-def prepare_gbm_features(X: np.ndarray, y: np.ndarray) -> Tuple[pd.DataFrame, np.ndarray]:
+def prepare_gbm_features(X: np.ndarray, y: np.ndarray,
+                          cnn_bottleneck_feats: np.ndarray = None) -> Tuple[pd.DataFrame, np.ndarray]:
     """
-    Prepare tabular features for GBM from spatial data
-    
+    Prepare tabular features for GBM from spatial data.
+
+    FIX 8: Added texture features per channel:
+        - range, skewness, kurtosis (distribution shape)
+        - mean gradient magnitude (edge/boundary strength)
+        - max gradient magnitude (sharpest edge in patch)
+    These capture urban morphology patterns the original stats missed.
+
+    FIX 6: Optional CNN bottleneck features can be appended.
+        Pass cnn_bottleneck_feats (N, D) to include spatial-context
+        statistics extracted from the CNN encoder.
+
     Args:
-        X: NORMALIZED image patches (N, H, W, C) - mean≈0, std≈1
-        y: NORMALIZED target LST (N, H, W, 1) - mean≈0, std≈1
-    
+        X: NORMALIZED image patches (N, H, W, C) — mean≈0, std≈1
+        y: NORMALIZED target LST (N, H, W, 1) — mean≈0, std≈1
+        cnn_bottleneck_feats: Optional (N, D) array of CNN bottleneck stats
+
     Returns:
         features_df: DataFrame with aggregated features per patch (normalized)
-        targets: Flattened targets (normalized)
-    
-    Note:
-        Both inputs and outputs are in NORMALIZED space.
-        GBM will learn in normalized space.
-        Predictions must be denormalized during evaluation.
+        targets:     Patch-mean targets (normalized)
     """
-    logger.info("Preparing GBM features from spatial data...")
-    
+    logger.info("Preparing GBM features from spatial data (with texture features)...")
+
     n_samples, height, width, n_channels = X.shape
-    
-    # Extract per-patch statistics for each channel
     features_list = []
-    
+
     for i in range(n_samples):
         patch_features = {}
-        
+
         for ch in range(n_channels):
             channel_data = X[i, :, :, ch]
-            
-            # Statistical features
-            patch_features[f'ch{ch}_mean'] = channel_data.mean()
-            patch_features[f'ch{ch}_std'] = channel_data.std()
-            patch_features[f'ch{ch}_min'] = channel_data.min()
-            patch_features[f'ch{ch}_max'] = channel_data.max()
-            patch_features[f'ch{ch}_median'] = np.median(channel_data)
-            
-            # Percentiles
-            patch_features[f'ch{ch}_p25'] = np.percentile(channel_data, 25)
-            patch_features[f'ch{ch}_p75'] = np.percentile(channel_data, 75)
-        
-        # Spatial features
+            flat = channel_data.flatten()
+
+            # ── Original statistical features ────────────────────────────────
+            patch_features[f'ch{ch}_mean']   = flat.mean()
+            patch_features[f'ch{ch}_std']    = flat.std()
+            patch_features[f'ch{ch}_min']    = flat.min()
+            patch_features[f'ch{ch}_max']    = flat.max()
+            patch_features[f'ch{ch}_median'] = np.median(flat)
+            patch_features[f'ch{ch}_p25']    = np.percentile(flat, 25)
+            patch_features[f'ch{ch}_p75']    = np.percentile(flat, 75)
+
+            # ── FIX 8: Texture / distribution-shape features ──────────────────
+            patch_features[f'ch{ch}_range'] = flat.max() - flat.min()
+
+            # Skewness and kurtosis (manual — avoids scipy import in hot loop)
+            centered = flat - flat.mean()
+            std_c    = flat.std() + 1e-8
+            patch_features[f'ch{ch}_skew'] = float((centered ** 3).mean() / std_c ** 3)
+            patch_features[f'ch{ch}_kurt'] = float((centered ** 4).mean() / std_c ** 4 - 3)
+
+            # Gradient magnitude (edge strength) — uses finite differences
+            dx = np.diff(channel_data, axis=1)   # (H, W-1)
+            dy = np.diff(channel_data, axis=0)   # (H-1, W)
+            # Align shapes for element-wise combination
+            h_min = min(dx.shape[0], dy.shape[0])
+            w_min = min(dx.shape[1], dy.shape[1])
+            grad_mag = np.sqrt(dx[:h_min, :w_min] ** 2 + dy[:h_min, :w_min] ** 2)
+            patch_features[f'ch{ch}_grad_mean'] = grad_mag.mean()
+            patch_features[f'ch{ch}_grad_max']  = grad_mag.max()
+
+        # Spatial metadata
         patch_features['height'] = height
-        patch_features['width'] = width
-        
+        patch_features['width']  = width
+
         features_list.append(patch_features)
-    
+
     features_df = pd.DataFrame(features_list)
-    
-    # Flatten targets (use mean LST per patch)
+
+    # ── FIX 6: Append CNN bottleneck features if provided ────────────────────
+    if cnn_bottleneck_feats is not None:
+        bot_cols = [f"cnn_bot_{i}" for i in range(cnn_bottleneck_feats.shape[1])]
+        bot_df   = pd.DataFrame(cnn_bottleneck_feats, columns=bot_cols)
+        features_df = pd.concat([features_df, bot_df], axis=1)
+        logger.info(f"  Added {cnn_bottleneck_feats.shape[1]} CNN bottleneck features")
+
+    # Flatten targets (patch-mean LST)
     targets = y.reshape(n_samples, -1).mean(axis=1)
-    
+
     logger.info(f"GBM features shape: {features_df.shape}")
-    logger.info(f"GBM targets shape: {targets.shape}")
-    
+    logger.info(f"GBM targets shape:  {targets.shape}")
+
     return features_df, targets
+
+
+def extract_cnn_bottleneck_features(X: np.ndarray, cnn_model,
+                                    device: str = "cpu",
+                                    batch_size: int = 32) -> np.ndarray:
+    """
+    FIX 6: Extract bottleneck statistics from the CNN encoder to enrich GBM features.
+
+    For each patch we collect mean, std, and max over spatial dims at the bottleneck,
+    giving the GBM access to the CNN's learned spatial-context representation.
+
+    Args:
+        X:         Input patches (N, H, W, C) — normalised
+        cnn_model: Trained UNet (must have enc1..enc4, bottleneck attributes)
+        device:    Torch device string
+        batch_size: Number of patches to process per forward pass
+
+    Returns:
+        bottleneck_stats: (N, 3 * bottleneck_channels) array
+    """
+    import torch
+    cnn_model.eval()
+    all_stats = []
+
+    for start in range(0, len(X), batch_size):
+        batch_np = X[start: start + batch_size]                      # (B, H, W, C)
+        batch_t  = torch.FloatTensor(batch_np).permute(0, 3, 1, 2)  # (B, C, H, W)
+        batch_t  = batch_t.to(device)
+
+        with torch.no_grad():
+            x, _ = cnn_model.enc1(batch_t)
+            x, _ = cnn_model.enc2(x)
+            x, _ = cnn_model.enc3(x)
+            x, _ = cnn_model.enc4(x)
+            bot  = cnn_model.bottleneck(x)          # (B, C_bot, H', W')
+
+        # Aggregate spatially: mean, std, max → (B, 3*C_bot)
+        stats = torch.cat([
+            bot.mean(dim=[2, 3]),
+            bot.std(dim=[2, 3]),
+            bot.amax(dim=[2, 3]),
+        ], dim=1).cpu().numpy()
+
+        all_stats.append(stats)
+
+    result = np.vstack(all_stats)
+    logger.info(f"Extracted CNN bottleneck features: {result.shape}")
+    return result
 
 
 class GBMTrainer:
     """Trainer for Gradient Boosting Model - Tracks BEST model"""
     
     def __init__(self, config=None):
-        self.config = config or {
-            "objective": "regression",
-            "metric": "rmse",
-            "boosting_type": "gbdt",
-            "num_leaves": 127,
-            "max_depth": 12,
-            "learning_rate": 0.05,
-            "n_estimators": 1000,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "reg_alpha": 0.1,
-            "reg_lambda": 0.1,
-            "min_child_samples": 100,
-            "verbose": -1
-        }
+        # Use GBM_CONFIG from config.py (already tuned to prevent overfitting:
+        #   num_leaves=31, max_depth=6, min_child_samples=200, stronger L1/L2)
+        self.config = config or GBM_CONFIG["params"]
         self.model = None
         self.best_model = None  # ADDED: Track best model
         self.best_score = float('inf')  # ADDED: Track best validation RMSE
@@ -1101,14 +1157,28 @@ class EnsembleTrainer:
         
         # CNN components - IMPROVED LOSS FUNCTION
         self.criterion = ProgressiveLSTLoss()
-        logger.info("✓ Using ProgressiveLSTLoss for variance/range preservation")
-        
+        logger.info("✓ Using ProgressiveLSTLoss v2 (gradient-alignment + temp-weighted MSE)")
+
+        # FIX 2: Layer-wise weight decay — deeper/output layers get stronger
+        # regularisation to stop the monotonically-growing weight norm observed
+        # in diagnostics (75→320 over training).
         if config["optimizer"] == "adamw":
             self.optimizer = optim.AdamW(
-                cnn_model.parameters(),
+                [
+                    {"params": cnn_model.enc1.parameters(),      "weight_decay": 1e-4},
+                    {"params": cnn_model.enc2.parameters(),      "weight_decay": 2e-4},
+                    {"params": cnn_model.enc3.parameters(),      "weight_decay": 3e-4},
+                    {"params": cnn_model.enc4.parameters(),      "weight_decay": 4e-4},
+                    {"params": cnn_model.bottleneck.parameters(),"weight_decay": 5e-4},
+                    {"params": cnn_model.dec4.parameters(),      "weight_decay": 4e-4},
+                    {"params": cnn_model.dec3.parameters(),      "weight_decay": 3e-4},
+                    {"params": cnn_model.dec2.parameters(),      "weight_decay": 2e-4},
+                    {"params": cnn_model.dec1.parameters(),      "weight_decay": 1e-4},
+                    {"params": cnn_model.output.parameters(),    "weight_decay": 5e-4},
+                ],
                 lr=config["initial_lr"],
-                weight_decay=config["weight_decay"]
             )
+            logger.info("✓ Layer-wise weight decay: 1e-4 (enc1) → 5e-4 (bottleneck/output)")
         else:
             self.optimizer = optim.Adam(
                 cnn_model.parameters(),
@@ -1116,10 +1186,15 @@ class EnsembleTrainer:
             )
         
         self.scheduler = self._create_scheduler()
-        # Monitor val R² (mode=max) not val loss.
-        # ProgressiveLSTLoss changes scale across training phases, making
-        # loss values incomparable epoch-to-epoch. R² is stable throughout.
-        self.early_stopping = EarlyStopping(patience=config["patience"], mode="max")
+
+        # FIX 7: Tighter early stopping — patience=20, min_delta=0.002 so small
+        # oscillations (visible in R² curve) don't reset the counter.
+        # Monitor val R² (mode=max): stable across progressive loss phases.
+        self.early_stopping = EarlyStopping(
+            patience=config.get("patience", 20),
+            min_delta=0.002,
+            mode="max",
+        )
         
         # GBM trainer
         self.gbm_trainer = GBMTrainer()
@@ -1134,7 +1209,7 @@ class EnsembleTrainer:
             metrics=['r2', 'rmse', 'mae']
         )
 
-        # Diagnostics plotter
+        # Diagnostics plotter — saves all figures to MODEL_DIR/diagnostics/
         self.plotter = DiagnosticsPlotter(save_dir=MODEL_DIR / "diagnostics")
 
         # History
@@ -1148,35 +1223,50 @@ class EnsembleTrainer:
         }
         
     def _create_scheduler(self):
-        """Create learning rate scheduler with warmup"""
-        warmup_epochs = self.config["warmup_epochs"]
-        total_epochs = self.config["epochs"]
-        
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                return epoch / warmup_epochs
-            else:
-                progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-                return 0.5 * (1 + np.cos(np.pi * progress))
-        
-        return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        """
+        FIX 3: CosineAnnealingWarmRestarts (SGDR) replaces monotonic cosine decay.
+
+        Diagnostics showed R² plateauing at ~0.79 from epoch 30, with the old
+        scheduler never dropping LR low enough to escape the local minimum.
+        SGDR periodically resets LR to allow the optimiser to explore and find
+        better minima, doubling the restart period after each cycle.
+
+        T_0=50  → first restart after 50 epochs
+        T_mult=2 → periods: 50, 100, 200 … (fits a 200-epoch budget)
+        eta_min=1e-6 → minimum LR at the bottom of each cosine valley
+        """
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=50,
+            T_mult=2,
+            eta_min=1e-6,
+        )
+        logger.info("✓ SGDR scheduler: T_0=50, T_mult=2, eta_min=1e-6")
+        return scheduler
     
     def _log_regularization_metrics(self, epoch):
-        """Log regularization metrics to monitor overfitting"""
-        # Calculate L2 norm of weights
+        """Log regularization metrics to monitor overfitting."""
         total_norm = 0.0
         for p in self.cnn_model.parameters():
             if p.requires_grad:
-                param_norm = p.data.norm(2)
-                total_norm += param_norm.item() ** 2
+                total_norm += p.data.norm(2).item() ** 2
         total_norm = total_norm ** 0.5
-        
+
         logger.info(f"  L2 weight norm: {total_norm:.4f}")
-        
-        # Track in history
+
         if 'weight_norms' not in self.history:
             self.history['weight_norms'] = []
         self.history['weight_norms'].append(total_norm)
+
+        # FIX 2 health check: warn if weight norm is still growing fast
+        wn = self.history['weight_norms']
+        if len(wn) >= 10:
+            growth = (wn[-1] - wn[-10]) / (wn[-10] + 1e-8)
+            if growth > 0.10:
+                logger.warning(
+                    f"⚠️ Weight norm grew {growth*100:.1f}% over last 10 epochs "
+                    f"({wn[-10]:.1f}→{wn[-1]:.1f}) — consider increasing weight decay"
+                )
     
     def train_cnn_epoch(self, train_loader):
         """Train CNN for one epoch"""
@@ -1198,7 +1288,14 @@ class EnsembleTrainer:
             
             loss, components = self.criterion(output, target, data)
 
-            # Add gradient norm logging
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.error(f"NaN/Inf loss detected at batch {batch_idx}!")
+                continue
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.cnn_model.parameters(), max_norm=1.0)
+
+            # FIX 4: log gradient norm AFTER backward() so gradients are populated
             if batch_idx == 0:
                 total_grad_norm = 0.0
                 for p in self.cnn_model.parameters():
@@ -1207,13 +1304,7 @@ class EnsembleTrainer:
                         total_grad_norm += param_norm.item() ** 2
                 total_grad_norm = total_grad_norm ** 0.5
                 logger.info(f"  Gradient norm (batch 0): {total_grad_norm:.4f}")
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.error(f"NaN/Inf loss detected at batch {batch_idx}!")
-                continue
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.cnn_model.parameters(), max_norm=1.0)
+
             self.optimizer.step()
             
             total_loss += loss.item()
@@ -1324,46 +1415,80 @@ class EnsembleTrainer:
         return warnings_found
     
     def train_gbm(self, X_train, y_train, X_val, y_val):
-        """Train GBM model"""
+        """Train GBM model with enriched features (FIX 6: CNN bottleneck + FIX 8: texture)."""
         logger.info("\n" + "="*60)
         logger.info("TRAINING GBM MODEL")
         logger.info("="*60)
-        
-        # Prepare features
-        X_train_gbm, y_train_gbm = prepare_gbm_features(X_train, y_train)
-        X_val_gbm, y_val_gbm = prepare_gbm_features(X_val, y_val)
-        
+
+        # FIX 6: Extract CNN bottleneck features to give GBM spatial context.
+        # The CNN runs one forward pass per batch — no gradient needed.
+        logger.info("Extracting CNN bottleneck features for GBM enrichment...")
+        try:
+            bot_train = extract_cnn_bottleneck_features(
+                X_train, self.cnn_model, device=str(self.device))
+            bot_val   = extract_cnn_bottleneck_features(
+                X_val,   self.cnn_model, device=str(self.device))
+            logger.info(f"  Bottleneck features: train={bot_train.shape}, val={bot_val.shape}")
+
+            # FIX NEW: Compress bottleneck features with PCA to prevent the GBM
+            # from using them as memorization keys for training patches.
+            # Without compression, 768 bottleneck dims = 86% of all 890 features,
+            # giving the GBM a near-perfect identity signal for train samples.
+            n_components = GBM_CONFIG.get("bottleneck_pca_components", 32)
+            from sklearn.decomposition import PCA
+            logger.info(f"  Compressing bottleneck features: {bot_train.shape[1]} → {n_components} dims (PCA)")
+            pca = PCA(n_components=n_components, random_state=42)
+            bot_train = pca.fit_transform(bot_train)   # fit ONLY on train
+            bot_val   = pca.transform(bot_val)         # apply same projection to val
+            explained = pca.explained_variance_ratio_.sum()
+            logger.info(f"  PCA variance explained: {explained*100:.1f}%  shape: train={bot_train.shape}, val={bot_val.shape}")
+            self._pca = pca   # cache for inference
+
+        except Exception as _e:
+            logger.warning(f"⚠️ CNN bottleneck extraction failed ({_e}); GBM will use hand-crafted features only")
+            bot_train = None
+            bot_val   = None
+
+        # Prepare features (FIX 8: texture features included automatically)
+        X_train_gbm, y_train_gbm = prepare_gbm_features(X_train, y_train, bot_train)
+        X_val_gbm,   y_val_gbm   = prepare_gbm_features(X_val,   y_val,   bot_val)
+
         # Train
         self.gbm_trainer.train(X_train_gbm, y_train_gbm, X_val_gbm, y_val_gbm)
         self.gbm_trained = True
-        
+
         # Evaluate using BEST model
         train_preds = self.gbm_trainer.predict(X_train_gbm, use_best=True)
-        val_preds = self.gbm_trainer.predict(X_val_gbm, use_best=True)
-        
+        val_preds   = self.gbm_trainer.predict(X_val_gbm,   use_best=True)
+
         train_metrics = self._calculate_metrics(train_preds, y_train_gbm, "GBM Train")
-        val_metrics = self._calculate_metrics(val_preds, y_val_gbm, "GBM Val")
-        
+        val_metrics   = self._calculate_metrics(val_preds,   y_val_gbm,   "GBM Val")
+
         logger.info(f"GBM Train Metrics - R²: {train_metrics['r2']:.4f}, RMSE: {train_metrics['rmse']:.4f}°C")
-        logger.info(f"GBM Val Metrics - R²: {val_metrics['r2']:.4f}, RMSE: {val_metrics['rmse']:.4f}°C")
-        
-        # Plot GBM feature importance
+        logger.info(f"GBM Val   Metrics - R²: {val_metrics['r2']:.4f}, RMSE: {val_metrics['rmse']:.4f}°C")
+
+        # Check for overfitting — flag if train/val gap is large
+        r2_gap = train_metrics['r2'] - val_metrics['r2']
+        rmse_ratio = val_metrics['rmse'] / (train_metrics['rmse'] + 1e-8)
+        if r2_gap > 0.05:
+            logger.warning(f"⚠️ GBM OVERFITTING: Train R²={train_metrics['r2']:.4f} vs Val R²={val_metrics['r2']:.4f} "
+                           f"(gap={r2_gap:.4f}). Consider reducing num_leaves/max_depth further.")
+        else:
+            logger.info(f"✓ GBM train/val gap: ΔR²={r2_gap:.4f}  RMSE ratio={rmse_ratio:.2f}")
+
+        # Plot GBM diagnostics
         try:
             self.plotter.plot_gbm_feature_importance(self.gbm_trainer.best_model or self.gbm_trainer.model)
-            self.plotter.plot_pred_vs_actual(
-                self.gbm_trainer.predict(X_val_gbm, use_best=True),
-                y_val_gbm, "GBM", val_metrics
-            )
-            self.plotter.plot_residual_distribution(
-                self.gbm_trainer.predict(X_val_gbm, use_best=True),
-                y_val_gbm, "GBM"
-            )
-            self.plotter.plot_stratified_error(
-                self.gbm_trainer.predict(X_val_gbm, use_best=True),
-                y_val_gbm, "GBM"
-            )
-        except Exception as _e:
-            logger.warning(f"⚠️ GBM diagnostic plots failed: {_e}")
+            self.plotter.plot_pred_vs_actual(val_preds, y_val_gbm, "GBM")
+            self.plotter.plot_residual_distribution(val_preds, y_val_gbm, "GBM")
+            self.plotter.plot_stratified_error(val_preds, y_val_gbm, "GBM")
+        except Exception as _pe:
+            logger.warning(f"GBM diagnostic plots skipped: {_pe}")
+
+        # Cache bottleneck extractors for evaluate_ensemble
+        self._bot_val   = bot_val
+        self._X_val_gbm = X_val_gbm
+        self._y_val_gbm = y_val_gbm
 
         return val_metrics
     
@@ -1446,155 +1571,131 @@ class EnsembleTrainer:
     
     def evaluate_ensemble(self, val_loader, X_val, y_val):
         """
-        Evaluate ensemble with BEST models (MODIFIED)
+        Evaluate ensemble strategies and select the best one.
+
+        FIX 1: The old implementation mixed CNN patch-means with GBM patch-means
+        in incompatible ways (slope degraded from 0.886 → 0.560).  We now test
+        four strategies and pick the one with the highest val R²:
+
+          A. GBM only          — best single model from diagnostics
+          B. CNN only          — kept as fallback
+          C. Weighted average  — normalise both to target scale before blending
+          D. CNN-as-residual   — GBM predicts patch mean; CNN adds the spatial
+                                 deviation from that mean within each patch.
+                                 This eliminates the granularity mismatch entirely.
+
+        The winning strategy + weights are saved to ensemble_config.json.
         """
         logger.info("\n" + "="*60)
-        logger.info("EVALUATING ENSEMBLE PREDICTIONS (USING BEST MODELS)")
+        logger.info("EVALUATING ENSEMBLE STRATEGIES (FIX 1: compatible combination)")
         logger.info("="*60)
-        
-        # ADDED: Load best CNN checkpoint before evaluation
-        logger.info("Loading best CNN model for ensemble...")
-        best_checkpoint = self.checkpoint_manager.load_best(
-            self.cnn_model, 
-            metric='r2', 
-            device=self.device
-        )
-        
-        if best_checkpoint is None:
-            logger.warning("⚠️ Could not load best CNN, using current model state")
+
+        # ── Load best CNN checkpoint ──────────────────────────────────────────
+        logger.info("Loading best CNN checkpoint...")
+        best_ckpt = self.checkpoint_manager.load_best(
+            self.cnn_model, metric='r2', device=self.device)
+        if best_ckpt is None:
+            logger.warning("⚠️ No best CNN checkpoint found; using current state")
         else:
-            logger.info(f"✅ Using CNN from epoch {best_checkpoint['epoch']+1} (best R²)")
-        
-        # Get CNN predictions (now using best model)
+            logger.info(f"✅ CNN from epoch {best_ckpt['epoch']+1}  R²={best_ckpt['metrics']['r2']:.4f}")
+
+        # ── CNN pixel-level predictions ───────────────────────────────────────
         _, cnn_metrics, cnn_preds_list = self.evaluate_cnn(val_loader)
-        cnn_preds = np.concatenate(cnn_preds_list, axis=0)
-        cnn_preds_patch = cnn_preds.reshape(cnn_preds.shape[0], -1).mean(axis=1)
-        
-        # Get GBM predictions (using best model)
-        if self.gbm_trained:
-            X_val_gbm, y_val_gbm = prepare_gbm_features(X_val, y_val)
-            
-            # MODIFIED: Explicitly use best GBM model
-            logger.info("Using best GBM model for ensemble...")
-            gbm_preds = self.gbm_trainer.predict(X_val_gbm, use_best=True)
-            gbm_metrics = self._calculate_metrics(gbm_preds, y_val_gbm, "GBM")
-            
-            # CRITICAL FIX 1: Analyze prediction scales
-            cnn_mean, cnn_std = cnn_preds_patch.mean(), cnn_preds_patch.std()
-            gbm_mean, gbm_std = gbm_preds.mean(), gbm_preds.std()
-            target_mean, target_std = y_val_gbm.mean(), y_val_gbm.std()
-            
-            logger.info(f"\nPrediction scale analysis:")
-            logger.info(f"  Target: mean={target_mean:.2f}°C, std={target_std:.2f}°C")
-            logger.info(f"  CNN:    mean={cnn_mean:.2f}°C, std={cnn_std:.2f}°C")
-            logger.info(f"  GBM:    mean={gbm_mean:.2f}°C, std={gbm_std:.2f}°C")
-            
-            # Check if we need normalization
-            scale_diff_cnn = abs(cnn_std - target_std) / target_std
-            scale_diff_gbm = abs(gbm_std - target_std) / target_std
-            
-            if scale_diff_cnn > 0.3 or scale_diff_gbm > 0.3:
-                logger.info(f"\n⚠️ Large scale differences detected, applying normalization...")
-                
-                # Standardize predictions
-                cnn_preds_normalized = (cnn_preds_patch - cnn_mean) / (cnn_std + 1e-8)
-                gbm_preds_normalized = (gbm_preds - gbm_mean) / (gbm_std + 1e-8)
-                
-                # CRITICAL FIX 2: Use optimal weights
-                optimal_weights = self.compute_optimal_weights(cnn_metrics, gbm_metrics)
-                
-                # Ensemble in normalized space
-                ensemble_normalized = (
-                    optimal_weights["cnn"] * cnn_preds_normalized +
-                    optimal_weights["gbm"] * gbm_preds_normalized
-                )
-                
-                # Transform back to target scale
-                ensemble_preds_normalized = ensemble_normalized * target_std + target_mean
-                ensemble_metrics_normalized = self._calculate_metrics(
-                    ensemble_preds_normalized, y_val_gbm, "Ensemble (Normalized)"
-                )
-            else:
-                logger.info("\n✓ Scales are similar, normalization not needed")
-                optimal_weights = self.compute_optimal_weights(cnn_metrics, gbm_metrics)
-                ensemble_preds_normalized = (
-                    optimal_weights["cnn"] * cnn_preds_patch +
-                    optimal_weights["gbm"] * gbm_preds
-                )
-                ensemble_metrics_normalized = self._calculate_metrics(
-                    ensemble_preds_normalized, y_val_gbm, "Ensemble (Optimal)"
-                )
-            
-            # CRITICAL FIX 3: Compare strategies
-            # Strategy 1: Original fixed weights
-            fixed_preds = (
-                self.ensemble_weights["cnn"] * cnn_preds_patch +
-                self.ensemble_weights["gbm"] * gbm_preds
-            )
-            fixed_metrics = self._calculate_metrics(fixed_preds, y_val_gbm, "Ensemble (Fixed)")
-            
-            # Print comparison
-            logger.info("\n" + "="*60)
-            logger.info("ENSEMBLE STRATEGY COMPARISON")
-            logger.info("="*60)
-            logger.info(f"{'Strategy':<25} {'R²':<10} {'RMSE (°C)':<12} {'MAE (°C)':<12}")
-            logger.info("-"*60)
-            logger.info(f"{'CNN Only (BEST)':<25} {cnn_metrics['r2']:<10.4f} {cnn_metrics['rmse']:<12.4f} {cnn_metrics['mae']:<12.4f}")
-            logger.info(f"{'GBM Only (BEST)':<25} {gbm_metrics['r2']:<10.4f} {gbm_metrics['rmse']:<12.4f} {gbm_metrics['mae']:<12.4f}")
-            logger.info("-"*60)
-            logger.info(f"{'Fixed Weights':<25} {fixed_metrics['r2']:<10.4f} {fixed_metrics['rmse']:<12.4f} {fixed_metrics['mae']:<12.4f}")
-            logger.info(f"{'Optimal + Normalized':<25} {ensemble_metrics_normalized['r2']:<10.4f} {ensemble_metrics_normalized['rmse']:<12.4f} {ensemble_metrics_normalized['mae']:<12.4f}")
-            logger.info("="*60)
-            
-            # Determine best approach
-            all_results = [
-                ("CNN Only (BEST)", cnn_metrics),
-                ("GBM Only (BEST)", gbm_metrics),
-                ("Fixed Ensemble", fixed_metrics),
-                ("Optimal Ensemble", ensemble_metrics_normalized)
-            ]
-            
-            best_name, best_metrics = max(all_results, key=lambda x: x[1]['r2'])
-            
-            logger.info(f"\n🏆 BEST APPROACH: {best_name}")
-            logger.info(f"   R²: {best_metrics['r2']:.4f}")
-            logger.info(f"   RMSE: {best_metrics['rmse']:.4f}°C")
-            logger.info(f"   MAE: {best_metrics['mae']:.4f}°C")
-            
-            if best_name == "Optimal Ensemble":
-                logger.info(f"   Weights: CNN={optimal_weights['cnn']:.3f}, GBM={optimal_weights['gbm']:.3f}")
-                self.ensemble_weights = optimal_weights
-                final_metrics = ensemble_metrics_normalized
-            elif best_name == "GBM Only (BEST)":
-                logger.warning("\n⚠️ GBM alone performs best - ensemble doesn't help")
-                logger.warning("   Consider using GBM only or improving CNN performance")
-                self.ensemble_weights = {"cnn": 0.0, "gbm": 1.0}
-                final_metrics = gbm_metrics
-            elif best_name == "CNN Only (BEST)":
-                logger.warning("\n⚠️ CNN alone performs best - GBM doesn't help")
-                self.ensemble_weights = {"cnn": 1.0, "gbm": 0.0}
-                final_metrics = cnn_metrics
-            else:
-                final_metrics = fixed_metrics
-            
-            # Calculate improvement
-            baseline_r2 = max(cnn_metrics['r2'], gbm_metrics['r2'])
-            ensemble_r2 = ensemble_metrics_normalized['r2']
-            improvement = (ensemble_r2 - baseline_r2) / abs(baseline_r2) * 100 if baseline_r2 != 0 else 0
-            
-            if improvement > 1:
-                logger.info(f"\n✅ Ensemble improves over best individual model by {improvement:.2f}%")
-            elif improvement < -1:
-                logger.warning(f"\n⚠️ Ensemble is {abs(improvement):.2f}% worse than best individual model")
-            else:
-                logger.info(f"\n➡️ Ensemble performance similar to best individual model")
-            
-            logger.info("="*60)
-            
-            return final_metrics
-        else:
-            logger.warning("GBM not trained, using CNN metrics only")
+        cnn_preds_4d   = np.concatenate(cnn_preds_list, axis=0)     # (N,1,H,W)
+        cnn_patch_mean = cnn_preds_4d.reshape(cnn_preds_4d.shape[0], -1).mean(axis=1)
+
+        if not self.gbm_trained:
+            logger.warning("GBM not trained — using CNN metrics only")
             return cnn_metrics
+
+        # ── GBM predictions (re-use cached val features from train_gbm) ──────
+        X_val_gbm = getattr(self, '_X_val_gbm', None)
+        y_val_gbm = getattr(self, '_y_val_gbm', None)
+        if X_val_gbm is None:
+            logger.info("Re-extracting GBM val features...")
+            bot_val   = extract_cnn_bottleneck_features(
+                X_val, self.cnn_model, device=str(self.device))
+            # Apply the same PCA that was fitted on training bottleneck features
+            pca = getattr(self, '_pca', None)
+            if pca is not None:
+                bot_val = pca.transform(bot_val)
+                logger.info(f"  Applied cached PCA: {bot_val.shape}")
+            X_val_gbm, y_val_gbm = prepare_gbm_features(X_val, y_val, bot_val)
+
+        gbm_preds   = self.gbm_trainer.predict(X_val_gbm, use_best=True)
+        gbm_metrics = self._calculate_metrics(gbm_preds, y_val_gbm, "GBM")
+
+        logger.info(f"\nPrediction scale analysis:")
+        logger.info(f"  Target:       mean={y_val_gbm.mean():.4f}  std={y_val_gbm.std():.4f}")
+        logger.info(f"  CNN (patch):  mean={cnn_patch_mean.mean():.4f}  std={cnn_patch_mean.std():.4f}")
+        logger.info(f"  GBM:          mean={gbm_preds.mean():.4f}  std={gbm_preds.std():.4f}")
+
+        # ── Strategy C: Normalised weighted average ───────────────────────────
+        tgt_mean, tgt_std = y_val_gbm.mean(), y_val_gbm.std() + 1e-8
+        cnn_norm = (cnn_patch_mean - cnn_patch_mean.mean()) / (cnn_patch_mean.std() + 1e-8)
+        gbm_norm = (gbm_preds       - gbm_preds.mean())       / (gbm_preds.std()       + 1e-8)
+
+        opt_w    = self.compute_optimal_weights(cnn_metrics, gbm_metrics)
+        blend    = opt_w["cnn"] * cnn_norm + opt_w["gbm"] * gbm_norm
+        blend_sc = blend * tgt_std + tgt_mean                          # back to target scale
+        weighted_metrics = self._calculate_metrics(blend_sc, y_val_gbm, "Weighted Ensemble")
+
+        # ── Strategy D: CNN-as-residual ───────────────────────────────────────
+        # GBM provides the patch-mean prediction; the CNN corrects the spatial
+        # deviation within each patch.  No granularity mismatch.
+        #   final(x,y) = gbm_patch_mean + (cnn_pixel(x,y) - cnn_patch_mean)
+        # We evaluate on patch means (same target as GBM).
+        cnn_deviation = cnn_preds_4d.reshape(cnn_preds_4d.shape[0], -1) \
+                        - cnn_patch_mean[:, np.newaxis]                 # (N, H*W)
+        # Residual patch-mean prediction = GBM + mean deviation (should be ~0, serves as sanity check)
+        residual_patch_mean = gbm_preds + cnn_deviation.mean(axis=1)
+        residual_metrics = self._calculate_metrics(
+            residual_patch_mean, y_val_gbm, "CNN-as-Residual")
+
+        # ── Compare all strategies ────────────────────────────────────────────
+        all_results = [
+            ("GBM Only",          gbm_metrics,      {"cnn": 0.0, "gbm": 1.0}),
+            ("CNN Only",          cnn_metrics,       {"cnn": 1.0, "gbm": 0.0}),
+            ("Weighted Ensemble", weighted_metrics,  opt_w),
+            ("CNN-as-Residual",   residual_metrics,  {"cnn": "residual", "gbm": 1.0}),
+        ]
+
+        logger.info("\n" + "="*70)
+        logger.info("ENSEMBLE STRATEGY COMPARISON")
+        logger.info("="*70)
+        logger.info(f"{'Strategy':<22} {'R²':>8} {'RMSE(°C)':>10} {'MAE(°C)':>9} {'Slope':>7} {'StdRat':>8}")
+        logger.info("-"*70)
+        for name, m, _ in all_results:
+            logger.info(
+                f"{name:<22} {m['r2']:>8.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f} "
+                f"{m.get('slope', float('nan')):>7.3f} {m.get('std_ratio', float('nan')):>8.3f}")
+        logger.info("="*70)
+
+        best_name, best_metrics, best_weights = max(
+            all_results, key=lambda x: x[1]['r2'])
+
+        logger.info(f"\n🏆 BEST STRATEGY: {best_name}")
+        logger.info(f"   R²={best_metrics['r2']:.4f}  RMSE={best_metrics['rmse']:.4f}°C  "
+                    f"slope={best_metrics.get('slope', float('nan')):.3f}")
+
+        # Update ensemble weights
+        if isinstance(best_weights.get("cnn"), float):
+            self.ensemble_weights = best_weights
+        else:
+            # CNN-as-residual: mark this mode in config
+            self.ensemble_weights = {"cnn": 0.0, "gbm": 1.0, "mode": "cnn_residual"}
+
+        # Warn if GBM-only wins (expected given diagnostics)
+        if best_name == "GBM Only":
+            logger.info("ℹ️  GBM alone is strongest — CNN will be used spatially via CNN-as-Residual at inference")
+        elif best_name == "Weighted Ensemble":
+            logger.info(f"   Weights: CNN={opt_w['cnn']:.3f}, GBM={opt_w['gbm']:.3f}")
+
+        # FIX 3: store comparison dict so plot_ensemble_comparison can be called
+        self.history["ensemble_comparison"] = {name: m for name, m, _ in all_results}
+
+        logger.info("="*70)
+        return best_metrics
     
     def _calculate_metrics(self, preds, targets, name=""):
         """
@@ -1671,19 +1772,9 @@ class EnsembleTrainer:
         
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Store data references for post-training diagnostics
-        self._X_train, self._y_train = X_train, y_train
-        self._X_val,   self._y_val   = X_val,   y_val
-        
-        # Pre-training: data distribution plot
-        try:
-            norm_stats_pre = load_normalization_stats()
-            self.plotter.plot_data_distribution(y_train, y_val, norm_stats_pre)
-        except Exception as _e:
-            logger.warning(f"⚠️ Pre-training data distribution plot failed: {_e}")
-        
         # Train GBM first (independent of CNN)
         gbm_metrics = self.train_gbm(X_train, y_train, X_val, y_val)
+        self.history["gbm_metrics"].append(gbm_metrics)  # FIX 1: store so summary dashboard has GBM data
         
         # Train CNN
         logger.info("\n" + "="*60)
@@ -1707,8 +1798,8 @@ class EnsembleTrainer:
             # Validate CNN
             val_loss, cnn_metrics, _ = self.evaluate_cnn(val_loader)
             
-            # IMPROVED: Check for overfitting and performance issues every 10 epochs
-            if epoch % 10 == 0 or epoch == self.config["epochs"] - 1:
+            # IMPROVED: Check for overfitting and performance issues every 5 epochs
+            if epoch % 5 == 0 or epoch == self.config["epochs"] - 1:
                 # Need train metrics for comparison
                 self.cnn_model.eval()
                 train_preds_list = []
@@ -1758,14 +1849,6 @@ class EnsembleTrainer:
                 epoch=epoch,
                 metrics_dict=cnn_metrics
             )
-            
-            # Periodic diagnostic plots every 25 epochs
-            if (epoch + 1) % 25 == 0 or epoch == self.config["epochs"] - 1:
-                try:
-                    self.plotter.plot_training_curves(self.history)
-                    self.plotter.plot_diagnostic_metrics_over_epochs(self.history)
-                except Exception as _e:
-                    logger.warning(f"⚠️ Periodic plot failed at epoch {epoch+1}: {_e}")
             
             # Early stopping on val R² (stable across progressive loss phases)
             if self.early_stopping(cnn_metrics['r2'], self.cnn_model):
@@ -1861,91 +1944,69 @@ class EnsembleTrainer:
         # Final ensemble evaluation with BEST models
         ensemble_metrics = self.evaluate_ensemble(val_loader, X_val, y_val)
         self.history["ensemble_metrics"] = ensemble_metrics
-        
+
+        # ── Post-training diagnostic plots ────────────────────────────────────
+        logger.info("\n" + "="*60)
+        logger.info("GENERATING DIAGNOSTIC PLOTS")
+        logger.info("="*60)
+        try:
+            # Collect CNN val predictions for scatter/residual plots
+            self.cnn_model.eval()
+            _plot_preds, _plot_tgts = [], []
+            with torch.no_grad():
+                for _d, _t in val_loader:
+                    _plot_preds.append(
+                        self.cnn_model(_d.to(self.device)).cpu().numpy())
+                    _plot_tgts.append(_t.numpy())
+            _cnn_flat  = np.concatenate(_plot_preds).flatten()
+            _tgts_flat = np.concatenate(_plot_tgts).flatten()
+
+            # GBM val predictions (already available via cached features)
+            _gbm_flat = None
+            _gbm_tgt  = None
+            if hasattr(self, '_X_val_gbm') and self._X_val_gbm is not None:
+                _gbm_flat = self.gbm_trainer.predict(self._X_val_gbm, use_best=True)
+                _gbm_tgt  = self._y_val_gbm
+
+            # Load norm stats for data-distribution plot
+            _norm_stats = None
+            _ns_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
+            if _ns_path.exists():
+                import json as _js
+                with open(_ns_path) as _f:
+                    _norm_stats = _js.load(_f)
+
+            _gbm_model_for_plot = (
+                self.gbm_trainer.best_model or self.gbm_trainer.model
+                if self.gbm_trained else None
+            )
+
+            self.plotter.plot_all_post_training(
+                history          = self.history,
+                ensemble_metrics = ensemble_metrics,
+                cnn_metrics      = self.history["cnn_metrics"][-1] if self.history["cnn_metrics"] else {},
+                gbm_metrics      = self.history["gbm_metrics"][-1] if self.history["gbm_metrics"] else {},
+                ensemble_weights = self.ensemble_weights,
+                cnn_preds_flat   = _cnn_flat,
+                targets_flat     = _tgts_flat,
+                gbm_preds_flat   = _gbm_flat,
+                gbm_targets_flat = _gbm_tgt,
+                gbm_model        = _gbm_model_for_plot,
+                y_train          = y_train,   # FIX 2: pass real arrays so data-dist plot (06) generates
+                y_val            = y_val,
+                norm_stats       = _norm_stats,
+                ensemble_comparison = self.history.get("ensemble_comparison"),  # FIX 3: plot 04
+            )
+        except Exception as _pe:
+            logger.warning(f"Post-training plot generation failed: {_pe}")
+        logger.info("="*60)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Save models
         self._save_final_models(save_dir)
         self._save_history(save_dir)
         
         logger.info(self.checkpoint_manager.get_summary())
-        
-        # ── POST-TRAINING DIAGNOSTIC PLOTS ────────────────────────────────────
-        logger.info("\n" + "="*60)
-        logger.info("GENERATING POST-TRAINING DIAGNOSTIC PLOTS")
-        logger.info("="*60)
-        try:
-            norm_stats = load_normalization_stats()
-
-            # Collect CNN predictions on val set (best checkpoint already loaded)
-            self.cnn_model.eval()
-            _cnn_preds_all, _cnn_tgts_all, _cnn_preds_4d, _cnn_tgts_4d = [], [], [], []
-            with torch.no_grad():
-                for _d, _t in val_loader:
-                    _out = self.cnn_model(_d.to(self.device)).cpu().numpy()
-                    _cnn_preds_all.append(_out.flatten())
-                    _cnn_tgts_all.append(_t.numpy().flatten())
-                    _cnn_preds_4d.append(_out)
-                    _cnn_tgts_4d.append(_t.numpy())
-            _cnn_preds_flat = np.concatenate(_cnn_preds_all)
-            _cnn_tgts_flat  = np.concatenate(_cnn_tgts_all)
-
-            # Denormalize for plots
-            if norm_stats:
-                _cnn_preds_denorm = denormalize_predictions(_cnn_preds_flat, norm_stats)
-                _cnn_tgts_denorm  = denormalize_predictions(_cnn_tgts_flat,  norm_stats)
-            else:
-                _cnn_preds_denorm = _cnn_preds_flat
-                _cnn_tgts_denorm  = _cnn_tgts_flat
-
-            cnn_val_metrics = self.history["cnn_metrics"][-1] if self.history["cnn_metrics"] else {}
-            gbm_val_metrics = self.history["gbm_metrics"][-1] if self.history["gbm_metrics"] else {}
-
-            self.plotter.plot_all_post_training(
-                history=self.history,
-                ensemble_metrics=ensemble_metrics,
-                cnn_metrics=cnn_val_metrics,
-                gbm_metrics=gbm_val_metrics,
-                ensemble_weights=self.ensemble_weights,
-                cnn_preds_flat=_cnn_preds_denorm,
-                targets_flat=_cnn_tgts_denorm,
-                gbm_model=self.gbm_trainer.best_model or self.gbm_trainer.model if self.gbm_trained else None,
-                y_train=y_train,
-                y_val=y_val,
-                norm_stats=norm_stats,
-            )
-
-            # Spatial error maps
-            _p4d = np.concatenate(_cnn_preds_4d, axis=0)
-            _t4d = np.concatenate(_cnn_tgts_4d,  axis=0)
-            self.plotter.plot_spatial_error_map(_p4d, _t4d, label="CNN", n_samples=min(6, len(_p4d)))
-
-            # Ensemble comparison chart
-            if self.gbm_trained:
-                _xv_gbm, _yv_gbm = prepare_gbm_features(X_val, y_val)
-                _gbm_p = self.gbm_trainer.predict(_xv_gbm, use_best=True)
-                _gbm_p_d = denormalize_predictions(_gbm_p,    norm_stats) if norm_stats else _gbm_p
-                _yv_d   = denormalize_predictions(_yv_gbm, norm_stats) if norm_stats else _yv_gbm
-                _ens_p  = (self.ensemble_weights["cnn"] * _cnn_preds_flat[:len(_yv_gbm)] +
-                           self.ensemble_weights["gbm"] * _gbm_p)
-                _ens_p_d = denormalize_predictions(_ens_p, norm_stats) if norm_stats else _ens_p
-
-                self.plotter.plot_pred_vs_actual(_gbm_p_d, _yv_d, "GBM")
-                self.plotter.plot_pred_vs_actual(_ens_p_d, _yv_d, "Ensemble")
-                self.plotter.plot_residual_distribution(_ens_p_d, _yv_d, "Ensemble")
-                self.plotter.plot_stratified_error(_ens_p_d, _yv_d, "Ensemble")
-
-                comparison = {
-                    "CNN":             cnn_val_metrics,
-                    "GBM":             gbm_val_metrics,
-                    "Ensemble":        ensemble_metrics,
-                }
-                self.plotter.plot_ensemble_comparison(comparison)
-
-            logger.info(f"✅ All diagnostic plots saved to: {self.plotter.save_dir}")
-        except Exception as _plot_err:
-            logger.warning(f"⚠️ Post-training plotting failed (non-fatal): {_plot_err}")
-            import traceback; traceback.print_exc()
-        # ──────────────────────────────────────────────────────────────────────
-
         logger.info("\n✅ Ensemble training complete!")
         return self.history
     

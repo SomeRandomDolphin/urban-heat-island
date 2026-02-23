@@ -172,19 +172,24 @@ GBM_CONFIG = {
         "num_leaves": 31,  # Was 127 - much simpler
         "max_depth": 6,    # Was 12 - much shallower
         
-        # LEARNING: Slower, fewer trees
-        "learning_rate": 0.05,  # Was 0.02 - faster convergence
-        "n_estimators": 500,    # Was 2000 - fewer trees
+        # LEARNING: Let early stopping find the right number of trees
+        "learning_rate": 0.05,
+        "n_estimators": 2000,   # Was 500 — model was hitting the cap, not converging
         
-        # STRONGER SAMPLING: More regularization
-        "subsample": 0.6,         # Was 0.7 - more bagging
+        # SAMPLING: More aggressive feature sampling to reduce remaining gap
+        "subsample": 0.7,         # Was 0.6 — slight increase to stabilize with more trees
         "subsample_freq": 1,
-        "colsample_bytree": 0.6,  # Was 0.7 - more feature sampling
+        "colsample_bytree": 0.4,  # Was 0.6 — more aggressive, reduces memorization
         
-        # STRONGER REGULARIZATION: Prevent overfitting
-        "reg_alpha": 1.0,   # Was 0.1 - much stronger L1
-        "reg_lambda": 1.0,  # Was 0.1 - much stronger L2
-        "min_child_samples": 200,  # Was 100 - require more data per leaf
+        # REGULARIZATION
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0,
+        # Reduced from 200 — was too restrictive, forcing mean-regression (slope=0.833)
+        "min_child_samples": 50,
+        # Controls leaf weight instead of count — more precise than min_child_samples alone
+        "min_child_weight": 1e-3,
+        # Prune splits that don't earn their keep — directly fights range compression
+        "min_split_gain": 0.01,
         
         # Convergence
         "early_stopping_rounds": 50,

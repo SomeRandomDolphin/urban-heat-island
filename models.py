@@ -133,108 +133,145 @@ class UNet(nn.Module):
 
 class ProgressiveLSTLoss(nn.Module):
     """
-    Enhanced loss function preventing variance collapse and range compression
-    
-    Fixes the issue where:
-    - Training: R² = 0.92, RMSE = 1.30°C
-    - Inference: R² = 0.75, RMSE = 2.71°C, Slope = 0.675
+    Enhanced loss function preventing variance collapse and range compression.
+
+    FIX 4: Spatial smoothness penalty REMOVED — it was blurring sharp land-cover
+            boundaries (e.g. building/water edges) which are physically real.
+            Replaced with a gradient-alignment loss that penalises *disagreement*
+            with the target's spatial gradients rather than raw smoothness.
+
+    FIX 5: Temperature-weighted MSE — weights each pixel by how far its true
+            temperature is from the patch mean, so extreme-temperature pixels
+            (rooftops, industrial zones) contribute more to training than the
+            densely-sampled mid-temperature range.  This attacks the observed
+            heteroscedastic fan in residuals.
     """
-    
+
     def __init__(self):
         super().__init__()
-        
-        # Start with MSE focus, then adapt during training
-        self.mse_weight = 0.7
+
+        # Phase weights — updated each epoch via set_training_progress()
+        self.mse_weight      = 0.6
         self.variance_weight = 0.1
-        self.range_weight = 0.1
-        self.bias_weight = 0.1
-        
+        self.range_weight    = 0.1
+        self.bias_weight     = 0.1
+        self.gradient_weight = 0.1   # FIX 4: replaces spatial smoothness
+
         self.current_epoch = 0
-        
-        logger.info("ImprovedLSTLoss initialized (adaptive)")
-    
+
+        logger.info("ProgressiveLSTLoss v2 initialised "
+                    "(gradient-alignment + temperature-weighted MSE, no spatial smoothness)")
+
     def set_training_progress(self, epoch: int, total_epochs: int):
-        """Update weights based on training progress"""
+        """Update loss component weights based on training phase."""
         self.current_epoch = epoch
-        progress = epoch / total_epochs
-        
+        progress = epoch / max(total_epochs, 1)
+
         if progress < 0.3:
-            # Phase 1: MSE focus (0-30%)
-            self.mse_weight = 0.7
-            self.variance_weight = 0.1
-            self.range_weight = 0.1
-            self.bias_weight = 0.1
+            # Phase 1 – WARMUP: lead with weighted MSE; light regularisation
+            self.mse_weight      = 0.65
+            self.variance_weight = 0.10
+            self.range_weight    = 0.10
+            self.bias_weight     = 0.05
+            self.gradient_weight = 0.10
             phase = "WARMUP"
-            
+
         elif progress < 0.6:
-            # Phase 2: Add variance/range (30-60%)
-            self.mse_weight = 0.5
-            self.variance_weight = 0.2
-            self.range_weight = 0.2
-            self.bias_weight = 0.1
+            # Phase 2 – REFINEMENT: increase variance/range pressure
+            self.mse_weight      = 0.50
+            self.variance_weight = 0.18
+            self.range_weight    = 0.18
+            self.bias_weight     = 0.07
+            self.gradient_weight = 0.07
             phase = "REFINEMENT"
-            
+
         else:
-            # Phase 3: Balanced (60-100%)
-            self.mse_weight = 0.4
-            self.variance_weight = 0.25
-            self.range_weight = 0.2
-            self.bias_weight = 0.15
+            # Phase 3 – FINE-TUNING: balance all terms
+            self.mse_weight      = 0.40
+            self.variance_weight = 0.22
+            self.range_weight    = 0.20
+            self.bias_weight     = 0.10
+            self.gradient_weight = 0.08
             phase = "FINE-TUNING"
-        
+
         if epoch % 20 == 0:
-            logger.info(f"Loss phase: {phase} (epoch {epoch}/{total_epochs})")
-    
+            logger.info(f"Loss phase: {phase}  (epoch {epoch}/{total_epochs})  "
+                        f"weights: mse={self.mse_weight}, var={self.variance_weight}, "
+                        f"range={self.range_weight}, bias={self.bias_weight}, "
+                        f"grad={self.gradient_weight}")
+
     def forward(self, pred, target, features=None):
-        """Calculate loss with variance and range preservation"""
+        """
+        Args:
+            pred:     (N, 1, H, W) normalised predictions
+            target:   (N, 1, H, W) normalised targets
+            features: unused, kept for API compatibility
+        Returns:
+            total_loss (scalar), components (dict)
+        """
         components = {}
-        
-        # 1. MSE - Accuracy
-        mse = F.mse_loss(pred, target)
+
+        # ── 1. Temperature-weighted MSE (FIX 5) ──────────────────────────────
+        # Weight each pixel by |target - patch_mean| + 1, so extreme-temp pixels
+        # (hot rooftops, cool water) receive more gradient signal than the
+        # densely-sampled mid-range pixels.  Weights are normalised so the
+        # effective learning rate is unchanged on average.
+        with torch.no_grad():
+            patch_mean = target.mean(dim=[2, 3], keepdim=True)   # (N,1,1,1)
+            weights    = (target - patch_mean).abs() + 1.0       # ≥ 1 everywhere
+            weights    = weights / weights.mean()                 # mean = 1 → same LR scale
+
+        mse = (weights * (pred - target) ** 2).mean()
         components['mse'] = mse.item()
-        
-        # 2. Variance Preservation (NORMALIZED: relative ratio, not raw squared diff)
-        # Penalizes when pred_std / target_std deviates from 1.0
-        # This is scale-invariant, so the weight is stable across datasets
-        pred_std = pred.std() + 1e-8
+
+        # ── 2. Variance preservation ──────────────────────────────────────────
+        pred_std   = pred.std()   + 1e-8
         target_std = target.std() + 1e-8
-        std_ratio = pred_std / target_std
-        # Use log ratio: 0 when ratio=1, symmetric, scale-invariant
-        variance_loss = torch.log(std_ratio) ** 2
-        components['variance'] = variance_loss.item()
+        std_ratio  = pred_std / target_std
+        variance_loss = torch.log(std_ratio) ** 2   # 0 when ratio = 1, symmetric
+        components['variance']  = variance_loss.item()
         components['std_ratio'] = std_ratio.item()
-        
-        # 3. Slope Penalty - directly punishes range compression (pred = slope * target + intercept)
-        # Calculated via covariance: slope = cov(pred, target) / var(target)
-        pred_flat = pred.flatten()
-        target_flat = target.flatten()
-        pred_centered = pred_flat - pred_flat.mean()
-        target_centered = target_flat - target_flat.mean()
-        cov = (pred_centered * target_centered).mean()
-        target_var = (target_centered ** 2).mean() + 1e-8
-        slope = cov / target_var
-        # Penalize slope deviating from 1.0
-        slope_loss = (slope - 1.0) ** 2
+
+        # ── 3. Slope penalty (range compression) ─────────────────────────────
+        pred_flat     = pred.flatten()
+        target_flat   = target.flatten()
+        pred_c        = pred_flat   - pred_flat.mean()
+        target_c      = target_flat - target_flat.mean()
+        cov           = (pred_c * target_c).mean()
+        target_var    = (target_c ** 2).mean() + 1e-8
+        slope         = cov / target_var
+        slope_loss    = (slope - 1.0) ** 2
         components['slope'] = slope.item()
         components['range'] = slope_loss.item()
-        
-        # 4. Bias Penalty (NORMALIZED: relative to target std for scale stability)
-        bias = (pred_flat.mean() - target_flat.mean()) / target_std
+
+        # ── 4. Bias penalty ───────────────────────────────────────────────────
+        bias      = (pred_flat.mean() - target_flat.mean()) / target_std
         bias_loss = bias ** 2
         components['bias'] = bias_loss.item()
-        
-        # Track distribution metrics
-        components['pred_std'] = pred_std.item()
+
+        # ── 5. Gradient alignment (FIX 4 — replaces spatial smoothness) ──────
+        # Penalise disagreement between predicted and target spatial gradients.
+        # This preserves sharp edges instead of blurring them.
+        pred_dx  = pred[:, :, :, 1:]  - pred[:, :, :, :-1]
+        pred_dy  = pred[:, :, 1:, :]  - pred[:, :, :-1, :]
+        tgt_dx   = target[:, :, :, 1:] - target[:, :, :, :-1]
+        tgt_dy   = target[:, :, 1:, :] - target[:, :, :-1, :]
+        grad_loss = F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
+        components['gradient'] = grad_loss.item()
+
+        # ── Distribution tracking ─────────────────────────────────────────────
+        components['pred_std']   = pred_std.item()
         components['target_std'] = target_std.item()
-        
-        # Total loss
+
+        # ── Total ─────────────────────────────────────────────────────────────
         total = (
-            self.mse_weight * mse +
+            self.mse_weight      * mse          +
             self.variance_weight * variance_loss +
-            self.range_weight * slope_loss +
-            self.bias_weight * bias_loss
+            self.range_weight    * slope_loss    +
+            self.bias_weight     * bias_loss     +
+            self.gradient_weight * grad_loss
         )
-        
+
         return total, components
 
 class LSTLoss(nn.Module):

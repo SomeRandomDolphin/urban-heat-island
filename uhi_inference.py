@@ -272,48 +272,140 @@ class EnsemblePredictor:
     
     def _predict_gbm_normalized(self, X: np.ndarray) -> np.ndarray:
         """
-        GBM predictions in NORMALIZED space
-        
-        Args:
-            X: NORMALIZED features (N, H, W, C)
-            
-        Returns:
-            Predictions in NORMALIZED space (DO NOT denormalize here)
+        GBM predictions in NORMALIZED space.
+
+        Updated to match the enriched feature schema from train_ensemble.py FIX 6+8:
+          Original 7 stats:  mean, std, min, max, median, p25, p75
+          FIX 8 texture:     range, skew, kurt, grad_mean, grad_max  (5 new per channel)
+          FIX 6 bottleneck:  CNN encoder mean/std/max per bottleneck channel
+          Plus:              height, width
+
+        The GBM model's feature_name() list is used as the ground-truth column order,
+        so inference is always aligned to whatever was present at training time.
         """
-        logger.info("Running GBM predictions...")
-        
-        features_list = []
+        logger.info("Running GBM predictions (enriched feature schema)...")
+
         n_samples, height, width, n_channels = X.shape
-        
+        features_list = []
+
         for i in tqdm(range(n_samples), desc="Extracting GBM features"):
             patch_features = {}
-            
+
             for ch in range(n_channels):
                 channel_data = X[i, :, :, ch]
-                
-                patch_features[f'ch{ch}_mean'] = channel_data.mean()
-                patch_features[f'ch{ch}_std'] = channel_data.std()
-                patch_features[f'ch{ch}_min'] = channel_data.min()
-                patch_features[f'ch{ch}_max'] = channel_data.max()
-                patch_features[f'ch{ch}_median'] = np.median(channel_data)
-                patch_features[f'ch{ch}_p25'] = np.percentile(channel_data, 25)
-                patch_features[f'ch{ch}_p75'] = np.percentile(channel_data, 75)
-            
+                flat = channel_data.flatten()
+
+                # ── Original 7 stats ───────────────────────────────────────────
+                patch_features[f'ch{ch}_mean']   = flat.mean()
+                patch_features[f'ch{ch}_std']    = flat.std()
+                patch_features[f'ch{ch}_min']    = flat.min()
+                patch_features[f'ch{ch}_max']    = flat.max()
+                patch_features[f'ch{ch}_median'] = np.median(flat)
+                patch_features[f'ch{ch}_p25']    = np.percentile(flat, 25)
+                patch_features[f'ch{ch}_p75']    = np.percentile(flat, 75)
+
+                # ── FIX 8: Texture features ────────────────────────────────────
+                patch_features[f'ch{ch}_range'] = flat.max() - flat.min()
+
+                centered = flat - flat.mean()
+                std_c    = flat.std() + 1e-8
+                patch_features[f'ch{ch}_skew'] = float((centered ** 3).mean() / std_c ** 3)
+                patch_features[f'ch{ch}_kurt'] = float((centered ** 4).mean() / std_c ** 4 - 3)
+
+                # Gradient magnitude (edge strength)
+                dx = np.diff(channel_data, axis=1)
+                dy = np.diff(channel_data, axis=0)
+                h_min = min(dx.shape[0], dy.shape[0])
+                w_min = min(dx.shape[1], dy.shape[1])
+                grad_mag = np.sqrt(dx[:h_min, :w_min] ** 2 + dy[:h_min, :w_min] ** 2)
+                patch_features[f'ch{ch}_grad_mean'] = grad_mag.mean()
+                patch_features[f'ch{ch}_grad_max']  = grad_mag.max()
+
             patch_features['height'] = height
-            patch_features['width'] = width
-            
+            patch_features['width']  = width
             features_list.append(patch_features)
-        
+
         features_df = pd.DataFrame(features_list)
-        
+
+        # ── FIX 6: Append CNN bottleneck features ──────────────────────────────
+        try:
+            bot_feats = self._extract_cnn_bottleneck_features(X)
+            bot_cols  = [f"cnn_bot_{i}" for i in range(bot_feats.shape[1])]
+            bot_df    = pd.DataFrame(bot_feats, columns=bot_cols)
+            features_df = pd.concat([features_df, bot_df], axis=1)
+            logger.info(f"  + {bot_feats.shape[1]} CNN bottleneck features "
+                        f"→ {features_df.shape[1]} total")
+        except Exception as _e:
+            logger.warning(f"  ⚠️ CNN bottleneck extraction skipped ({_e}) — "
+                           "proceeding without bottleneck features")
+
+        # ── Align columns to what the GBM was trained on ───────────────────────
+        train_cols = self.gbm_model.feature_name()
+        infer_n    = features_df.shape[1]
+        train_n    = len(train_cols)
+
+        if infer_n != train_n or list(features_df.columns) != train_cols:
+            logger.warning(f"  ⚠️ Feature mismatch: inference={infer_n}, "
+                           f"training={train_n}. Aligning to training column list...")
+            # Add any missing columns as zeros
+            missing = [c for c in train_cols if c not in features_df.columns]
+            if missing:
+                logger.warning(f"    Adding {len(missing)} missing columns as 0 "
+                               f"(e.g. {missing[:3]})")
+                for col in missing:
+                    features_df[col] = 0.0
+            # Drop extra columns and reorder
+            extra = [c for c in features_df.columns if c not in train_cols]
+            if extra:
+                logger.warning(f"    Dropping {len(extra)} extra columns "
+                               f"(e.g. {extra[:3]})")
+            features_df = features_df[train_cols]
+            logger.info(f"  ✅ Aligned to {len(train_cols)} training features")
+
         # GBM prediction (KEEP NORMALIZED)
-        predictions = self.gbm_model.predict(features_df, 
-                                            num_iteration=self.gbm_model.best_iteration)
-        
+        predictions = self.gbm_model.predict(
+            features_df,
+            num_iteration=self.gbm_model.best_iteration
+        )
+
         logger.info(f"  GBM raw predictions (normalized): "
-                   f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
-        
-        return predictions  # Return NORMALIZED predictions
+                    f"mean={predictions.mean():.4f}, std={predictions.std():.4f}")
+
+        return predictions
+
+    def _extract_cnn_bottleneck_features(self, X: np.ndarray,
+                                          batch_size: int = 32) -> np.ndarray:
+        """
+        Extract CNN encoder bottleneck statistics to enrich GBM features (FIX 6).
+        Mirrors extract_cnn_bottleneck_features() from train_ensemble.py exactly.
+
+        Returns (N, 3 * bottleneck_channels) — mean/std/max per channel.
+        """
+        import torch
+        base = self.cnn_model.base_model   # unwrap MCDropoutUNet
+        base.eval()
+        all_stats = []
+
+        for start in range(0, len(X), batch_size):
+            batch_np = X[start: start + batch_size]
+            batch_t  = torch.FloatTensor(batch_np).permute(0, 3, 1, 2).to(self.device)
+
+            with torch.no_grad():
+                x, _ = base.enc1(batch_t)
+                x, _ = base.enc2(x)
+                x, _ = base.enc3(x)
+                x, _ = base.enc4(x)
+                bot  = base.bottleneck(x)          # (B, C_bot, H', W')
+
+            stats = torch.cat([
+                bot.mean(dim=[2, 3]),
+                bot.std(dim=[2, 3]),
+                bot.amax(dim=[2, 3]),
+            ], dim=1).cpu().numpy()
+
+            all_stats.append(stats)
+
+        return np.vstack(all_stats)
     
     def predict_ensemble(self, X: np.ndarray, batch_size: int = 8, 
                         return_uncertainty: bool = False,
