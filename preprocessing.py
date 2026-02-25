@@ -4,6 +4,7 @@ Purpose: Process BOTH Landsat and Sentinel-2 data and fuse them
 Does NOT download data - only transforms existing raw data files
 """
 import sys
+import gc
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -15,6 +16,9 @@ from scipy.ndimage import uniform_filter, generic_filter, zoom
 import pyproj
 from datetime import datetime, timedelta
 from sklearn.model_selection import train_test_split, StratifiedKFold
+
+import rasterio
+from rasterio.enums import Resampling as RasterioResampling
 
 from config import *
 
@@ -32,6 +36,248 @@ import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+
+
+# ---------------------------------------------------------------------------
+# GeoTIFF / NPZ unified band loader
+# ---------------------------------------------------------------------------
+
+_LANDSAT_BAND_ORDER = [
+    "SR_B1", "SR_B2", "SR_B3", "SR_B4",
+    "SR_B5", "SR_B6", "SR_B7", "ST_B10", "QA_PIXEL",
+]
+_SENTINEL2_BAND_ORDER = ["B2", "B3", "B4", "B8", "B11", "B12", "SCL"]
+
+# ---------------------------------------------------------------------------
+# Memory-budget configuration
+# ---------------------------------------------------------------------------
+# Maximum number of pixels (rows × cols) allowed per band before adaptive
+# downsampling kicks in.  At float32 each pixel costs 4 bytes, so:
+#   12_000_000 px  →  ~46 MiB per band  →  ~410 MiB for 9 Landsat bands
+# Raise this if your machine has more headroom; lower it if you still OOM.
+# The value can also be overridden via an environment variable:
+#   export UHI_MAX_PIXELS=8000000
+import os as _os
+_DEFAULT_MAX_PIXELS = 8_000_000
+MAX_PIXELS: int = int(_os.environ.get("UHI_MAX_PIXELS", _DEFAULT_MAX_PIXELS))
+
+
+def _compute_downsample_factor(rows: int, cols: int,
+                                n_bands: int,
+                                max_pixels: int = MAX_PIXELS) -> float:
+    """
+    Return the linear scale factor (≤ 1.0) needed so that rows*cols ≤ max_pixels.
+
+    We also peek at available system RAM (via psutil if installed, otherwise we
+    use a conservative 1 GiB budget) and tighten the factor if even the
+    downsampled load would exceed half the free memory.
+
+    Args:
+        rows, cols : native raster dimensions
+        n_bands    : number of bands that will be loaded (affects RAM estimate)
+        max_pixels : pixel budget (default MAX_PIXELS)
+
+    Returns:
+        factor ∈ (0, 1] — 1.0 means no downsampling needed
+    """
+    native_px = rows * cols
+
+    # Factor driven by pixel budget
+    if native_px <= max_pixels:
+        pixel_factor = 1.0
+    else:
+        pixel_factor = (max_pixels / native_px) ** 0.5  # sqrt because both dims scale
+
+    # Factor driven by available RAM (optional, requires psutil)
+    ram_factor = 1.0
+    try:
+        import psutil
+        free_bytes = psutil.virtual_memory().available
+        # Budget: use at most 40 % of free RAM for the bands (conservative)
+        budget_bytes = free_bytes * 0.40
+        bytes_per_band_native = native_px * 4  # float32
+        bytes_total_native = bytes_per_band_native * n_bands
+        if bytes_total_native > budget_bytes:
+            ram_factor = (budget_bytes / bytes_total_native) ** 0.5
+    except ImportError:
+        pass  # psutil not installed — fall back to pixel budget only
+
+    factor = min(pixel_factor, ram_factor)
+    return max(factor, 0.05)   # never go below 5 % of native resolution
+
+
+def load_tif_as_bands(tif_path: Path,
+                       max_pixels: int = MAX_PIXELS) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Load a GeoTIFF exported by earth_engine_loader.py and return a dict of
+    {band_name: 2-D float32 array}, mirroring the format of np.load(npz).
+
+    Band identification priority:
+      1. Rasterio band description stored in the file (set by GEE export).
+      2. Positional fallback using the known export order (inferred from
+         the number of bands in the file).
+      3. Generic ``band_N`` keys as a last resort.
+
+    The earth_engine_loader applies Landsat C2 L2 scale factors before
+    exporting, so TIF values are already physically meaningful:
+      - SR bands  : surface reflectance [0.0 – 1.0]
+      - ST_B10    : brightness temperature in Kelvin (~280–330 K)
+      - S2 bands  : surface reflectance × 10 000
+    QA_PIXEL is kept as integer-valued float for bitmask operations.
+
+    Adaptive downsampling
+    ─────────────────────
+    If the native raster exceeds *max_pixels* (or would exceed 40 % of free
+    RAM when psutil is installed), the bands are read at a reduced resolution
+    using rasterio's decimated-read feature with bilinear resampling (nearest-
+    neighbour for the QA/SCL mask bands).  The downsample factor and resulting
+    shape are logged so you can audit exactly what happened.
+    """
+    try:
+        with rasterio.open(tif_path) as src:
+            n_bands      = src.count
+            native_rows  = src.height
+            native_cols  = src.width
+            descriptions = [src.descriptions[i] for i in range(n_bands)]
+            has_desc     = any(d is not None and str(d).strip() for d in descriptions)
+
+            if not has_desc:
+                if n_bands == len(_LANDSAT_BAND_ORDER):
+                    descriptions = _LANDSAT_BAND_ORDER
+                elif n_bands == len(_SENTINEL2_BAND_ORDER):
+                    descriptions = _SENTINEL2_BAND_ORDER
+                else:
+                    descriptions = [f"band_{i+1}" for i in range(n_bands)]
+
+            # ── Adaptive downsampling ──────────────────────────────────────
+            factor = _compute_downsample_factor(
+                native_rows, native_cols, n_bands, max_pixels
+            )
+            if factor < 1.0:
+                out_rows = max(1, int(round(native_rows * factor)))
+                out_cols = max(1, int(round(native_cols * factor)))
+                logger.warning(
+                    f"  [Downsample] {tif_path.name}: "
+                    f"native {native_rows}×{native_cols} "
+                    f"→ {out_rows}×{out_cols}  "
+                    f"(factor={factor:.3f}, max_pixels={max_pixels:,}). "
+                    f"Set UHI_MAX_PIXELS env-var to change this threshold."
+                )
+            else:
+                out_rows, out_cols = native_rows, native_cols
+
+            # Bands whose values are bitmasks / class labels — use NN resampling
+            _MASK_BAND_NAMES = {"QA_PIXEL", "SCL", "QA60"}
+
+            nodata = src.nodata
+            bands: Dict[str, np.ndarray] = {}
+            for i, name in enumerate(descriptions, start=1):
+                is_mask = (name in _MASK_BAND_NAMES)
+                resample_method = (
+                    RasterioResampling.nearest if is_mask
+                    else RasterioResampling.bilinear
+                )
+                arr = src.read(
+                    i,
+                    out_shape=(out_rows, out_cols),
+                    resampling=resample_method,
+                ).astype(np.float32)
+                if nodata is not None:
+                    arr[arr == nodata] = np.nan
+                bands[name] = arr
+
+        actual_rows, actual_cols = next(iter(bands.values())).shape
+        logger.info(
+            f"  Loaded {n_bands} bands from {tif_path.name} "
+            f"[{actual_rows}×{actual_cols}]: {list(bands.keys())}"
+        )
+        return bands
+    except Exception as exc:
+        logger.error(f"  Failed to load {tif_path}: {exc}")
+        return None
+
+
+def _downsample_npz_bands(data: Dict[str, np.ndarray],
+                           max_pixels: int = MAX_PIXELS) -> Dict[str, np.ndarray]:
+    """
+    Apply adaptive downsampling to a dict of arrays loaded from a legacy .npz.
+
+    Uses scipy.ndimage.zoom with order=1 (bilinear) for continuous bands and
+    order=0 (nearest-neighbour) for QA/mask bands.
+
+    Args:
+        data       : {band_name: 2-D ndarray} loaded from np.load(npz)
+        max_pixels : pixel budget
+
+    Returns:
+        Same dict with arrays resampled in-place (or original if no downsample).
+    """
+    _MASK_BAND_NAMES = {"QA_PIXEL", "SCL", "QA60"}
+
+    # Determine shape from the first 2-D array
+    ref_shape = None
+    for arr in data.values():
+        if isinstance(arr, np.ndarray) and arr.ndim == 2:
+            ref_shape = arr.shape
+            break
+    if ref_shape is None:
+        return data
+
+    native_rows, native_cols = ref_shape
+    n_bands = sum(1 for v in data.values() if isinstance(v, np.ndarray) and v.ndim == 2)
+    factor = _compute_downsample_factor(native_rows, native_cols, n_bands, max_pixels)
+
+    if factor >= 1.0:
+        return data  # nothing to do
+
+    logger.warning(
+        f"  [Downsample/npz] native {native_rows}×{native_cols} "
+        f"→ factor={factor:.3f}. Downsampling all 2-D bands."
+    )
+
+    out: Dict[str, np.ndarray] = {}
+    for name, arr in data.items():
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+            out[name] = arr   # pass through scalars / 1-D metadata as-is
+            continue
+        # Use the same factor even if this particular band has a different shape
+        # (e.g. a higher-res ancillary band) — keep relative shapes consistent.
+        band_factor_r = factor * (native_rows / arr.shape[0])
+        band_factor_c = factor * (native_cols / arr.shape[1])
+        zoom_order = 0 if name in _MASK_BAND_NAMES else 1
+        out[name] = zoom(
+            arr.astype(np.float32),
+            (band_factor_r, band_factor_c),
+            order=zoom_order,
+            prefilter=False,
+        ).astype(np.float32)
+    return out
+
+
+def load_raw_file(raw_file: Path,
+                   max_pixels: int = MAX_PIXELS) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Unified loader: GeoTIFF (.tif/.tiff) or legacy NumPy archive (.npz).
+    Returns {band_name: float32 np.ndarray} or None on failure.
+
+    Adaptive downsampling is applied automatically when the raster exceeds
+    *max_pixels* per band — see load_tif_as_bands / _downsample_npz_bands.
+    """
+    suffix = raw_file.suffix.lower()
+    if suffix in (".tif", ".tiff"):
+        return load_tif_as_bands(raw_file, max_pixels=max_pixels)
+    elif suffix == ".npz":
+        try:
+            data = dict(np.load(raw_file))
+            data = _downsample_npz_bands(data, max_pixels=max_pixels)
+            logger.info(f"  Loaded {len(data)} arrays from {raw_file.name} (npz)")
+            return data
+        except Exception as exc:
+            logger.error(f"  Failed to load {raw_file}: {exc}")
+            return None
+    else:
+        logger.error(f"  Unsupported file format: {raw_file.suffix}")
+        return None
 
 
 class PreprocessingDiagnostics:
@@ -723,8 +969,8 @@ class PreprocessingDiagnostics:
         """Linearly stretch arr to [0, 1] given lo/hi, clip to [0, 1]."""
         spread = hi - lo
         if spread < 1e-10:
-            return np.zeros_like(arr, dtype=float)
-        return np.clip((arr.astype(float) - lo) / spread, 0.0, 1.0)
+            return np.zeros_like(arr, dtype=np.float32)
+        return np.clip((arr.astype(np.float32) - np.float32(lo)) / np.float32(spread), 0.0, 1.0)
 
     def plot_s2_raw_bands(self, raw_data: dict,
                           filename: str = "s2_01_raw_bands.png"):
@@ -987,10 +1233,10 @@ class PreprocessingDiagnostics:
         ax2 = axes[1]
         b2 = bands.get("B2"); b4 = bands.get("B4"); b8 = bands.get("B8")
         if b2 is not None and b4 is not None and b8 is not None:
-            blue = b2.astype(float)
-            red  = b4.astype(float)
-            nir  = b8.astype(float)
-            eps  = 1e-8
+            blue = b2.astype(np.float32)
+            red  = b4.astype(np.float32)
+            nir  = b8.astype(np.float32)
+            eps  = np.float32(1e-8)
             ndvi = (nir - red) / (nir + red + eps)
 
             blue_norm = np.clip(blue / (np.nanmax(blue) + eps), 0, 1)
@@ -1038,20 +1284,20 @@ class PreprocessingDiagnostics:
         b8 = bands.get("B8"); b11 = bands.get("B11"); b12 = bands.get("B12")
 
         if b8 is not None and b4 is not None:
-            ratios["NIR/Red"]   = b8.astype(float) / (b4.astype(float) + eps)
+            ratios["NIR/Red"]   = b8.astype(np.float32) / (b4.astype(np.float32) + eps)
             labels["NIR/Red"]   = "Vegetation Vigour"
         if b11 is not None and b8 is not None:
-            ratios["SWIR1/NIR"] = b11.astype(float) / (b8.astype(float) + eps)
+            ratios["SWIR1/NIR"] = b11.astype(np.float32) / (b8.astype(np.float32) + eps)
             labels["SWIR1/NIR"] = "Urban Heat / Soil Moisture Proxy"
         if b4 is not None and b2 is not None:
-            ratios["Red/Blue"]  = b4.astype(float) / (b2.astype(float) + eps)
+            ratios["Red/Blue"]  = b4.astype(np.float32) / (b2.astype(np.float32) + eps)
             labels["Red/Blue"]  = "Aerosol / Dust Proxy"
         if b8 is not None and b11 is not None:
-            ratios["NIR/SWIR1"] = b8.astype(float) / (b11.astype(float) + eps)
+            ratios["NIR/SWIR1"] = b8.astype(np.float32) / (b11.astype(np.float32) + eps)
             labels["NIR/SWIR1"] = "Soil Moisture Index"
         if b2 is not None and b3 is not None and b4 is not None and b8 is not None:
-            num = b2.astype(float) + b3.astype(float)
-            den = b4.astype(float) + b8.astype(float)
+            num = b2.astype(np.float32) + b3.astype(np.float32)
+            den = b4.astype(np.float32) + b8.astype(np.float32)
             ratios["(B+G)/(R+NIR)"] = num / (den + eps)
             labels["(B+G)/(R+NIR)"] = "Simple Urban Index"
 
@@ -1070,7 +1316,7 @@ class PreprocessingDiagnostics:
 
         cmaps = ["YlGn", "hot_r", "RdBu", "Blues", "RdYlBu"]
         for ax, (key, arr), cmap in zip(axes, ratios.items(), cmaps):
-            arr = arr.astype(float)
+            arr = arr.astype(np.float32)
             vmin, vmax = self._safe_stretch(arr)
             im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="bilinear")
             ax.set_title(f"{key}\n{labels[key]}", fontsize=8, fontweight="bold")
@@ -1340,8 +1586,8 @@ class PreprocessingDiagnostics:
             logger.warning(f"[Diagnostics] plot_resolution_comparison: {index} not in both sensors.")
             return
 
-        s2_arr = s2_data[index].astype(float)
-        ls_arr = ls_data[index].astype(float)
+        s2_arr = s2_data[index].astype(np.float32)
+        ls_arr = ls_data[index].astype(np.float32)
 
         fig = plt.figure(figsize=(16, 10))
         gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
@@ -1436,16 +1682,35 @@ class PreprocessingDiagnostics:
             axes = axes[np.newaxis, :]
 
         for row, key in enumerate(available):
-            # Stack all scenes (use minimum common shape)
+            # Use Welford's online algorithm to compute mean and variance
+            # incrementally — one scene at a time — so we never allocate a
+            # stack of all scenes simultaneously (avoids the ~132 MiB spike).
             shapes = [d[key].shape for d in scene_dicts]
             h = min(s[0] for s in shapes)
             w = min(s[1] for s in shapes)
-            stack = np.stack([d[key][:h, :w].astype(float) for d in scene_dicts])
+
+            count    = np.zeros((h, w), dtype=np.float32)
+            mean     = np.zeros((h, w), dtype=np.float32)
+            M2       = np.zeros((h, w), dtype=np.float32)
+
+            for d in scene_dicts:
+                scene = d[key][:h, :w].astype(np.float32)
+                valid = np.isfinite(scene)
+                count[valid] += 1
+                delta         = np.where(valid, scene - mean, 0.0)
+                mean         += np.where(valid, delta / np.maximum(count, 1), 0.0)
+                delta2        = np.where(valid, scene - mean, 0.0)
+                M2           += np.where(valid, delta * delta2, 0.0)
+                del scene, valid, delta, delta2
 
             with np.errstate(invalid="ignore", divide="ignore"):
-                pixel_mean = np.nanmean(stack, axis=0)
-                pixel_std  = np.nanstd(stack,  axis=0)
+                pixel_mean = np.where(count > 0, mean, np.nan)
+                pixel_std  = np.where(count > 1,
+                                      np.sqrt(M2 / np.maximum(count - 1, 1)),
+                                      np.nan)
                 pixel_cv   = pixel_std / (np.abs(pixel_mean) + 1e-8)
+
+            del count, mean, M2
 
             # Mean map
             ax0 = axes[row, 0]
@@ -1496,9 +1761,9 @@ class PreprocessingDiagnostics:
         time_weight_s2 = 1.0 / (1.0 + time_diff / 16.0)
         time_weight_ls = 1.0 - time_weight_s2
 
-        ls_arr = landsat_data[index].astype(float)
-        s2_arr = sentinel2_data[index].astype(float)
-        fu_arr = fused_data[index].astype(float)
+        ls_arr = landsat_data[index].astype(np.float32)
+        s2_arr = sentinel2_data[index].astype(np.float32)
+        fu_arr = fused_data[index].astype(np.float32)
 
         # Crop to minimum common shape
         h = min(ls_arr.shape[0], s2_arr.shape[0], fu_arr.shape[0])
@@ -1569,7 +1834,7 @@ class PreprocessingDiagnostics:
             logger.warning("[Diagnostics] plot_impervious_surface_analysis: ISF not found.")
             return
 
-        isf = fused_data["impervious_surface"].astype(float)
+        isf = fused_data["impervious_surface"].astype(np.float32)
 
         fig = plt.figure(figsize=(16, 10))
         gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
@@ -1732,30 +1997,40 @@ class SatellitePreprocessor:
             logger.warning("LST calculation only available for Landsat")
             return None
         
-        # Convert DN to Kelvin using Landsat Collection 2 Level-2 scaling
-        bt_kelvin = thermal_band * 0.00341802 + 149.0
+        # Detect whether ST_B10 is already in Kelvin (GeoTIFF, scale applied
+        # at export) or raw Collection-2 DN integers (legacy .npz).
+        # Jakarta surface temps: ~295–330 K. Raw DN values are ~7 000–15 000.
+        sample     = thermal_band[np.isfinite(thermal_band)]
+        median_val = float(np.nanmedian(sample)) if sample.size > 0 else 0.0
+
+        if 200.0 < median_val < 400.0:
+            # Already in Kelvin — GeoTIFF path
+            bt_kelvin = thermal_band.astype(np.float32)
+        else:
+            # Raw DN — apply C2 L2 scale factor (float32)
+            bt_kelvin = thermal_band.astype(np.float32) * np.float32(0.00341802) + np.float32(149.0)
+
         bt_celsius = bt_kelvin - 273.15
         
-        # Calculate land surface emissivity from NDVI
+        # Calculate land surface emissivity from NDVI (stay in float32)
+        ndvi_f32 = ndvi.astype(np.float32) if ndvi.dtype != np.float32 else ndvi
         epsilon = np.where(
-            ndvi < 0.2,
-            0.973,  # Bare soil
+            ndvi_f32 < np.float32(0.2),
+            np.float32(0.973),   # Bare soil
             np.where(
-                ndvi > 0.5,
-                0.986,  # Full vegetation
-                0.973 + 0.047 * ((ndvi - 0.2) / 0.3)  # Mixed pixels
+                ndvi_f32 > np.float32(0.5),
+                np.float32(0.986),  # Full vegetation
+                np.float32(0.973) + np.float32(0.047) * ((ndvi_f32 - np.float32(0.2)) / np.float32(0.3))
             )
-        )
-        
-        # Apply emissivity correction using Planck's law
-        wavelength = 10.9e-6  # Band 10 wavelength (meters)
-        h = 6.626e-34  # Planck's constant (J·s)
-        c = 2.998e8    # Speed of light (m/s)
-        sigma = 1.38e-23  # Boltzmann constant (J/K)
-        rho = (h * c) / sigma  # ≈ 1.438e-2 m·K
-        
-        # LST with emissivity correction
-        lst_celsius = bt_celsius / (1 + (wavelength * bt_kelvin / rho) * np.log(epsilon))
+        ).astype(np.float32)
+        del ndvi_f32
+
+        # Apply emissivity correction using Planck's law (float32 constants)
+        wavelength = np.float32(10.9e-6)  # Band 10 wavelength (meters)
+        rho = np.float32(1.438e-2)        # h*c/k_B  m·K (precomputed)
+
+        # LST with emissivity correction (all float32)
+        lst_celsius = bt_celsius / (np.float32(1.0) + (wavelength * bt_kelvin / rho) * np.log(epsilon).astype(np.float32))
         
         return lst_celsius
     
@@ -1831,60 +2106,125 @@ class SatellitePreprocessor:
     
     def calculate_spectral_indices(self, bands: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
-        Calculate spectral indices from raw bands
-        
+        Calculate spectral indices from raw bands.
+
+        Memory-efficient implementation:
+          - All intermediate arrays stay in float32 (half the size of float64).
+          - Band copies are freed as soon as they are no longer needed.
+          - Indices are computed one at a time to minimise peak live allocations.
+
         Args:
-            bands: Dictionary of band arrays
-            
+            bands: Dictionary of band arrays (float32 preferred)
+
         Returns:
-            Dictionary of calculated indices
+            Dictionary of calculated indices (all float32)
         """
         indices = {}
-        eps = 1e-8
-        
-        # Extract bands based on satellite type
-        if self.satellite_type == "landsat":
-            blue = bands.get("SR_B2", np.zeros_like(bands["SR_B4"])).astype(float)
-            green = bands.get("SR_B3", np.zeros_like(bands["SR_B4"])).astype(float)
-            red = bands["SR_B4"].astype(float)
-            nir = bands["SR_B5"].astype(float)
-            swir1 = bands["SR_B6"].astype(float)
-            swir2 = bands["SR_B7"].astype(float)
-        else:  # Sentinel-2
-            blue = bands["B2"].astype(float)
-            green = bands["B3"].astype(float)
-            red = bands["B4"].astype(float)
-            nir = bands["B8"].astype(float)
-            swir1 = bands["B11"].astype(float)
-            swir2 = bands["B12"].astype(float)
-        
-        # Calculate indices
-        indices["NDVI"] = (nir - red) / (nir + red + eps)
-        indices["NDBI"] = (swir1 - nir) / (swir1 + nir + eps)
-        indices["MNDWI"] = (green - swir1) / (green + swir1 + eps)
-        indices["BSI"] = ((swir1 + red) - (nir + blue)) / ((swir1 + red) + (nir + blue) + eps)
-        indices["UI"] = (swir2 - nir) / (swir2 + nir + eps)
-        
-        # Albedo (simplified broadband surface albedo — Liang 2001)
-        # FIX: Landsat Collection 2 Level-2 SR bands are scaled integers.
-        #   Reflectance = DN * 0.0000275 − 0.2   (USGS Collection 2 scaling)
-        #   Sentinel-2 bands are already in surface reflectance (0–1).
-        # Without this conversion Landsat albedo ≈ 0.51 vs S2 ≈ 0.001,
-        # giving sensor-agreement r = 0.687 and a large bias in the fused
-        # albedo channel after multi-sensor fusion.
-        if self.satellite_type == "landsat":
-            blue_r  = np.clip(blue  * 0.0000275 - 0.2, 0.0, 1.0)
-            red_r   = np.clip(red   * 0.0000275 - 0.2, 0.0, 1.0)
-            nir_r   = np.clip(nir   * 0.0000275 - 0.2, 0.0, 1.0)
-            swir1_r = np.clip(swir1 * 0.0000275 - 0.2, 0.0, 1.0)
-            swir2_r = np.clip(swir2 * 0.0000275 - 0.2, 0.0, 1.0)
-        else:
-            # Sentinel-2 is already in reflectance (0–1)
-            blue_r, red_r, nir_r, swir1_r, swir2_r = blue, red, nir, swir1, swir2
+        eps = np.float32(1e-8)
 
-        albedo = (0.356 * blue_r + 0.130 * red_r + 0.373 * nir_r +
-                  0.085 * swir1_r + 0.072 * swir2_r - 0.0018)
-        indices["albedo"] = np.clip(albedo, 0, 1)
+        # ── Helper: ensure float32 copy without double-allocating ──────────
+        def _f32(arr: np.ndarray) -> np.ndarray:
+            """Return a float32 array; reuse memory if already float32."""
+            if arr.dtype == np.float32:
+                return arr.copy()
+            return arr.astype(np.float32)
+
+        # ── Band extraction ─────────────────────────────────────────────────
+        if self.satellite_type == "landsat":
+            blue  = _f32(bands.get("SR_B2", np.zeros_like(bands["SR_B4"])))
+            green = _f32(bands.get("SR_B3", np.zeros_like(bands["SR_B4"])))
+            red   = _f32(bands["SR_B4"])
+            nir   = _f32(bands["SR_B5"])
+            swir1 = _f32(bands["SR_B6"])
+            swir2 = _f32(bands["SR_B7"])
+
+            # Detect DN (legacy .npz) vs pre-scaled reflectance (GeoTIFF).
+            # Pre-scaled values are in [0, 1]; raw DN medians are ~5 000–30 000.
+            _s = red[np.isfinite(red)]
+            if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
+                # Legacy DN — convert to reflectance in-place
+                scale = np.float32(2.75e-5)
+                offset = np.float32(0.2)
+                for arr in (blue, green, red, nir, swir1, swir2):
+                    arr *= scale
+                    arr -= offset
+                np.clip(blue,  -0.5, 1.5, out=blue)
+                np.clip(green, -0.5, 1.5, out=green)
+                np.clip(red,   -0.5, 1.5, out=red)
+                np.clip(nir,   -0.5, 1.5, out=nir)
+                np.clip(swir1, -0.5, 1.5, out=swir1)
+                np.clip(swir2, -0.5, 1.5, out=swir2)
+            del _s
+            # GeoTIFF path: already in [0, 1] — no conversion needed
+
+        else:  # Sentinel-2
+            blue  = _f32(bands["B2"])
+            green = _f32(bands["B3"])
+            red   = _f32(bands["B4"])
+            nir   = _f32(bands["B8"])
+            swir1 = _f32(bands["B11"])
+            swir2 = _f32(bands["B12"])
+
+            # S2_SR_HARMONIZED: reflectance × 10 000 — divide in-place if needed
+            _s = red[np.isfinite(red)]
+            if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
+                scale = np.float32(1.0 / 10000.0)
+                for arr in (blue, green, red, nir, swir1, swir2):
+                    arr *= scale
+            del _s
+
+        # ── Index computation — one at a time, in-place where possible ─────
+        # NDVI = (nir - red) / (nir + red + eps)
+        _num = nir - red                          # float32 temp
+        _den = nir + red; _den += eps
+        np.divide(_num, _den, out=_num)
+        indices["NDVI"] = _num
+        del _den
+
+        # NDBI = (swir1 - nir) / (swir1 + nir + eps)
+        _num = swir1 - nir
+        _den = swir1 + nir; _den += eps
+        np.divide(_num, _den, out=_num)
+        indices["NDBI"] = _num
+        del _den
+
+        # MNDWI = (green - swir1) / (green + swir1 + eps)
+        _num = green - swir1
+        _den = green + swir1; _den += eps
+        np.divide(_num, _den, out=_num)
+        indices["MNDWI"] = _num
+        del _den
+
+        # BSI = ((swir1 + red) - (nir + blue)) / ((swir1 + red) + (nir + blue) + eps)
+        _a = swir1 + red          # swir1 + red
+        _b = nir   + blue         # nir   + blue
+        _num = _a - _b
+        _den = _a + _b; _den += eps
+        del _a, _b
+        np.divide(_num, _den, out=_num)
+        indices["BSI"] = _num
+        del _den
+
+        # UI = (swir2 - nir) / (swir2 + nir + eps)
+        _num = swir2 - nir
+        _den = swir2 + nir; _den += eps
+        np.divide(_num, _den, out=_num)
+        indices["UI"] = _num
+        del _den
+
+        # Albedo (Liang 2001) — computed in-place to avoid a large temp array
+        albedo = np.float32(0.356) * blue
+        albedo += np.float32(0.130) * red
+        albedo += np.float32(0.373) * nir
+        albedo += np.float32(0.085) * swir1
+        albedo += np.float32(0.072) * swir2
+        albedo -= np.float32(0.0018)
+        np.clip(albedo, 0, 1, out=albedo)
+        indices["albedo"] = albedo
+
+        # Free working band copies — the originals in `bands` are unaffected
+        del blue, green, red, nir, swir1, swir2, albedo
+        gc.collect()
         
         logger.info(f"  Calculated {len(indices)} spectral indices")
 
@@ -1915,8 +2255,10 @@ class SatellitePreprocessor:
         logger.info(f"Processing: {raw_file.name}")
         
         try:
-            # Load raw data
-            raw_data = dict(np.load(raw_file))
+            # Load raw data — supports both .tif (new) and .npz (legacy)
+            raw_data = load_raw_file(raw_file)
+            if raw_data is None:
+                return None
             logger.info(f"  Loaded {len(raw_data)} raw bands")
             
             # Extract band data
@@ -2303,86 +2645,49 @@ class DatasetCreator:
         patches = []
         filtered_by_temp = 0
         filtered_by_variance = 0
-        
+
+        lst = raster_data["LST"]   # reference view — no copy
+
         for i in range(0, height - patch_size + 1, stride):
             for j in range(0, width - patch_size + 1, stride):
-                patch = {
-                    "position": (i, j),
-                    "data": {}
-                }
-                
-                # Extract patch for each feature
-                valid_patch = True
-                for name, arr in raster_data.items():
-                    if isinstance(arr, np.ndarray) and arr.ndim == 2:
-                        if arr.shape != (height, width):
-                            logger.warning(f"  Skipping feature {name}: shape mismatch {arr.shape} vs ({height}, {width})")
-                            valid_patch = False
-                            break
-                        
-                        patch_data = arr[i:i+patch_size, j:j+patch_size]
-                        
-                        # Verify patch dimensions
-                        if patch_data.shape != (patch_size, patch_size):
-                            logger.warning(f"  Invalid patch shape for {name}: {patch_data.shape}")
-                            valid_patch = False
-                            break
-                        
-                        patch["data"][name] = patch_data
-                
-                if not valid_patch:
-                    continue
-                
-                # Quality control on LST
-                if "LST" not in patch["data"]:
-                    continue
-                
-                patch_lst = patch["data"]["LST"]
-                
-                # Verify patch shape one more time
+                patch_lst = lst[i:i+patch_size, j:j+patch_size]
+
                 if patch_lst.shape != (patch_size, patch_size):
-                    logger.warning(f"  LST patch has wrong shape: {patch_lst.shape}")
                     continue
-                
+
                 valid_pixels = np.isfinite(patch_lst).sum()
-                valid_ratio = valid_pixels / (patch_size * patch_size)
-                
-                if valid_ratio >= min_valid_ratio:
-                    # Check variance
-                    lst_std = np.nanstd(patch_lst)
-                    if lst_std < min_variance:
-                        filtered_by_variance += 1
-                        continue
-                    
-                    # Only check the patch MEAN, not individual pixels, so extreme
-                    # urban heat pixels (dark rooftops, asphalt) are preserved.
-                    valid_temps = patch_lst[np.isfinite(patch_lst)]
-                    if len(valid_temps) == 0:
-                        continue
+                valid_ratio  = valid_pixels / (patch_size * patch_size)
 
-                    lst_mean = np.nanmean(patch_lst)
-                    lst_std  = np.nanstd(patch_lst)
+                if valid_ratio < min_valid_ratio:
+                    continue
 
-                    # Tier 2 patch-mean gate (see docstring for ceiling rationale)
-                    if lst_mean < min_temp or lst_mean > max_temp:
-                        filtered_by_temp += 1
-                        continue
+                valid_temps = patch_lst[np.isfinite(patch_lst)]
+                if len(valid_temps) == 0:
+                    continue
 
-                    # Reject spatially uniform patches (cloud decks, water, bad data)
-                    if lst_std < 0.3:
-                        filtered_by_variance += 1
-                        continue
+                lst_mean = float(valid_temps.mean())
+                lst_std  = float(valid_temps.std())
 
-                    # Reject patches where >20% of pixels are outside the pixel-level
-                    # plausible range [10, 65°C] — matches validate_lst tier bounds.
-                    extreme_pixel_ratio = (
-                        np.sum((valid_temps < 10.0) | (valid_temps > 65.0)) / len(valid_temps)
-                    )
-                    if extreme_pixel_ratio > 0.20:
-                        filtered_by_temp += 1
-                        continue
-                    
-                    patches.append(patch)
+                if lst_std < min_variance or lst_std < 0.3:
+                    filtered_by_variance += 1
+                    continue
+
+                if lst_mean < min_temp or lst_mean > max_temp:
+                    filtered_by_temp += 1
+                    continue
+
+                extreme_ratio = np.sum((valid_temps < 10.0) | (valid_temps > 65.0)) / len(valid_temps)
+                if extreme_ratio > 0.20:
+                    filtered_by_temp += 1
+                    continue
+
+                # Store position + lightweight stats only — NOT data copies.
+                # create_training_samples re-slices from the raster on demand.
+                patches.append({
+                    "position":  (i, j),
+                    "_lst_mean": lst_mean,
+                    "_lst_std":  lst_std,
+                })
         
         logger.info(f"  Extracted {len(patches)} valid patches")
         logger.info(f"  Filtered by temperature: {filtered_by_temp} patches")
@@ -2390,8 +2695,8 @@ class DatasetCreator:
 
         # ── DIAGNOSTIC: patch LST statistics ──────────────────────────
         if patches:
-            patch_means = np.array([np.nanmean(p["data"]["LST"]) for p in patches])
-            patch_stds  = np.array([np.nanstd(p["data"]["LST"])  for p in patches])
+            patch_means = np.array([p["_lst_mean"] for p in patches])
+            patch_stds  = np.array([p["_lst_std"]  for p in patches])
             logger.info(
                 f"  Patch LST mean – μ={patch_means.mean():.2f}°C  "
                 f"σ={patch_means.std():.2f}°C  "
@@ -2413,160 +2718,158 @@ class DatasetCreator:
     
     def create_training_samples(self, patches: List[Dict],
                                 temporal_features: Dict,
-                                channel_order: List[str] = None) -> Tuple[np.ndarray, np.ndarray, Dict]:
+                                channel_order: List[str] = None,
+                                raster_data: Dict[str, np.ndarray] = None
+                                ) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """
-        Create training samples from patches
-        
+        Create training samples from patches.
+
+        Memory-efficient two-pass strategy:
+          Pass 1 — lightweight QC scan on _lst_mean/_lst_std (no array alloc).
+          Pass 2 — allocate exactly-sized X / y and fill by slicing raster_data.
+
+        Accepts either:
+          - Position-only patches ({"position": (r,c), "_lst_mean": …}) with
+            raster_data provided for slicing.
+          - Legacy data-carrying patches ({"position": …, "data": {…}}) when
+            raster_data is None.
+
         Args:
-            patches: List of patch dictionaries
-            temporal_features: Temporal feature dictionary
-            channel_order: Order of input channels
-            
+            patches:          List of patch dicts.
+            temporal_features: Temporal feature dict for metadata.
+            channel_order:    Ordered list of feature names to stack.
+            raster_data:      Raster dict to slice from (position-only mode).
+
         Returns:
-            Tuple of (X, y, metadata)
+            Tuple of (X, y, metadata).
         """
-        if len(patches) == 0:
+        if not patches:
             raise ValueError("No patches provided")
-        
+
         if channel_order is None:
-            # Default channel order (works for both Landsat and fused data)
             channel_order = [
-                "SR_B4", "SR_B5", "SR_B6", "SR_B7",  # Red, NIR, SWIR1, SWIR2
-                "NDVI", "NDBI", "MNDWI", "BSI", "UI",
-                "albedo"
+                "SR_B4", "SR_B5", "SR_B6", "SR_B7",
+                "NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo",
             ]
-        
-        n_samples = len(patches)
-        patch_size = patches[0]["data"]["LST"].shape[0]
+
+        position_only = "data" not in patches[0]
+        patch_size    = patches[0]["data"]["LST"].shape[0] if not position_only \
+                        else raster_data["LST"][
+                            patches[0]["position"][0]:patches[0]["position"][0]+64,
+                            patches[0]["position"][1]:patches[0]["position"][1]+64,
+                        ].shape[0]
+        # Derive patch_size robustly
+        if position_only and raster_data is not None:
+            r0, c0   = patches[0]["position"]
+            patch_size = min(64, raster_data["LST"].shape[0] - r0,
+                             raster_data["LST"].shape[1] - c0)
+        elif not position_only:
+            patch_size = patches[0]["data"]["LST"].shape[0]
+        else:
+            patch_size = 64  # fallback
+
         n_channels = len(channel_order)
-        
-        X = np.zeros((n_samples, patch_size, patch_size, n_channels), dtype=np.float32)
-        y = np.zeros((n_samples, patch_size, patch_size, 1), dtype=np.float32)
-        
-        valid_samples = []
 
+        # ── Pass 1: lightweight QC scan ───────────────────────────────────────
+        valid_indices = []
         for idx, patch in enumerate(patches):
-            # Stack channels
-            for channel_idx, feature in enumerate(channel_order):
-                if feature in patch["data"]:
-                    X[idx, :, :, channel_idx] = patch["data"][feature]
-                else:
-                    logger.warning(f"Feature {feature} not found in patch {idx}")
+            if position_only:
+                lst_mean = patch["_lst_mean"]
+                lst_std  = patch["_lst_std"]
+                if lst_std < 0.3 or lst_mean < 20.0 or lst_mean > 58.0:
+                    continue
+                valid_indices.append(idx)
+            else:
+                lst_patch = patch["data"]["LST"].astype(np.float32)
+                fin       = np.isfinite(lst_patch)
+                if fin.mean() < 0.95:
+                    continue
+                vt = lst_patch[fin]
+                if vt.size == 0 or not (20.0 <= float(vt.mean()) <= 58.0):
+                    continue
+                valid_indices.append(idx)
 
-            # Target (LST) — assign raw patch (may have residual NaN from edge pixels)
-            lst_patch = patch["data"]["LST"].astype(np.float32)
-            y[idx, :, :, 0] = lst_patch
+        n_samples = len(valid_indices)
+        if n_samples == 0:
+            raise ValueError("No valid patches after QC filtering")
 
-            # FIX: validate on the actual patch values, NOT the zero-initialised array.
-            # Previously y was checked while still containing zeros for NaN pixels,
-            # so every patch with any NaN was falsely flagged as < 20°C and discarded.
-            valid_fin = np.isfinite(lst_patch)
-            if valid_fin.mean() < 0.95:
-                logger.warning(f"Sample {idx} low valid ratio ({valid_fin.mean():.2f}), skipping")
-                continue
-            valid_temps_s = lst_patch[valid_fin]
-            lst_mean_s = float(valid_temps_s.mean()) if valid_temps_s.size > 0 else 0.0
-            if lst_mean_s < 20.0 or lst_mean_s > 58.0:
-                logger.warning(f"Sample {idx} implausible mean temp ({lst_mean_s:.1f}°C), removing")
-                continue
+        skipped = len(patches) - n_samples
+        if skipped:
+            logger.info(f"  QC removed {skipped}/{len(patches)} patches")
 
-            valid_samples.append(idx)
+        # ── Pass 2: allocate exact-sized arrays and fill directly ─────────────
+        X = np.zeros((n_samples, patch_size, patch_size, n_channels), dtype=np.float32)
+        y = np.zeros((n_samples, patch_size, patch_size, 1),           dtype=np.float32)
 
-        # Keep only valid samples
-        if len(valid_samples) < n_samples:
-            logger.info(f"Removing {n_samples - len(valid_samples)} samples with invalid temperatures")
-            X = X[valid_samples]
-            y = y[valid_samples]
-            n_samples = len(valid_samples)
+        for out_idx, src_idx in enumerate(valid_indices):
+            patch = patches[src_idx]
+            r, c  = patch["position"]
 
-        # FIX: fill residual NaN pixels with the per-patch mean rather than a global
-        # constant (e.g. 35°C median). A global constant collapses to ~0 after z-score
-        # normalisation, producing the central spike in val/test LST histograms.
-        # Per-patch mean preserves local temperature context with no systematic bias.
-        n_ch = X.shape[-1]
+            if position_only and raster_data is not None:
+                for ch_idx, feat in enumerate(channel_order):
+                    arr = raster_data.get(feat)
+                    if arr is not None:
+                        X[out_idx, :, :, ch_idx] = arr[r:r+patch_size, c:c+patch_size]
+                lst_arr = raster_data.get("LST")
+                if lst_arr is not None:
+                    y[out_idx, :, :, 0] = lst_arr[r:r+patch_size, c:c+patch_size]
+            else:
+                for ch_idx, feat in enumerate(channel_order):
+                    if feat in patch["data"]:
+                        X[out_idx, :, :, ch_idx] = patch["data"][feat]
+                y[out_idx, :, :, 0] = patch["data"]["LST"].astype(np.float32)
+
+        # ── In-place NaN fill ─────────────────────────────────────────────────
         for s in range(n_samples):
-            for ch in range(n_ch):                      # features: per-channel mean fill
+            for ch in range(n_channels):
                 sl = X[s, :, :, ch]
                 nm = ~np.isfinite(sl)
                 if nm.any():
                     sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
-                    X[s, :, :, ch] = sl
-            sl = y[s, :, :, 0]                         # LST target: per-patch mean fill
+            sl = y[s, :, :, 0]
             nm = ~np.isfinite(sl)
             if nm.any():
                 sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
-                y[s, :, :, 0] = sl
 
-        # Tier 3 safety clip — matches validate_lst pixel bounds [10, 65°C].
-        # Should rarely trigger; preserves real extreme urban heat values.
-        y = np.clip(y, 10.0, 65.0)
+        # Tier 3 safety clip — in-place
+        np.clip(y, 10.0, 65.0, out=y)
 
-        # ── SAMPLE WEIGHTS for tail upweighting ───────────────────────────────
-        # The model shows slope compression (slope=0.855, std_ratio=0.893):
-        # it under-predicts hot surfaces and over-predicts cool ones.  The root
-        # cause is that mid-range patches (30–38°C) heavily outnumber tail patches
-        # (<28°C or >42°C) in a balanced city-wide dataset.
-        #
-        # Fix: compute a per-sample inverse-frequency weight based on each patch's
-        # mean LST, so the loss sees equal effective representation across the
-        # temperature distribution.  Weights are saved as weights_train.npy for use
-        # in the model trainer (pass to sample_weight= or WeightedRandomSampler).
-        #
-        # Weight formula: w_i = 1 / p(bin_i), normalised so mean(w) = 1.0
-        # Uses 10 equal-width bins across the training LST range.
-        patch_means = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
-        n_weight_bins = 10
-        bin_edges = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_weight_bins + 1)
-        bin_ids = np.digitize(patch_means, bin_edges) - 1
-        bin_ids = np.clip(bin_ids, 0, n_weight_bins - 1)
-        bin_counts = np.bincount(bin_ids, minlength=n_weight_bins).astype(float)
-        bin_counts = np.maximum(bin_counts, 1)          # avoid divide-by-zero for empty bins
-        raw_weights = 1.0 / bin_counts[bin_ids]
-        sample_weights = raw_weights / raw_weights.mean()  # normalise: mean weight = 1
+        # ── Sample weights ────────────────────────────────────────────────────
+        patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+        n_wb          = 10
+        bin_edges     = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
+        bin_ids       = np.clip(np.digitize(patch_means, bin_edges) - 1, 0, n_wb - 1)
+        bin_counts    = np.maximum(np.bincount(bin_ids, minlength=n_wb).astype(np.float32), 1)
+        raw_weights   = 1.0 / bin_counts[bin_ids]
+        sample_weights = raw_weights / raw_weights.mean()
 
-        logger.info("  Sample weights for tail upweighting:")
-        logger.info(f"    Weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
-        logger.info(f"    Bins: {bin_counts.astype(int).tolist()}")
-        logger.info(f"    Weight per bin: {(1.0/bin_counts/((1.0/bin_counts).mean())).round(2).tolist()}")
-        # ──────────────────────────────────────────────────────────────────────
-        
+        logger.info(f"  Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+
         metadata = {
-            "n_samples": n_samples,
-            "patch_size": patch_size,
-            "n_channels": n_channels,
-            "channel_order": channel_order,
+            "n_samples":       n_samples,
+            "patch_size":      patch_size,
+            "n_channels":      n_channels,
+            "channel_order":   channel_order,
             "temporal_features": temporal_features,
             "temperature_range": {
-                "min": float(np.min(y)),
-                "max": float(np.max(y)),
+                "min":  float(np.min(y)),
+                "max":  float(np.max(y)),
                 "mean": float(np.mean(y)),
-                "std": float(np.std(y))
+                "std":  float(np.std(y)),
             },
-            "sample_weights": sample_weights,  # shape (N,) — use in trainer for tail upweighting
+            "sample_weights": sample_weights,
         }
-        
-        logger.info(f"Created training samples: X={X.shape}, y={y.shape}")
-        logger.info(f"Temperature range: [{metadata['temperature_range']['min']:.2f}, {metadata['temperature_range']['max']:.2f}]°C")
-        logger.info(f"Mean: {metadata['temperature_range']['mean']:.2f}°C, Std: {metadata['temperature_range']['std']:.2f}°C")
 
-        # ── DIAGNOSTIC: per-channel feature statistics ─────────────────
+        logger.info(f"Created training samples: X={X.shape}, y={y.shape}")
+        logger.info(f"Temperature range: [{metadata['temperature_range']['min']:.2f}, "
+                    f"{metadata['temperature_range']['max']:.2f}]°C")
+
         logger.info("  Per-channel feature statistics (X):")
         for ch_idx, feat in enumerate(channel_order):
             ch_data = X[:, :, :, ch_idx]
-            logger.info(
-                f"    [{ch_idx:2d}] {feat:12s}: mean={ch_data.mean():.4f}  "
-                f"std={ch_data.std():.4f}  "
-                f"range=[{ch_data.min():.4f}, {ch_data.max():.4f}]"
-            )
-
-        nan_x = np.sum(~np.isfinite(X))
-        nan_y = np.sum(~np.isfinite(y))
-        logger.info(f"  NaN/Inf count – X: {nan_x}  y: {nan_y}")
-        logger.info(
-            f"  y percentiles [5,25,50,75,95]: "
-            f"{np.percentile(y, [5,25,50,75,95]).round(2).tolist()}"
-        )
-        # ──────────────────────────────────────────────────────────────
+            logger.info(f"    [{ch_idx:2d}] {feat:12s}: mean={ch_data.mean():.4f} "
+                        f"std={ch_data.std():.4f} "
+                        f"range=[{ch_data.min():.4f}, {ch_data.max():.4f}]")
 
         return X, y, metadata
     
@@ -2640,43 +2943,39 @@ class DatasetCreator:
     def normalize_data(self, X: np.ndarray, y: np.ndarray, 
                     norm_stats: Dict) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Normalize features and targets using provided statistics
-        
+        Normalize features and targets in-place — no second array allocated.
+
         Args:
-            X: Features (N, H, W, C)
-            y: Targets (N, H, W, 1)
+            X: Features (N, H, W, C) — modified in place
+            y: Targets (N, H, W, 1) — modified in place
             norm_stats: Normalization statistics dictionary
-            
+
         Returns:
-            Tuple of (X_normalized, y_normalized)
+            Tuple of (X, y) — same objects, now normalized
         """
-        logger.info("Normalizing data...")
-        
-        X_norm = np.zeros_like(X, dtype=np.float32)
-        
-        # Normalize each channel
+        logger.info("Normalizing data (in-place)...")
+
         n_channels = X.shape[-1]
         for ch in range(n_channels):
             ch_key = f'channel_{ch}'
             if ch_key in norm_stats['features']:
                 mean = norm_stats['features'][ch_key]['mean']
-                std = norm_stats['features'][ch_key]['std']
-                
-                if std > 1e-8:  # Avoid division by zero
-                    X_norm[:, :, :, ch] = (X[:, :, :, ch] - mean) / std
+                std  = norm_stats['features'][ch_key]['std']
+                if std > 1e-8:
+                    X[:, :, :, ch] -= mean
+                    X[:, :, :, ch] /= std
                 else:
                     logger.warning(f"  Channel {ch} has zero std, skipping normalization")
-                    X_norm[:, :, :, ch] = X[:, :, :, ch]
-        
-        # Normalize targets
+
         target_mean = norm_stats['target']['mean']
-        target_std = norm_stats['target']['std']
-        y_norm = (y - target_mean) / target_std
-        
-        logger.info(f"  X normalized: mean={X_norm.mean():.4f}, std={X_norm.std():.4f}")
-        logger.info(f"  y normalized: mean={y_norm.mean():.4f}, std={y_norm.std():.4f}")
-        
-        return X_norm, y_norm
+        target_std  = norm_stats['target']['std']
+        y -= target_mean
+        y /= target_std
+
+        logger.info(f"  X normalized: mean={X.mean():.4f}, std={X.std():.4f}")
+        logger.info(f"  y normalized: mean={y.mean():.4f}, std={y.std():.4f}")
+
+        return X, y
     
     def verify_no_data_leakage(self, X_train, y_train, X_val, y_val, X_test, y_test,
                             norm_stats: Dict):
@@ -2808,32 +3107,44 @@ class DatasetCreator:
     def save_dataset(self, splits: Dict, output_dir: Path, metadata: Dict, 
                     norm_stats: Optional[Dict] = None):
         """
-        Save dataset to disk with normalization statistics
-        
+        Save dataset to disk.
+
+        Memory-efficient: saves each split then immediately removes it from
+        the splits dict so Python can reclaim the memory before the next
+        split is processed.
+
         Args:
-            splits: Dictionary with train/val/test splits
+            splits: Dictionary with train/val/test splits (mutated in place)
             output_dir: Output directory
             metadata: Metadata dictionary
             norm_stats: Normalization statistics (optional)
         """
         output_dir = Path(output_dir)
-        
-        # Save each split
+
         for split_name in ['train', 'val', 'test']:
             split_dir = output_dir / split_name
             split_dir.mkdir(parents=True, exist_ok=True)
-            
-            np.save(split_dir / "X.npy", splits[f"X_{split_name}"])
-            np.save(split_dir / "y.npy", splits[f"y_{split_name}"])
-            
-            if f"dates_{split_name}" in splits:
-                np.save(split_dir / "dates.npy", splits[f"dates_{split_name}"])
-        
-        # Save metadata
+
+            X_key = f"X_{split_name}"
+            y_key = f"y_{split_name}"
+            d_key = f"dates_{split_name}"
+
+            if X_key in splits:
+                np.save(split_dir / "X.npy", splits[X_key])
+                del splits[X_key]
+            if y_key in splits:
+                np.save(split_dir / "y.npy", splits[y_key])
+                del splits[y_key]
+            if d_key in splits:
+                np.save(split_dir / "dates.npy", splits[d_key])
+                del splits[d_key]
+
+            gc.collect()
+            logger.info(f"  ✓ Saved and freed {split_name} split → {split_dir}")
+
         import json
         metadata_file = output_dir / "metadata.json"
         with open(metadata_file, "w") as f:
-            # Convert numpy types to native Python types
             metadata_clean = {}
             for k, v in metadata.items():
                 if isinstance(v, (np.integer, np.floating)):
@@ -2843,14 +3154,13 @@ class DatasetCreator:
                 else:
                     metadata_clean[k] = v
             json.dump(metadata_clean, f, indent=2)
-        
-        # Save normalization statistics if provided
+
         if norm_stats is not None:
             stats_file = output_dir / "normalization_stats.json"
             with open(stats_file, "w") as f:
                 json.dump(norm_stats, f, indent=2)
             logger.info(f"✅ Saved normalization stats to {stats_file}")
-        
+
         logger.info(f"✅ Dataset saved to {output_dir}")
 
 class EnhancedDatasetCreator(DatasetCreator):
@@ -2897,27 +3207,10 @@ class EnhancedDatasetCreator(DatasetCreator):
             count = np.sum(seasons == season_idx)
             logger.info(f"  {season_names[season_idx]}: {count} samples ({count/n_samples*100:.1f}%)")
         
-        # Create spatial blocks by clustering patch center locations
-        # Extract center coordinates from each patch
+        # ── Spatial features — vectorised (no Python loop over samples) ─────
         logger.info(f"\nCreating spatial blocks...")
-        
-        # For patches, we need to extract spatial information
-        # We'll use NDVI spatial patterns as a proxy for location
-        # (higher variation in certain channels indicates different regions)
-        spatial_features = []
-        for i in range(n_samples):
-            # Use mean values of key indices as spatial signature
-            # NDVI, NDBI, MNDWI are typically in channels 0, 1, 2
-            if X.shape[-1] >= 3:
-                ndvi_mean = X[i, :, :, 0].mean()
-                ndbi_mean = X[i, :, :, 1].mean()
-                mndwi_mean = X[i, :, :, 2].mean()
-                spatial_features.append([ndvi_mean, ndbi_mean, mndwi_mean])
-            else:
-                # Fallback: use first 3 channels
-                spatial_features.append([X[i, :, :, ch].mean() for ch in range(min(3, X.shape[-1]))])
-        
-        spatial_features = np.array(spatial_features)
+        n_feat_cols = min(3, X.shape[-1])
+        spatial_features = X[:, :, :, :n_feat_cols].mean(axis=(1, 2))  # (N, ≤3)
         
         # Cluster locations into spatial blocks
         from sklearn.cluster import KMeans
@@ -2933,7 +3226,8 @@ class EnhancedDatasetCreator(DatasetCreator):
         # ── LST VARIANCE STRATIFICATION ───────────────────────────────────────
         # Bin each patch by LST std so all splits share the same variance profile.
         # Without this the test set had ~16% wider LST range than val.
-        lst_stds = np.array([y[i].std() for i in range(n_samples)])
+        # Vectorised — no Python loop over samples (was the biggest memory/speed bottleneck)
+        lst_stds = y[:, :, :, 0].reshape(n_samples, -1).std(axis=1)
         lst_std_bins = pd.qcut(lst_stds, q=4, labels=False, duplicates='drop')
         n_variance_bins = len(np.unique(lst_std_bins))
         logger.info(f"\nLST variance bins ({n_variance_bins} quartile bins):")
@@ -2948,7 +3242,8 @@ class EnhancedDatasetCreator(DatasetCreator):
         # After global-constant NaN fill (→ median ≈ 0 normalised) this produced
         # the central spike in val/test LST histograms. Including a valid-ratio
         # bin ensures NaN-heavy patches are distributed evenly across splits.
-        valid_ratios = np.array([np.isfinite(y[i]).mean() for i in range(n_samples)])
+        # Vectorised — no Python loop over samples
+        valid_ratios = np.isfinite(y[:, :, :, 0]).reshape(n_samples, -1).mean(axis=1)
         valid_ratio_bins = (valid_ratios < 0.99).astype(int)  # 0=fully-valid, 1=has-NaN
         n_valid_bins = len(np.unique(valid_ratio_bins))
         logger.info(f"\nValid-pixel ratio bins ({n_valid_bins} bins):")
@@ -2984,8 +3279,9 @@ class EnhancedDatasetCreator(DatasetCreator):
 
         # Filter every parallel array consistently — missing a slice here causes
         # an IndexError or silent shape mismatch in the logging / split code below.
-        X = X[valid_indices]
-        y = y[valid_indices]
+        # Free originals immediately after slicing to avoid holding both in RAM.
+        _X_tmp = X[valid_indices]; del X; X = _X_tmp; del _X_tmp
+        _y_tmp = y[valid_indices]; del y; y = _y_tmp; del _y_tmp; gc.collect()
         dates = dates[valid_indices]
         seasons = seasons[valid_indices]
         spatial_blocks = spatial_blocks[valid_indices]
@@ -3023,18 +3319,24 @@ class EnhancedDatasetCreator(DatasetCreator):
             random_state=random_seed
         )
         
-        # Create the splits
+        # Create the splits — free full X/y as soon as all slices are taken.
+        # Fancy indexing creates copies, so after three slices the originals
+        # serve no further purpose.  Deleting them here reduces peak RSS by
+        # ~33% compared with holding both the originals and the three copies.
+        # We extract all index arrays first, then slice and free in one pass.
         X_train = X[train_idx]
+        X_val   = X[val_idx]
+        X_test  = X[test_idx]
+        del X; gc.collect()
+
         y_train = y[train_idx]
+        y_val   = y[val_idx]
+        y_test  = y[test_idx]
+        del y; gc.collect()
+
         dates_train = dates[train_idx]
-        
-        X_val = X[val_idx]
-        y_val = y[val_idx]
-        dates_val = dates[val_idx]
-        
-        X_test = X[test_idx]
-        y_test = y[test_idx]
-        dates_test = dates[test_idx]
+        dates_val   = dates[val_idx]
+        dates_test  = dates[test_idx]
         
         # Verify distribution
         logger.info("\n" + "="*70)
@@ -3205,14 +3507,22 @@ def main():
         logger.info("STEP 1A: Process Landsat data")
         logger.info("="*70)
         
-        landsat_files = sorted(landsat_dir.glob("landsat_*.npz"))
+        landsat_files = sorted(
+            list(landsat_dir.glob("Landsat_*.tif")) +   # GEE export (new)
+            list(landsat_dir.glob("landsat_*.tif")) +   # lower-case variant
+            list(landsat_dir.glob("landsat_*.npz"))     # legacy npz
+        )
         logger.info(f"Found {len(landsat_files)} Landsat files")
         
         for raw_file in landsat_files:
-            # Extract date from filename
+            # Handles both Landsat_YYYY_MM.tif and landsat_YYYY_MM.npz
             parts = raw_file.stem.split('_')
-            year = int(parts[1])
-            month = int(parts[2])
+            try:
+                year  = int(parts[-2])
+                month = int(parts[-1])
+            except (IndexError, ValueError):
+                logger.warning(f"  Cannot parse date from {raw_file.name}, skipping")
+                continue
             timestamp = pd.Timestamp(year=year, month=month, day=15)
             
             # Process the file
@@ -3243,7 +3553,7 @@ def main():
             # ── DIAGNOSTIC PLOTS (first file only) ────────────────────
             if len(landsat_processed) == 1:
                 try:
-                    raw_data_for_plot = dict(np.load(raw_file))
+                    raw_data_for_plot = load_raw_file(raw_file) or {}
                     diag.plot_raw_bands(
                         raw_data_for_plot,
                         title=f"Raw Bands – {raw_file.name}",
@@ -3286,14 +3596,22 @@ def main():
         logger.info("STEP 1B: Process Sentinel-2 data")
         logger.info("="*70)
         
-        sentinel2_files = sorted(sentinel2_dir.glob("sentinel2_*.npz"))
+        sentinel2_files = sorted(
+            list(sentinel2_dir.glob("Sentinel2_*.tif")) +   # GEE export (new)
+            list(sentinel2_dir.glob("sentinel2_*.tif")) +   # lower-case variant
+            list(sentinel2_dir.glob("sentinel2_*.npz"))     # legacy npz
+        )
         logger.info(f"Found {len(sentinel2_files)} Sentinel-2 files")
         
         for raw_file in sentinel2_files:
-            # Extract date from filename
+            # Handles both Sentinel2_YYYY_MM.tif and sentinel2_YYYY_MM.npz
             parts = raw_file.stem.split('_')
-            year = int(parts[1])
-            month = int(parts[2])
+            try:
+                year  = int(parts[-2])
+                month = int(parts[-1])
+            except (IndexError, ValueError):
+                logger.warning(f"  Cannot parse date from {raw_file.name}, skipping")
+                continue
             timestamp = pd.Timestamp(year=year, month=month, day=15)
             
             # Process the file
@@ -3314,7 +3632,7 @@ def main():
             # ── DIAGNOSTIC PLOTS (first S2 file only) ─────────────────
             if len(sentinel2_processed) == 1:
                 try:
-                    raw_s2_data = dict(np.load(raw_file))
+                    raw_s2_data = load_raw_file(raw_file) or {}
                     diag.plot_s2_raw_bands(
                         raw_s2_data,
                         filename="s2_01_raw_bands.png",
@@ -3373,162 +3691,205 @@ def main():
             logger.warning(f"[Diagnostics] S2 multi-scene plots failed: {_e}")
         # ──────────────────────────────────────────────────────────────
     
-    # Step 3: Fuse data or use single sensor
+    # Steps 2 + 3 (combined): fuse and immediately extract patches,
+    # freeing each raster as soon as its patches are done.
+    # Previously all_fused_data held every raster in RAM before patch
+    # extraction even began — for 10 years of monthly data this was several GB.
     logger.info("\n" + "="*70)
-    logger.info("STEP 2: Fuse multi-sensor data")
+    logger.info("STEP 2+3: Fuse data and extract patches (streaming)")
     logger.info("="*70)
-    
-    all_fused_data = []
-    all_dates = []
-    
-    if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
-        # Perform temporal matching and fusion
-        logger.info("Performing multi-sensor fusion...")
-        
-        matches = fusion.temporal_match(landsat_processed, sentinel2_processed, max_time_diff_days=16)
-        
-        for avg_date, ls_data, s2_data, time_diff in matches:
-            logger.info(f"\nFusing data (time_diff={time_diff} days):")
-            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff, target_resolution=30)
-            
-            # Add impervious surface
-            if "NDVI" in fused_data and "NDBI" in fused_data and "MNDWI" in fused_data:
-                isf = feature_engineer.calculate_impervious_surface(
-                    fused_data["NDVI"],
-                    fused_data["NDBI"],
-                    fused_data["MNDWI"]
-                )
-                fused_data["impervious_surface"] = isf
-            
-            all_fused_data.append(fused_data)
-            all_dates.append(avg_date)
 
-            # ── DIAGNOSTIC: fusion quality plots (first pair only) ─────
-            if len(all_fused_data) == 1:
+    all_patches: List[Dict] = []
+    all_dates:   List       = []
+    all_rasters: List       = []   # (raster_dict, [position_patches]) pairs
+    first_fused_diag = True
+
+    def _fuse_extract_free(fused_data: Dict, date, label: str) -> None:
+        """Extract position-only patches, store raster ref, free bands later."""
+        patches = dataset_creator.extract_patches(
+            fused_data,
+            patch_size=64, stride=24, min_valid_ratio=0.95,
+            min_variance=0.3, min_temp=20.0, max_temp=58.0,
+        )
+        for p in patches:
+            p["date"] = date
+        all_patches.extend(patches)
+        all_dates.append(date)
+        # Keep a reference to the raster alongside its patches so
+        # create_training_samples can slice from it without re-loading.
+        all_rasters.append((fused_data, patches))
+        logger.info(f"  {label}: {len(patches)} patches "
+                    f"(running total: {len(all_patches)})")
+
+    if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
+        logger.info("Performing multi-sensor fusion (streaming)...")
+        matches = fusion.temporal_match(
+            landsat_processed, sentinel2_processed, max_time_diff_days=16
+        )
+        del landsat_processed, sentinel2_processed
+        gc.collect()
+
+        for mi, (avg_date, ls_data, s2_data, time_diff) in enumerate(matches):
+            logger.info(f"\nFusing pair {mi+1}/{len(matches)} (Δt={time_diff}d):")
+            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff, target_resolution=30)
+
+            if all(k in fused_data for k in ("NDVI", "NDBI", "MNDWI")):
+                fused_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                    fused_data["NDVI"], fused_data["NDBI"], fused_data["MNDWI"]
+                )
+
+            if first_fused_diag:
                 try:
-                    diag.plot_fusion_comparison(
-                        ls_data, s2_data, fused_data,
-                        index="NDVI",
-                        filename="09_fusion_comparison_NDVI.png",
-                    )
-                    diag.plot_fusion_comparison(
-                        ls_data, s2_data, fused_data,
-                        index="NDBI",
-                        filename="09b_fusion_comparison_NDBI.png",
-                    )
-                    diag.plot_fusion_weight_map(
-                        ls_data, s2_data, fused_data,
-                        time_diff=time_diff,
-                        filename="s2_11_fusion_weights.png",
-                    )
-                    diag.plot_impervious_surface_analysis(
-                        fused_data,
-                        filename="s2_12_impervious_surface.png",
-                    )
+                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
+                                                index="NDVI",
+                                                filename="09_fusion_comparison_NDVI.png")
+                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
+                                                index="NDBI",
+                                                filename="09b_fusion_comparison_NDBI.png")
+                    diag.plot_fusion_weight_map(ls_data, s2_data, fused_data,
+                                                time_diff=time_diff,
+                                                filename="s2_11_fusion_weights.png")
+                    diag.plot_impervious_surface_analysis(fused_data,
+                                                          filename="s2_12_impervious_surface.png")
                 except Exception as _e:
                     logger.warning(f"[Diagnostics] fusion plots failed: {_e}")
-            # ──────────────────────────────────────────────────────────
-        
-        logger.info(f"\n✓ Created {len(all_fused_data)} fused datasets")
-        
+                first_fused_diag = False
+
+            del ls_data, s2_data
+            gc.collect()
+
+            _fuse_extract_free(fused_data, avg_date, f"Pair {mi+1}/{len(matches)}")
+
+        logger.info(f"\n✓ Processed {len(matches)} fused pairs, "
+                    f"{len(all_patches)} total patches")
+
     elif has_landsat and len(landsat_processed) > 0:
-        # Use Landsat only
         logger.info("Using Landsat data only (no Sentinel-2 available)")
-        
-        for timestamp, ls_data in landsat_processed:
-            # Add impervious surface
-            if "NDVI" in ls_data and "NDBI" in ls_data and "MNDWI" in ls_data:
-                isf = feature_engineer.calculate_impervious_surface(
-                    ls_data["NDVI"],
-                    ls_data["NDBI"],
-                    ls_data["MNDWI"]
+        n_ls = len(landsat_processed)
+        for li, (timestamp, ls_data) in enumerate(landsat_processed):
+            if all(k in ls_data for k in ("NDVI", "NDBI", "MNDWI")):
+                ls_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                    ls_data["NDVI"], ls_data["NDBI"], ls_data["MNDWI"]
                 )
-                ls_data["impervious_surface"] = isf
-            
-            all_fused_data.append(ls_data)
-            all_dates.append(timestamp)
-        
-        logger.info(f"✓ Using {len(all_fused_data)} Landsat datasets")
-        
+            _fuse_extract_free(ls_data, timestamp, f"Landsat {li+1}/{n_ls}")
+        del landsat_processed
+        gc.collect()
+
     else:
         logger.error("No valid data available for training")
         return
-    
-    if len(all_fused_data) == 0:
-        logger.error("No data available after processing")
-        return
-    
-    # Step 4: Extract patches
-    logger.info("\n" + "="*70)
-    logger.info("STEP 3: Extract patches")
-    logger.info("="*70)
-    
-    all_patches = []
-    for idx, fused_data in enumerate(all_fused_data):
-        patches = dataset_creator.extract_patches(
-            fused_data,
-            patch_size=64,
-            stride=24,  # CHANGED: 75% overlap → 3x more patches
-            min_valid_ratio=0.95,  # RAISED: strict NaN filter prevents central LST spike
-            min_variance=0.3,
-            min_temp=20.0,           # Patch-mean lower bound (cloud/shadow below this)
-            max_temp=58.0            # Patch-mean upper bound (raised to admit hot urban patches)
-        )
-        
-        for patch in patches:
-            patch["date"] = all_dates[idx]
-        
-        all_patches.extend(patches)
-        logger.info(f"  Dataset {idx+1}/{len(all_fused_data)}: {len(patches)} patches")
-    
-    logger.info(f"\n✓ Total patches extracted: {len(all_patches)}")
 
-    # ── DIAGNOSTIC: patch quality plot ────────────────────────────────
-    if all_patches:
-        try:
-            diag.plot_patch_diagnostics(all_patches, filename="05_patch_diagnostics.png")
-        except Exception as _e:
-            logger.warning(f"[Diagnostics] patch plot failed: {_e}")
-    # ──────────────────────────────────────────────────────────────────
-    
-    if len(all_patches) == 0:
+    if not all_patches:
         logger.error("No patches extracted")
         return
     
-    # Step 5: Create training samples
+    # Patch quality diagnostic (before patches are freed)
+    try:
+        diag.plot_patch_diagnostics(all_patches, filename="05_patch_diagnostics.png")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] patch plot failed: {_e}")
+
+    # Step 4: Create training samples (streaming — one raster at a time)
     logger.info("\n" + "="*70)
     logger.info("STEP 4: Create training samples")
     logger.info("="*70)
-    
-    temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
-    # Build dates BEFORE create_training_samples so they can be filtered in sync
-    # with X/y. If built afterwards from all_patches it stays at full length
-    # (e.g. 9187) while X/y are already reduced (e.g. 7520), causing a
-    # ValueError: operands could not be broadcast together in create_stratified_split.
-    dates_all = np.array([patch["date"] for patch in all_patches])
-    X, y, metadata = dataset_creator.create_training_samples(all_patches, temporal_features)
 
-    n_kept = metadata["n_samples"]
-    if len(dates_all) != n_kept:
-        logger.warning(
-            f"create_training_samples dropped {len(dates_all) - n_kept} samples; "
-            f"trimming dates {len(dates_all)} → {n_kept} to match X/y."
-        )
-        # Reproduce the acceptance mask used inside create_training_samples:
-        # valid-pixel ratio >= 0.95  AND  patch-mean LST in [20, 58]°C
-        valid_mask = []
-        for patch in all_patches:
-            lst_p = patch["data"]["LST"].astype("float32")
-            fin = np.isfinite(lst_p)
-            if fin.mean() < 0.95:
-                valid_mask.append(False)
-                continue
-            mean_t = float(lst_p[fin].mean()) if fin.any() else 0.0
-            valid_mask.append(20.0 <= mean_t <= 58.0)
-        dates = dates_all[np.array(valid_mask)]
-    else:
-        dates = dates_all
-    
+    temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
+    dates_all = np.array([patch["date"] for patch in all_patches])
+
+    # Build X/y by streaming through each (raster, patches) pair, freeing
+    # the raster dict immediately after its patches are written into X/y.
+    channel_order = [
+        "SR_B4", "SR_B5", "SR_B6", "SR_B7",
+        "NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo",
+    ]
+    n_channels = len(channel_order)
+    patch_size = 64
+    n_total    = len(all_patches)
+
+    X = np.zeros((n_total, patch_size, patch_size, n_channels), dtype=np.float32)
+    y = np.zeros((n_total, patch_size, patch_size, 1),           dtype=np.float32)
+
+    write_idx = 0
+    for raster_data, raster_patches in all_rasters:
+        for p in raster_patches:
+            r, c = p["position"]
+            for ch_idx, feat in enumerate(channel_order):
+                arr = raster_data.get(feat)
+                if arr is not None:
+                    X[write_idx, :, :, ch_idx] = arr[r:r+patch_size, c:c+patch_size]
+            lst_arr = raster_data.get("LST")
+            if lst_arr is not None:
+                y[write_idx, :, :, 0] = lst_arr[r:r+patch_size, c:c+patch_size]
+            write_idx += 1
+        # Free this raster immediately — its data is now in X/y
+        raster_data.clear()
+        gc.collect()
+
+    del all_rasters
+    gc.collect()
+
+    # Free the patch list — no longer needed once X/y are filled
+    del all_patches
+    gc.collect()
+    logger.info("  Freed rasters and patch list from memory")
+
+    # QC + NaN fill + safety clip
+    valid_mask = np.ones(n_total, dtype=bool)
+    for s in range(n_total):
+        lst_p = y[s, :, :, 0]
+        fin   = np.isfinite(lst_p)
+        if fin.mean() < 0.95:
+            valid_mask[s] = False; continue
+        lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
+        if not (20.0 <= lst_mean <= 58.0):
+            valid_mask[s] = False
+
+    if not valid_mask.all():
+        dropped = int((~valid_mask).sum())
+        logger.info(f"  QC dropped {dropped}/{n_total} samples")
+        X          = X[valid_mask]
+        y          = y[valid_mask]
+        dates_all  = dates_all[valid_mask]
+
+    n_samples = len(X)
+    for s in range(n_samples):
+        for ch in range(n_channels):
+            sl = X[s, :, :, ch]; nm = ~np.isfinite(sl)
+            if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
+        sl = y[s, :, :, 0]; nm = ~np.isfinite(sl)
+        if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
+
+    np.clip(y, 10.0, 65.0, out=y)
+
+    # Sample weights
+    patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+    n_wb          = 10
+    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
+    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
+    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
+    rw_           = 1.0 / bc_[bids_]
+    sample_weights = rw_ / rw_.mean()
+
+    metadata = {
+        "n_samples":        n_samples,
+        "patch_size":       patch_size,
+        "n_channels":       n_channels,
+        "channel_order":    channel_order,
+        "temporal_features": temporal_features,
+        "temperature_range": {
+            "min": float(np.min(y)), "max": float(np.max(y)),
+            "mean": float(np.mean(y)), "std": float(np.std(y)),
+        },
+        "sample_weights": sample_weights,
+    }
+
+    logger.info(f"  Created X={X.shape}, y={y.shape}")
+    logger.info(f"  Temp range: [{metadata['temperature_range']['min']:.2f}, "
+                f"{metadata['temperature_range']['max']:.2f}]°C")
+
+    dates = dates_all[:n_samples]
+
     # Step 6: Create splits - MODIFIED
     logger.info("\n" + "="*70)
     logger.info("STEP 5: Create train/val/test splits")
@@ -3618,103 +3979,57 @@ def main():
         logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
     # ──────────────────────────────────────────────────────────────────────
 
+
     # Step 6.7: Update metadata with fusion info
     logger.info("\n" + "="*70)
     logger.info("STEP 6.7: Update metadata")
     logger.info("="*70)
 
-    # Add fusion strategy info to metadata
+    fusion_strategy = (
+        'multi-sensor' if (has_landsat and has_sentinel2)
+        else 'landsat-only'
+    )
     metadata['fusion_info'] = {
-        'fusion_strategy': 'multi-sensor' if (has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0) else 'landsat-only',
-        'landsat_files': len(landsat_processed) if has_landsat else 0,
-        'sentinel2_files': len(sentinel2_processed) if has_sentinel2 else 0,
-        'fused_datasets': len(all_fused_data)
+        'fusion_strategy': fusion_strategy,
+        'landsat_available':   has_landsat,
+        'sentinel2_available': has_sentinel2,
+        'total_samples':       metadata["n_samples"],
     }
 
-    # Save sample weights for the training split (used for tail upweighting in trainer)
+    # Save sample weights for the training split
     sample_weights = metadata.pop("sample_weights", None)
     if sample_weights is not None:
-        # Align weights with the train split indices used by create_stratified_split.
-        # splits contains 'X_train' etc already subset; we need the weights for those rows.
-        # create_stratified_split does not re-order samples, so train_idx into the
-        # post-rare-strata-filter array is not directly accessible here.
-        # Safe approach: recompute weights from the normalised y_train directly.
-        y_train_raw = splits['y_train']  # already normalised at this point
+        y_train_raw = splits['y_train']
         patch_means_train = y_train_raw[:, :, :, 0].reshape(len(y_train_raw), -1).mean(axis=1)
         n_wb = 10
         be = np.linspace(patch_means_train.min(), patch_means_train.max() + 1e-6, n_wb + 1)
         bids = np.clip(np.digitize(patch_means_train, be) - 1, 0, n_wb - 1)
-        bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(float), 1)
+        bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)
         rw = 1.0 / bc[bids]
         train_weights = rw / rw.mean()
         weights_path = output_dataset_dir / "train" / "weights_train.npy"
         np.save(weights_path, train_weights.astype(np.float32))
         logger.info(f"✅ Saved sample weights → {weights_path}")
-        logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]  "
-                    f"mean={train_weights.mean():.3f}")
+        logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]")
 
-    # Save the NORMALIZED dataset
+    # save_dataset streams one split at a time, deleting each from `splits` after saving
     dataset_creator.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
 
-    # Update metadata with NORMALIZED data statistics
-    metadata['temperature_range'] = {
-        'min': float(np.min(splits['y_train'])),
-        'max': float(np.max(splits['y_train'])),
-        'mean': float(np.mean(splits['y_train'])),
-        'std': float(np.std(splits['y_train']))
-    }
-
-    logger.info("Metadata updated with normalized data statistics")
-    logger.info(f"  y_train range: [{metadata['temperature_range']['min']:.4f}, {metadata['temperature_range']['max']:.4f}]")
-
-    # Step 7: Save dataset
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6: Save normalized dataset")
-    logger.info("="*70)
-    
-    # Final summary
+    # ── Final summary (splits dict is now empty — use metadata) ─────────────
     logger.info("\n" + "="*70)
     logger.info("✓ MULTI-SENSOR PREPROCESSING COMPLETE")
     logger.info("="*70)
-
-    # ── DIAGNOSTIC PLOTS: channel correlation & pipeline summary ───────────
-    try:
-        channel_names = metadata.get("channel_order", None)
-        diag.plot_channel_correlation(
-            splits["X_train"], channel_names=channel_names,
-            filename="08_channel_correlation.png"
-        )
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] channel correlation plot failed: {_e}")
-
-    try:
-        diag.plot_pipeline_summary(splits, metadata, filename="10_pipeline_summary.png")
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] pipeline summary plot failed: {_e}")
-
-    logger.info(
-        f"[Diagnostics] All diagnostic plots saved to: "
-        f"{PROCESSED_DATA_DIR / 'cnn_dataset' / 'diagnostics'}"
-    )
-    # ──────────────────────────────────────────────────────────────────────
     logger.info(f"Data sources:")
-    logger.info(f"  Landsat files: {len(landsat_processed) if has_landsat else 0}")
-    logger.info(f"  Sentinel-2 files: {len(sentinel2_processed) if has_sentinel2 else 0}")
-    logger.info(f"  Fused datasets: {len(all_fused_data)}")
-    logger.info(f"Patches:")
-    logger.info(f"  Total patches: {len(all_patches)}")
+    logger.info(f"  Landsat available:    {has_landsat}")
+    logger.info(f"  Sentinel-2 available: {has_sentinel2}")
+    logger.info(f"  Fusion strategy:      {fusion_strategy}")
     logger.info(f"Training data:")
-    logger.info(f"  Training samples: {len(splits['X_train'])}")
-    logger.info(f"  Validation samples: {len(splits['X_val'])}")
-    logger.info(f"  Test samples: {len(splits['X_test'])}")
+    logger.info(f"  Total samples (after QC): {metadata['n_samples']}")
     logger.info(f"Output:")
     logger.info(f"  Dataset saved to: {output_dataset_dir}")
-    logger.info(f"  Fusion strategy: {metadata['fusion_info']['fusion_strategy']}")
     logger.info(f"Normalization:")
     logger.info(f"  Stats saved: ✅")
-    logger.info(f"  Training data normalized: mean≈0, std≈1")
-    logger.info(f"  Validation data normalized: ✅")
-    logger.info(f"  Test data normalized: ✅")
+    logger.info(f"  All splits normalized in-place: ✅")
     logger.info("="*70)
     logger.info("\nNext step: Run model training")
 

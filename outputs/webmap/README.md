@@ -13,9 +13,9 @@
 4. Switch between different basemap styles
 
 ## Map Bounds
-- West: 106.6000°
+- West: 106.6500°
 - South: -6.4000°
-- East: 107.1000°
+- East: 107.0000°
 - North: -6.0000°
 
 ## Layers
@@ -28,4 +28,4 @@
 - **Temperature Heatmap** - Smooth temperature gradient
 - **Hotspot Markers** - Top priority hotspots
 
-Generated: 2026-02-23 19:46:35
+Generated: 2026-02-24 10:06:04

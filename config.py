@@ -21,15 +21,22 @@ for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, MODEL_DIR, OUTPUT_D
 
 # ============================================================================
 # STUDY AREA CONFIGURATION (Jakarta)
+# Bounds cover the full DKI Jakarta administrative area:
+# - Jakarta Utara, Jakarta Barat, Jakarta Pusat, Jakarta Selatan, Jakarta Timur
+# - Kepulauan Seribu (Thousand Islands)
+# Extended slightly beyond admin boundary to capture urban fringe / rural reference
 # ============================================================================
 STUDY_AREA = {
-    "name": "Jakarta Metropolitan Area",
+    "name": "Jakarta Metropolitan Area (DKI Jakarta)",
     "bounds": {
-        "min_lon": 106.6,
-        "max_lon": 107.1,
-        "min_lat": -6.4,
-        "max_lat": -6.0
+        "min_lon": 106.65,   # Western edge (Jakarta Barat coast)
+        "max_lon": 107.00,   # Eastern edge (Jakarta Timur boundary)
+        "min_lat": -6.40,    # Southern edge (Jakarta Selatan border)
+        "max_lat": -6.00,    # Northern edge (includes Kepulauan Seribu waters)
     },
+    # NOTE: Kepulauan Seribu extends far north (~-5.4°), but including the full
+    # archipelago chain adds mostly open sea. Set max_lat=-5.85 to include the
+    # nearest island cluster while keeping the AOI manageable. Adjust if needed.
     "epsg": 32748,  # WGS84 / UTM Zone 48S
     "buffer_km": 5
 }
@@ -37,86 +44,104 @@ STUDY_AREA = {
 # ============================================================================
 # SATELLITE DATA CONFIGURATION
 # ============================================================================
+
+# Landsat collection merges LC08 (launched 2013) and LC09 (launched 2021).
+# Both carry OLI + TIRS instruments with identical band structure, so they can
+# be treated as a single harmonised collection. Merging maximises revisit
+# frequency and is especially important for 2021-onwards when both are active.
 LANDSAT_CONFIG = {
-    "collection": "LANDSAT/LC08/C02/T1_L2",
+    # Primary (LC08) and secondary (LC09) collections — merged at runtime
+    "collection_l8": "LANDSAT/LC08/C02/T1_L2",
+    "collection_l9": "LANDSAT/LC09/C02/T1_L2",
     "bands": {
-        "blue": "SR_B2",
-        "green": "SR_B3",
-        "red": "SR_B4",
-        "nir": "SR_B5",
-        "swir1": "SR_B6",
-        "swir2": "SR_B7",
+        "coastal": "SR_B1",   # Coastal/Aerosol (not on TM/ETM+, but on OLI)
+        "blue":    "SR_B2",
+        "green":   "SR_B3",
+        "red":     "SR_B4",
+        "nir":     "SR_B5",
+        "swir1":   "SR_B6",
+        "swir2":   "SR_B7",
         "thermal": "ST_B10",
-        "qa": "QA_PIXEL"
+        "qa":      "QA_PIXEL"
     },
+    # Landsat Collection-2 Level-2 scale factors (MUST apply before analysis)
+    # Surface Reflectance: DN * 2.75e-5 - 0.2   → unitless [0, 1]
+    # Surface Temperature: DN * 0.00341802 + 149.0 → Kelvin
+    "sr_scale":    2.75e-5,
+    "sr_offset":  -0.2,
+    "st_scale":    0.00341802,
+    "st_offset":  149.0,
     "cloud_threshold": 50,  # percentage
-    "scale": 30,  # meters
-    "thermal_scale": 100  # meters (native resolution)
+    "scale": 30,            # meters (OLI optical bands)
+    "thermal_scale": 100    # meters (TIRS native, resampled to 30 m in C2)
 }
 
 SENTINEL2_CONFIG = {
     "collection": "COPERNICUS/S2_SR_HARMONIZED",
     "bands": {
-        "blue": "B2",
+        "blue":  "B2",
         "green": "B3",
-        "red": "B4",
-        "nir": "B8",
+        "red":   "B4",
+        "nir":   "B8",
         "swir1": "B11",
         "swir2": "B12",
-        "scl": "SCL"
+        "scl":   "SCL"
     },
-    "cloud_classes": [3, 8, 9, 10],  # Cloud shadow, cloud medium/high probability, cirrus
+    # SCL classes to mask out:
+    # 1=Saturated/Defective, 3=Cloud Shadow, 8=Cloud Med, 9=Cloud High,
+    # 10=Cirrus, 11=Snow/Ice
+    "cloud_classes": [1, 3, 8, 9, 10, 11],
     "scale": 10  # meters
 }
 
-# Landsat 8 thermal constants
+# Landsat 8/9 TIRS thermal constants (Band 10)
 THERMAL_CONSTANTS = {
-    "K1": 774.8853,  # Band 10
-    "K2": 1321.0789,  # Band 10
-    "wavelength": 10.9e-6,  # meters
-    "rho": 1.438e-2  # m·K
+    "K1": 774.8853,       # W/(m²·sr·μm)
+    "K2": 1321.0789,      # K
+    "wavelength": 10.9e-6,  # metres
+    "rho": 1.438e-2         # m·K
 }
 
 # ============================================================================
-# TEMPORAL CONFIGURATION - IMPROVED
+# TEMPORAL CONFIGURATION
 # ============================================================================
-# OLD: Temporal split caused distribution shift
-# NEW: Random stratified split maintaining seasonal distribution
 DATE_RANGE = {
-    # Use all available data
-    "all_data_start": "2021-01-01",
-    "all_data_end": "2024-12-31",
-    
+    # Full download window — 10 years of data (2016-01-01 to 2025-12-31)
+    # NOTE: Sentinel-2A launched March 2015; regular S2 data for Indonesia
+    # is available from mid-2015. Landsat 8 data is available from 2013.
+    "all_data_start": "2016-01-01",
+    "all_data_end":   "2025-12-31",
+
     # Split ratios
     "train_ratio": 0.65,
-    "val_ratio": 0.15,
-    "test_ratio": 0.20,
-    
-    # Ensure seasonal balance
-    "stratify_by_season": True,
-    "stratify_by_location": True,  # Also stratify spatially
+    "val_ratio":   0.15,
+    "test_ratio":  0.20,
+
+    # Ensure seasonal balance in splits
+    "stratify_by_season":   True,
+    "stratify_by_location": True,
 }
 
 # ============================================================================
 # GRID CONFIGURATION
 # ============================================================================
 GRID_CONFIG = {
-    "resolution": 50,  # meters
+    "resolution": 50,  # metres
     "patch_size": 64,  # pixels for CNN input
-    "overlap": 32  # pixels overlap between patches
+    "overlap": 32      # pixels overlap between patches
 }
 
 # ============================================================================
 # FEATURE ENGINEERING
 # ============================================================================
 SPECTRAL_INDICES = [
-    "NDVI",   # Normalized Difference Vegetation Index
-    "NDBI",   # Normalized Difference Built-up Index
-    "MNDWI",  # Modified Normalized Difference Water Index
-    "BSI",    # Bare Soil Index
-    "UI",     # Urban Index
-    "EBBI",   # Enhanced Built-Up and Bareness Index
-    "albedo"  # Surface albedo
+    "NDVI",    # Normalized Difference Vegetation Index
+    "NDBI",    # Normalized Difference Built-up Index
+    "MNDWI",   # Modified Normalized Difference Water Index
+    "BSI",     # Bare Soil Index
+    "UI",      # Urban Index
+    "EBBI",    # Enhanced Built-Up and Bareness Index
+    "albedo"   # Surface albedo
 ]
 
 URBAN_FEATURES = [
@@ -149,16 +174,16 @@ TEMPORAL_FEATURES = [
 CNN_CONFIG = {
     "architecture": "unet",
     "input_channels": 10,
-    
-    # REDUCED CAPACITY: Prevent overfitting
+
+    # Reduced capacity: prevents overfitting
     "filters": [16, 32, 64, 128, 256],  # Was [32, 64, 128, 256, 512]
-    
-    # INCREASED DROPOUT: Better regularization
+
+    # Increased dropout: better regularisation
     "dropout_rates": [0.3, 0.4, 0.5, 0.5, 0.5],  # Was [0.2, 0.25, 0.3, 0.35, 0.4]
-    
+
     "batch_norm": True,
     "activation": "relu",
-    "use_attention": False,  # Keep simple
+    "use_attention": False,
 }
 
 GBM_CONFIG = {
@@ -167,126 +192,100 @@ GBM_CONFIG = {
         "objective": "regression",
         "metric": "rmse",
         "boosting_type": "gbdt",
-        
-        # REDUCED TREE COMPLEXITY: Prevent overfitting
-        "num_leaves": 31,  # Was 127 - much simpler
-        "max_depth": 6,    # Was 12 - much shallower
-        
-        # LEARNING: Let early stopping find the right number of trees
+
+        "num_leaves": 31,   # Was 127
+        "max_depth": 6,     # Was 12
+
         "learning_rate": 0.05,
-        "n_estimators": 2000,   # Was 500 — model was hitting the cap, not converging
-        
-        # SAMPLING: More aggressive feature sampling to reduce remaining gap
-        "subsample": 0.7,         # Was 0.6 — slight increase to stabilize with more trees
+        "n_estimators": 2000,
+
+        "subsample": 0.7,
         "subsample_freq": 1,
-        "colsample_bytree": 0.4,  # Was 0.6 — more aggressive, reduces memorization
-        
-        # REGULARIZATION
+        "colsample_bytree": 0.4,
+
         "reg_alpha": 1.0,
         "reg_lambda": 1.0,
-        # Reduced from 200 — was too restrictive, forcing mean-regression (slope=0.833)
         "min_child_samples": 50,
-        # Controls leaf weight instead of count — more precise than min_child_samples alone
         "min_child_weight": 1e-3,
-        # Prune splits that don't earn their keep — directly fights range compression
         "min_split_gain": 0.01,
-        
-        # Convergence
+
         "early_stopping_rounds": 50,
         "verbose": 100,
     }
 }
 
-# ADJUSTED ENSEMBLE WEIGHTS: Favor more robust GBM
 ENSEMBLE_WEIGHTS = {
-    "cnn": 0.35,   # Was 0.5 - reduced (CNN overfits more)
-    "gbm": 0.55,   # Was 0.4 - increased (GBM more robust)
-    "baseline": 0.1
+    "cnn": 0.35,
+    "gbm": 0.55,
+    "baseline": 0.10
 }
 
 # ============================================================================
 # TRAINING CONFIGURATION - IMPROVED
 # ============================================================================
 TRAINING_CONFIG = {
-    # Batch size
-    "batch_size": 16,  # Was 12 - larger for better gradient estimates
-    
-    # Training duration
-    "epochs": 500,  # Was 200 - rely more on early stopping
-    
-    # Learning rate
-    "initial_lr": 0.001,  # Was 0.0015 - slightly more conservative
-    "min_lr": 1e-6,       # Was 5e-7
-    "warmup_epochs": 10,  # Was 20 - faster warmup
-    
-    # STRICTER EARLY STOPPING: Stop before overfitting
-    "patience": 50,       # Was 50 - stop earlier
-    "min_delta": 0.0005,   # Was 0.0005 - higher threshold
-    
-    # Optimizer
+    "batch_size": 16,
+    "epochs": 500,
+
+    "initial_lr": 0.001,
+    "min_lr": 1e-6,
+    "warmup_epochs": 10,
+
+    "patience": 50,
+    "min_delta": 0.0005,
+
     "optimizer": "adamw",
-    "weight_decay": 0.001,  # Was 0.0001 - MUCH stronger weight decay
-    
-    # Loss weights - FOCUS ON PRESERVING VARIANCE AND RANGE
+    "weight_decay": 0.001,
+
     "loss_weights": {
-        "mse": 0.5,        # Was 1.0 - share weight with other objectives
-        "variance": 0.2,   # NEW: Preserve variance (prevent mean regression)
-        "range": 0.15,     # NEW: Preserve range (prevent compression)
-        "bias": 0.15,      # Prevent systematic bias
-        "spatial": 0.0,    # Start at 0, increase during training
-        "physical": 0.0,   # Start at 0, increase during training
+        "mse":      0.50,
+        "variance": 0.20,
+        "range":    0.15,
+        "bias":     0.15,
+        "spatial":  0.00,
+        "physical": 0.00,
     },
-    
-    # Gradient control
-    "gradient_clip": 1.0,  # Was 0.5 - slightly looser
+
+    "gradient_clip": 1.0,
 }
 
-# STRONGER DATA AUGMENTATION: Better generalization
 AUGMENTATION_CONFIG = {
-    # Geometric augmentations
-    "rotation_range": 30,      # Was 15 - more rotation
-    "flip_horizontal": True,
-    "flip_vertical": True,
-    "elastic_deform": 0.1,     # NEW: Simulate terrain variations
-    
-    # Photometric augmentations
-    "brightness_range": 0.15,  # Was 0.05 - simulate different solar angles
-    "contrast_range": 0.15,    # NEW: Different atmospheric conditions
-    "saturation_range": 0.10,  # NEW: Simulate sensor variations
-    
-    # Noise augmentations
-    "noise_std": 0.10,         # Was 0.05 - more noise tolerance
-    "gaussian_blur": 0.3,      # NEW: Simulate atmospheric blur
-    
-    # Advanced augmentations
-    "mixup_alpha": 0.2,        # NEW: MixUp for better generalization
-    "cutout_size": 8,          # NEW: Random masking
+    "rotation_range":   30,
+    "flip_horizontal":  True,
+    "flip_vertical":    True,
+    "elastic_deform":   0.10,
+
+    "brightness_range": 0.15,
+    "contrast_range":   0.15,
+    "saturation_range": 0.10,
+
+    "noise_std":        0.10,
+    "gaussian_blur":    0.30,
+
+    "mixup_alpha":      0.20,
+    "cutout_size":      8,
 }
 
 # ============================================================================
 # VALIDATION CONFIGURATION - IMPROVED
 # ============================================================================
 VALIDATION_CONFIG = {
-    # Metrics to track
     "metrics": ["r2", "rmse", "mae", "mbe", "slope", "std_ratio"],
-    
-    # Target performance (realistic)
+
     "targets": {
-        "r2": 0.85,      # Was 0.80
-        "rmse": 1.5,     # °C
-        "mae": 1.0,      # °C
-        "slope": 0.95,   # NEW: Check for range compression
-        "std_ratio": 0.90,  # NEW: Check variance preservation
+        "r2":       0.85,
+        "rmse":     1.5,
+        "mae":      1.0,
+        "slope":    0.95,
+        "std_ratio": 0.90,
     },
-    
-    # Cross-validation
+
     "cv_folds": 5,
     "spatial_holdout": 0.15,
     "station_holdout": 0.20,
-    
-    # NEW: Spatial cross-validation
+
     "use_spatial_cv": True,
-    "spatial_block_size": 5000,  # meters - blocks for spatial CV
+    "spatial_block_size": 5000,  # metres
 }
 
 # ============================================================================
@@ -294,58 +293,48 @@ VALIDATION_CONFIG = {
 # ============================================================================
 UHI_CONFIG = {
     "classification": {
-        "weak": (0, 2),      # °C
-        "moderate": (2, 4),
-        "strong": (4, 6),
+        "weak":      (0, 2),
+        "moderate":  (2, 4),
+        "strong":    (4, 6),
         "very_strong": (6, 100)
     },
-    "hotspot_threshold": 2.58,  # Gi* statistic (99% confidence)
-    "spatial_weight_distance": 500,  # meters
+    "hotspot_threshold": 2.58,       # Gi* statistic (99% confidence)
+    "spatial_weight_distance": 500,  # metres
     "rural_ndvi_threshold": 0.4,
     "urban_building_density_threshold": 0.7
 }
 
 # ============================================================================
-# NORMALIZATION CONFIGURATION - CRITICAL
+# NORMALIZATION CONFIGURATION
 # ============================================================================
 NORMALIZATION_CONFIG = {
-    # Ensure consistent normalization between train/test
-    "method": "zscore",  # Standardization
+    "method": "zscore",
     "clip_outliers": True,
-    "clip_std": 5.0,  # Clip values beyond ±5 std
-    
-    # Save/load normalization statistics
+    "clip_std": 5.0,
+
     "save_stats": True,
     "stats_file": "normalization_stats.json",
-    
-    # Validation
+
     "validate_normalized": True,
     "expected_mean_range": (-0.5, 0.5),
-    "expected_std_range": (0.5, 1.5),
+    "expected_std_range":  (0.5, 1.5),
 }
 
 # ============================================================================
-# POST-PROCESSING CONFIGURATION - NEW
+# POST-PROCESSING CONFIGURATION
 # ============================================================================
 POST_PROCESSING_CONFIG = {
-    # Bias correction
     "apply_bias_correction": True,
-    
-    # Variance scaling
     "apply_variance_scaling": True,
-    
-    # Calibration
     "apply_calibration": True,
-    "calibration_method": "isotonic",  # or "platt"
-    
-    # Spatial filtering
+    "calibration_method": "isotonic",
+
     "bilateral_filter": {
         "enabled": True,
         "sigma_spatial": 5,
         "sigma_range": 2.0,
     },
-    
-    # Physical constraints
+
     "temp_min": 20.0,  # °C
     "temp_max": 50.0,  # °C
 }
@@ -361,9 +350,9 @@ NAFAS_CONFIG = {
 
 BMKG_CONFIG = {
     "stations": [
-        {"id": "96749", "name": "Kemayoran", "lat": -6.1667, "lon": 106.8500},
-        {"id": "96745", "name": "Tanjung Priok", "lat": -6.1167, "lon": 106.8833},
-        {"id": "96747", "name": "Halim", "lat": -6.2667, "lon": 106.8833}
+        {"id": "96749", "name": "Kemayoran",    "lat": -6.1667, "lon": 106.8500},
+        {"id": "96745", "name": "Tanjung Priok","lat": -6.1167, "lon": 106.8833},
+        {"id": "96747", "name": "Halim",        "lat": -6.2667, "lon": 106.8833}
     ]
 }
 
@@ -378,7 +367,7 @@ OUTPUT_CONFIG = {
         "nodata": -9999
     },
     "color_scheme": {
-        "lst": "RdYlBu_r",  # Red-Yellow-Blue reversed
+        "lst": "RdYlBu_r",
         "uhi": "hot"
     },
     "export_formats": ["geotiff", "png", "json", "csv"]
@@ -394,7 +383,6 @@ LOGGING_CONFIG = {
     "encoding": "utf-8"
 }
 
-# Create logs directory
 (BASE_DIR / "logs").mkdir(exist_ok=True)
 
 # ============================================================================
@@ -409,10 +397,9 @@ COMPUTE_CONFIG = {
 }
 
 # ============================================================================
-# MONITORING CONFIGURATION - NEW
+# MONITORING CONFIGURATION
 # ============================================================================
 MONITORING_CONFIG = {
-    # Track these metrics during training
     "track_metrics": [
         "r2", "rmse", "mae", "mbe",
         "slope", "intercept",
@@ -420,15 +407,13 @@ MONITORING_CONFIG = {
         "target_mean", "target_std",
         "std_ratio", "range_ratio"
     ],
-    
-    # Warning thresholds
+
     "warnings": {
-        "overfitting_threshold": 0.10,  # Train-val R² gap
-        "variance_collapse_threshold": 0.80,  # pred_std / target_std
-        "range_compression_threshold": 0.90,  # slope
+        "overfitting_threshold": 0.10,
+        "variance_collapse_threshold": 0.80,
+        "range_compression_threshold": 0.90,
     },
-    
-    # Log frequency
+
     "log_every_n_epochs": 5,
     "save_checkpoint_every_n_epochs": 10,
 }

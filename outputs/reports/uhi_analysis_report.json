@@ -1,50 +1,33 @@
 {
   "title": "Urban Heat Island Analysis Report",
-  "date": "2026-02-23 19:46:35",
+  "date": "2026-02-25 13:48:31",
   "uhi_characterization": {
-    "maximum_intensity": "5.48\u00b0C",
-    "minimum_intensity": "-1.58\u00b0C",
-    "mean_intensity": "1.78\u00b0C",
-    "median_intensity": "1.30\u00b0C",
-    "std_intensity": "1.62\u00b0C",
-    "p5_p95": "-0.35\u20134.72\u00b0C",
-    "skewness": "0.5107",
-    "kurtosis": "-0.7869",
-    "spatial_extent": "3.69 km\u00b2",
-    "pct_positive": "87.96%",
-    "magnitude": "7499.83\u00b0C\u00b7pixels"
+    "maximum_intensity": "0.00\u00b0C",
+    "minimum_intensity": "0.00\u00b0C",
+    "mean_intensity": "0.00\u00b0C",
+    "median_intensity": "0.00\u00b0C",
+    "std_intensity": "0.00\u00b0C",
+    "p5_p95": "0.00\u20130.00\u00b0C",
+    "skewness": "nan",
+    "kurtosis": "nan",
+    "spatial_extent": "0.00 km\u00b2",
+    "pct_positive": "0.00%",
+    "magnitude": "0.00\u00b0C\u00b7pixels"
   },
   "hotspot_summary": {
-    "total_hotspots": 1,
-    "total_hotspot_area": "0.18 km\u00b2",
-    "largest_hotspot": "0.180 km\u00b2",
-    "highest_temperature": "44.49\u00b0C"
+    "total_hotspots": 0,
+    "total_hotspot_area": "0.00 km\u00b2",
+    "largest_hotspot": "N/A",
+    "highest_temperature": "N/A"
   },
-  "top_priority_hotspots": [
-    {
-      "id": 1,
-      "n_pixels": 72,
-      "area_km2": 0.18000000000000005,
-      "centroid_y": 53.81944444444444,
-      "centroid_x": 38.80555555555556,
-      "mean_lst": 44.16600036621094,
-      "max_lst": 44.49160385131836,
-      "mean_gi_star": 2.0354824160204994,
-      "max_gi_star": 2.13594126701355,
-      "intensity_score": 0.0,
-      "extent_score": 0.0,
-      "significance_score": 0.0,
-      "priority_score": 0.0,
-      "rank": 1
-    }
-  ],
+  "top_priority_hotspots": [],
   "validation": {
-    "r2_score": "0.7899",
-    "rmse": "2.8921\u00b0C",
-    "mae": "2.1700\u00b0C",
-    "bias": "0.0534\u00b0C",
-    "slope": "0.7310",
-    "intercept": "10.0657",
+    "r2_score": "0.8085",
+    "rmse": "3.2202\u00b0C",
+    "mae": "2.3638\u00b0C",
+    "bias": "0.0207\u00b0C",
+    "slope": "0.7739",
+    "intercept": "9.0062",
     "residual_normality": "NON-NORMAL"
   }
 }

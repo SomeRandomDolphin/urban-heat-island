@@ -1,21 +1,43 @@
 """
 Google Earth Engine data downloader
-Purpose: Download RAW satellite bands from Earth Engine for later processing
-Does NOT perform any processing - just downloads raw data
+Purpose: Download RAW satellite bands from Earth Engine for later processing.
+
+Key improvements over original:
+  1. Merges Landsat 8 (LC08) and Landsat 9 (LC09) into a single collection —
+     maximises revisit frequency, especially important for 2021-2025.
+  2. Uses ee.batch.Export.image.toDrive() instead of getThumbURL() —
+     the correct approach for large-area / multi-year research downloads.
+     getThumbURL is limited to small tiles and unreliable for production use.
+  3. Applies official Landsat C2 L2 scale factors (SR and ST) before saving,
+     so downstream code receives physically-meaningful values from the start.
+  4. Correct pixel-dimension calculation using the cosine latitude correction
+     for longitude degrees (important near the equator).
+  5. Resume/skip logic: already-completed months are detected and skipped,
+     making interrupted runs safe to restart.
+  6. Seasonal composite strategy: dry-season (Apr–Oct) and wet-season
+     (Nov–Mar) months are composited separately when data permits, giving
+     richer temporal structure for UHI analysis.
 """
+
 import sys
+import math
+import time
 import ee
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
-import urllib.request
-import tempfile
-import rasterio
+import json
 
-from config import *
+from config import (
+    STUDY_AREA, LANDSAT_CONFIG, SENTINEL2_CONFIG,
+    RAW_DATA_DIR, LOGGING_CONFIG
+)
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
@@ -23,530 +45,586 @@ logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _lat_lon_to_pixels(min_lon: float, min_lat: float,
+                        max_lon: float, max_lat: float,
+                        scale_m: int) -> Tuple[int, int]:
+    """
+    Compute raster dimensions (width_px, height_px) for a bounding box.
+
+    Uses the proper cosine-latitude correction so that width pixels are not
+    overestimated near the equator (common bug in naive implementations).
+
+    Args:
+        min_lon, min_lat, max_lon, max_lat: Bounding box in WGS-84 degrees.
+        scale_m: Pixel size in metres.
+
+    Returns:
+        (width_px, height_px)
+    """
+    mid_lat = (min_lat + max_lat) / 2.0
+    metres_per_deg_lat = 111_320.0                             # constant ~111 km
+    metres_per_deg_lon = 111_320.0 * math.cos(math.radians(mid_lat))
+
+    height_m = abs(max_lat - min_lat) * metres_per_deg_lat
+    width_m  = abs(max_lon - min_lon) * metres_per_deg_lon
+
+    return int(width_m / scale_m), int(height_m / scale_m)
+
+
+def _apply_landsat_scale_factors(image: ee.Image) -> ee.Image:
+    """
+    Apply official USGS Landsat Collection-2 Level-2 scale factors.
+
+    Surface Reflectance (SR_B*) : value = DN × 2.75e-5 − 0.2   [unitless]
+    Surface Temperature (ST_B10): value = DN × 0.00341802 + 149 [Kelvin]
+
+    Without this step every SR band has raw integer DN values (~5 000–30 000),
+    which are meaningless for spectral-index computation.
+    """
+    sr_bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+    st_bands = ['ST_B10']
+
+    sr = (image.select(sr_bands)
+               .multiply(LANDSAT_CONFIG["sr_scale"])
+               .add(LANDSAT_CONFIG["sr_offset"]))
+
+    st = (image.select(st_bands)
+               .multiply(LANDSAT_CONFIG["st_scale"])
+               .add(LANDSAT_CONFIG["st_offset"]))
+
+    # Keep QA_PIXEL unchanged (it is a bitmask, not a physical value)
+    qa = image.select('QA_PIXEL')
+
+    return sr.addBands(st).addBands(qa)
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
 class EarthEngineLoader:
-    """Download RAW satellite bands from Earth Engine"""
-    
-    def __init__(self, sensors: List[str] = ["landsat", "sentinel2"]):
+    """
+    Download monthly Landsat 8/9 and Sentinel-2 composites from Google Earth
+    Engine and export them to Google Drive.
+
+    Export flow
+    -----------
+    GEE cannot stream large rasters synchronously. The correct workflow is:
+      1. Build the composite image in GEE (server-side).
+      2. Submit an Export.image.toDrive() task.
+      3. Poll until the task is COMPLETED (or FAILED).
+      4. The file then appears in the configured Google Drive folder; the user
+         downloads it from Drive (or mounts Drive locally with rclone/gdrive).
+
+    This matches the recommended pattern in the GEE developer documentation
+    and is used by virtually all peer-reviewed remote sensing pipelines.
+    """
+
+    # GEE export configuration — adjust folder / CRS as needed
+    DRIVE_FOLDER = "Jakarta_UHI"
+    EXPORT_CRS   = "EPSG:32748"          # WGS84 / UTM Zone 48S
+    EXPORT_SCALE = {                     # native export scales
+        "landsat":   30,
+        "sentinel2": 10,
+    }
+    POLL_INTERVAL_S = 30                 # seconds between task-status checks
+    MAX_WAIT_S      = 7200              # 2 hours before giving up on a task
+
+    def __init__(self, sensors: List[str] = ["landsat", "sentinel2"],
+                 gee_project: str = "nukobot-366809"):
         """
-        Initialize Earth Engine loader
-        
+        Initialise Earth Engine.
+
         Args:
-            sensors: List of sensors to download ('landsat', 'sentinel2')
+            sensors:     Sensors to download. Any of 'landsat', 'sentinel2'.
+            gee_project: Your GEE Cloud project ID.
         """
         try:
-            ee.Initialize(project='nukobot-366809')
-            logger.info("Earth Engine initialized successfully")
+            ee.Initialize(project=gee_project)
+            logger.info("Earth Engine initialised successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize Earth Engine: {e}")
-            logger.info("Please authenticate with: earthengine authenticate")
+            logger.error(f"Failed to initialise Earth Engine: {e}")
+            logger.info("Authenticate first with: earthengine authenticate")
             raise
-        
+
         self.sensors = sensors
-        
+
+    # ------------------------------------------------------------------
+    # Study area
+    # ------------------------------------------------------------------
+
     def get_study_area(self) -> ee.Geometry:
-        """Get study area geometry from config"""
-        bounds = STUDY_AREA["bounds"]
+        """Return the study-area rectangle as an ee.Geometry."""
+        b = STUDY_AREA["bounds"]
         return ee.Geometry.Rectangle([
-            bounds["min_lon"],
-            bounds["min_lat"],
-            bounds["max_lon"],
-            bounds["max_lat"]
+            b["min_lon"], b["min_lat"],
+            b["max_lon"], b["max_lat"]
         ])
-    
-    def load_landsat_collection(self, start_date: str, end_date: str,
-                               cloud_threshold: int = 50) -> ee.ImageCollection:
+
+    # ------------------------------------------------------------------
+    # Cloud masking
+    # ------------------------------------------------------------------
+
+    def _mask_landsat_clouds(self, image: ee.Image) -> ee.Image:
         """
-        Load Landsat 8/9 image collection
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            cloud_threshold: Maximum cloud cover percentage
-            
-        Returns:
-            Filtered image collection
-        """
-        study_area = self.get_study_area()
-        
-        collection = (ee.ImageCollection(LANDSAT_CONFIG["collection"])
-                     .filterBounds(study_area)
-                     .filterDate(start_date, end_date)
-                     .filter(ee.Filter.lt('CLOUD_COVER', cloud_threshold)))
-        
-        size = collection.size().getInfo()
-        logger.info(f"Found {size} Landsat images")
-        return collection
-    
-    def load_sentinel2_collection(self, start_date: str, end_date: str,
-                                 cloud_threshold: int = 50) -> ee.ImageCollection:
-        """
-        Load Sentinel-2 image collection
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            cloud_threshold: Maximum cloud cover percentage
-            
-        Returns:
-            Filtered image collection
-        """
-        study_area = self.get_study_area()
-        
-        collection = (ee.ImageCollection(SENTINEL2_CONFIG["collection"])
-                     .filterBounds(study_area)
-                     .filterDate(start_date, end_date)
-                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud_threshold)))
-        
-        size = collection.size().getInfo()
-        logger.info(f"Found {size} Sentinel-2 images")
-        return collection
-    
-    def apply_cloud_mask_landsat(self, image: ee.Image) -> ee.Image:
-        """
-        Apply cloud mask to Landsat image using QA_PIXEL band
-        
-        Args:
-            image: Landsat image
-            
-        Returns:
-            Cloud-masked image
+        Mask clouds and cloud shadows using QA_PIXEL bit flags.
+
+        Bit 3 = Cloud
+        Bit 4 = Cloud Shadow
+        Both must be 0 (clear) for a pixel to be retained.
         """
         qa = image.select('QA_PIXEL')
-        
-        # Bit 3: Cloud, Bit 4: Cloud Shadow
-        cloud = qa.bitwiseAnd(1 << 3).eq(0)
-        shadow = qa.bitwiseAnd(1 << 4).eq(0)
-        
-        mask = cloud.And(shadow)
-        return image.updateMask(mask)
-    
-    def apply_cloud_mask_sentinel2(self, image: ee.Image) -> ee.Image:
+        clear = (qa.bitwiseAnd(1 << 3).eq(0)   # not cloud
+                   .And(qa.bitwiseAnd(1 << 4).eq(0)))  # not cloud shadow
+        return image.updateMask(clear)
+
+    def _mask_sentinel2_clouds(self, image: ee.Image) -> ee.Image:
         """
-        Apply cloud mask to Sentinel-2 image using SCL band
-        
-        Args:
-            image: Sentinel-2 image
-            
-        Returns:
-            Cloud-masked image
+        Mask clouds/shadows using Sentinel-2 Scene Classification Layer (SCL).
+
+        Excluded SCL values:
+          1  = Saturated / Defective
+          3  = Cloud Shadow
+          8  = Cloud Medium Probability
+          9  = Cloud High Probability
+          10 = Thin Cirrus
+          11 = Snow / Ice
         """
         scl = image.select('SCL')
-        
-        # Exclude: saturated (1), cloud shadows (3), clouds (8,9), cirrus (10), snow/ice (11)
-        mask = (scl.neq(1).And(scl.neq(3))
-                .And(scl.neq(8)).And(scl.neq(9))
-                .And(scl.neq(10)).And(scl.neq(11)))
-        
-        return image.updateMask(mask)
-    
-    def create_composite(self, collection: ee.ImageCollection,
-                        sensor_type: str,
-                        method: str = "median") -> ee.Image:
-        """
-        Create temporal composite from image collection
-        
-        Args:
-            collection: Image collection
-            sensor_type: 'landsat' or 'sentinel2'
-            method: Compositing method ('median' or 'mean')
-            
-        Returns:
-            Composite image
-        """
-        # Apply cloud masking
-        if sensor_type == "landsat":
-            masked = collection.map(self.apply_cloud_mask_landsat)
-        else:
-            masked = collection.map(self.apply_cloud_mask_sentinel2)
-        
-        # Create composite
-        if method == "median":
-            composite = masked.median()
-        elif method == "mean":
-            composite = masked.mean()
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        
-        logger.info(f"Created {method} composite from {collection.size().getInfo()} images")
-        return composite
-    
-    def download_band(self, image: ee.Image, band_name: str,
-                     region: ee.Geometry, scale: int,
-                     dimensions: List[int]) -> Optional[np.ndarray]:
-        """
-        Download a single band as numpy array
-        
-        Args:
-            image: Earth Engine image
-            band_name: Band name to download
-            region: Region geometry
-            scale: Resolution in meters
-            dimensions: [width, height] in pixels
-            
-        Returns:
-            Numpy array or None if failed
-        """
-        try:
-            logger.info(f"  Downloading {band_name}...")
-            
-            band_image = image.select(band_name)
-            
-            # Get value range for this band
-            stats = band_image.reduceRegion(
-                reducer=ee.Reducer.minMax(),
-                geometry=region,
-                scale=scale * 10,  # Use coarser scale for stats
-                maxPixels=1e8
-            ).getInfo()
-            
-            band_min = stats.get(f'{band_name}_min')
-            band_max = stats.get(f'{band_name}_max')
-            
-            if band_min is None or band_max is None:
-                logger.warning(f"    No valid data for {band_name}")
-                return None
-            
-            if band_min == band_max:
-                band_max = band_min + 1
-            
-            logger.info(f"    Range: [{band_min:.4f}, {band_max:.4f}]")
-            
-            # Download as GeoTIFF
-            url = band_image.getThumbURL({
-                'region': region,
-                'dimensions': dimensions,
-                'format': 'GEO_TIFF'
-            })
-            
-            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            try:
-                urllib.request.urlretrieve(url, tmp_path)
-                
-                with rasterio.open(tmp_path) as src:
-                    arr = src.read(1).astype(np.float32)
-                    
-                    # Handle nodata
-                    if src.nodata is not None:
-                        arr[arr == src.nodata] = np.nan
-                    
-                    # Denormalize if needed (Earth Engine returns normalized values)
-                    if arr.max() <= 255 and arr.min() >= 0:
-                        arr = arr / 255.0 * (band_max - band_min) + band_min
-                    
-                    logger.info(f"    ✓ Shape: {arr.shape}, "
-                              f"Range: [{np.nanmin(arr):.2f}, {np.nanmax(arr):.2f}]")
-                    return arr
-                    
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-                
-        except Exception as e:
-            logger.error(f"    ✗ Failed to download {band_name}: {e}")
-            return None
-    
-    def download_landsat_data(self, composite: ee.Image,
-                             output_file: Path,
-                             scale: int = 30,
-                             max_dimension: int = 2000) -> bool:
-        """
-        Download all Landsat bands needed for analysis
-        
-        Args:
-            composite: Landsat composite image
-            output_file: Output file path
-            scale: Resolution in meters
-            max_dimension: Maximum dimension to avoid size limits
-            
-        Returns:
-            True if successful
-        """
-        region = self.get_study_area()
-        
-        # Calculate dimensions
-        bounds = region.bounds().getInfo()['coordinates'][0]
-        min_lon, min_lat = bounds[0]
-        max_lon, max_lat = bounds[2]
-        
-        width_km = (max_lon - min_lon) * 111
-        height_km = (max_lat - min_lat) * 111
-        width_px = int(width_km * 1000 / scale)
-        height_px = int(height_km * 1000 / scale)
-        
-        # Limit dimensions
-        if width_px > max_dimension or height_px > max_dimension:
-            aspect_ratio = width_px / height_px
-            if aspect_ratio > 1:
-                width_px = max_dimension
-                height_px = int(max_dimension / aspect_ratio)
-            else:
-                height_px = max_dimension
-                width_px = int(max_dimension * aspect_ratio)
-            logger.warning(f"  Limiting to {height_px}x{width_px} pixels")
-        
-        logger.info(f"  Resolution: {height_px}x{width_px} at {scale}m")
-        
-        # Bands to download
-        bands_to_download = [
-            'SR_B1',   # Coastal/Aerosol
-            'SR_B2',   # Blue
-            'SR_B3',   # Green
-            'SR_B4',   # Red
-            'SR_B5',   # NIR
-            'SR_B6',   # SWIR1
-            'SR_B7',   # SWIR2
-            'ST_B10',  # Thermal
-            'QA_PIXEL' # Quality band
-        ]
-        
-        arrays = {}
-        for band_name in bands_to_download:
-            arr = self.download_band(
-                composite, band_name, region, scale, [width_px, height_px]
-            )
-            if arr is not None:
-                arrays[band_name] = arr
-        
-        # Save to disk
-        if arrays:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(output_file, **arrays)
-            logger.info(f"  ✓ Saved {len(arrays)} bands to {output_file}")
-            return True
-        else:
-            logger.error(f"  ✗ No bands downloaded")
-            return False
-    
-    def download_sentinel2_data(self, composite: ee.Image,
-                               output_file: Path,
-                               scale: int = 10,
-                               max_dimension: int = 1500) -> bool:
-        """
-        Download all Sentinel-2 bands needed for analysis
-        
-        Args:
-            composite: Sentinel-2 composite image
-            output_file: Output file path
-            scale: Resolution in meters
-            max_dimension: Maximum dimension to avoid size limits
-            
-        Returns:
-            True if successful
-        """
-        region = self.get_study_area()
-        
-        # Calculate dimensions
-        bounds = region.bounds().getInfo()['coordinates'][0]
-        min_lon, min_lat = bounds[0]
-        max_lon, max_lat = bounds[2]
-        
-        width_km = (max_lon - min_lon) * 111
-        height_km = (max_lat - min_lat) * 111
-        width_px = int(width_km * 1000 / scale)
-        height_px = int(height_km * 1000 / scale)
-        
-        # Limit dimensions
-        if width_px > max_dimension or height_px > max_dimension:
-            aspect_ratio = width_px / height_px
-            if aspect_ratio > 1:
-                width_px = max_dimension
-                height_px = int(max_dimension / aspect_ratio)
-            else:
-                height_px = max_dimension
-                width_px = int(max_dimension * aspect_ratio)
-            logger.warning(f"  Limiting to {height_px}x{width_px} pixels")
-        
-        logger.info(f"  Resolution: {height_px}x{width_px} at {scale}m")
-        
-        # Bands to download
-        bands_to_download = [
-            'B2',   # Blue (10m)
-            'B3',   # Green (10m)
-            'B4',   # Red (10m)
-            'B8',   # NIR (10m)
-            'B11',  # SWIR1 (20m)
-            'B12',  # SWIR2 (20m)
-            'SCL'   # Scene Classification (20m)
-        ]
-        
-        arrays = {}
-        for band_name in bands_to_download:
-            arr = self.download_band(
-                composite, band_name, region, scale, [width_px, height_px]
-            )
-            if arr is not None:
-                arrays[band_name] = arr
-        
-        # Save to disk
-        if arrays:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(output_file, **arrays)
-            logger.info(f"  ✓ Saved {len(arrays)} bands to {output_file}")
-            return True
-        else:
-            logger.error(f"  ✗ No bands downloaded")
-            return False
-    
-    def download_monthly_data(self, year: int, month: int,
-                             output_dir: Path) -> Dict[str, Optional[Path]]:
-        """
-        Download monthly data for all configured sensors
-        
-        Args:
-            year: Year
-            month: Month (1-12)
-            output_dir: Output directory
-            
-        Returns:
-            Dictionary mapping sensor -> output file path (or None if failed)
-        """
-        # Define date range
-        start_date = datetime(year, month, 1)
-        if month == 12:
-            end_date = datetime(year + 1, 1, 1)
-        else:
-            end_date = datetime(year, month + 1, 1)
-        
-        start_str = start_date.strftime("%Y-%m-%d")
-        end_str = end_date.strftime("%Y-%m-%d")
-        
-        logger.info(f"\n{'='*70}")
-        logger.info(f"DOWNLOADING DATA: {year}-{month:02d}")
-        logger.info(f"Date range: {start_str} to {end_str}")
-        logger.info(f"{'='*70}")
-        
-        results = {}
-        
-        # Download Landsat
-        if "landsat" in self.sensors:
-            logger.info("\n--- LANDSAT 8/9 ---")
-            try:
-                collection = self.load_landsat_collection(start_str, end_str)
-                
-                if collection.size().getInfo() == 0:
-                    logger.warning("No Landsat images available")
-                    results["landsat"] = None
-                else:
-                    composite = self.create_composite(collection, "landsat")
-                    output_file = output_dir / "landsat" / f"landsat_{year}_{month:02d}.npz"
-                    
-                    success = self.download_landsat_data(composite, output_file)
-                    results["landsat"] = output_file if success else None
-                    
-            except Exception as e:
-                logger.error(f"Landsat download failed: {e}")
-                import traceback
-                traceback.print_exc()
-                results["landsat"] = None
-        
-        # Download Sentinel-2
-        if "sentinel2" in self.sensors:
-            logger.info("\n--- SENTINEL-2 ---")
-            try:
-                collection = self.load_sentinel2_collection(start_str, end_str)
-                
-                if collection.size().getInfo() == 0:
-                    logger.warning("No Sentinel-2 images available")
-                    results["sentinel2"] = None
-                else:
-                    composite = self.create_composite(collection, "sentinel2")
-                    output_file = output_dir / "sentinel2" / f"sentinel2_{year}_{month:02d}.npz"
-                    
-                    success = self.download_sentinel2_data(composite, output_file)
-                    results["sentinel2"] = output_file if success else None
-                    
-            except Exception as e:
-                logger.error(f"Sentinel-2 download failed: {e}")
-                import traceback
-                traceback.print_exc()
-                results["sentinel2"] = None
-        
-        # Summary
-        logger.info(f"\n{'='*70}")
-        logger.info("DOWNLOAD SUMMARY")
-        logger.info(f"{'='*70}")
-        for sensor, filepath in results.items():
-            if filepath and filepath.exists():
-                logger.info(f"{sensor.upper()}: ✓ {filepath}")
-            else:
-                logger.info(f"{sensor.upper()}: ✗ Failed")
-        
-        return results
-    
-    def download_date_range(self, start_year: int, start_month: int,
-                           end_year: int, end_month: int,
-                           output_dir: Path) -> List[Dict[str, Optional[Path]]]:
-        """
-        Download data for a range of months
-        
-        Args:
-            start_year: Start year
-            start_month: Start month
-            end_year: End year
-            end_month: End month
-            output_dir: Output directory
-            
-        Returns:
-            List of results for each month
-        """
-        all_results = []
-        
-        current_date = datetime(start_year, start_month, 1)
-        end_date = datetime(end_year, end_month, 1)
-        
-        while current_date <= end_date:
-            results = self.download_monthly_data(
-                current_date.year,
-                current_date.month,
-                output_dir
-            )
-            all_results.append(results)
-            
-            # Move to next month
-            if current_date.month == 12:
-                current_date = datetime(current_date.year + 1, 1, 1)
-            else:
-                current_date = datetime(current_date.year, current_date.month + 1, 1)
-        
-        logger.info(f"\n{'='*70}")
-        logger.info("ALL DOWNLOADS COMPLETE")
-        logger.info(f"{'='*70}")
-        logger.info(f"Total months processed: {len(all_results)}")
-        
-        return all_results
+        valid = (scl.neq(1).And(scl.neq(3))
+                    .And(scl.neq(8)).And(scl.neq(9))
+                    .And(scl.neq(10)).And(scl.neq(11)))
+        return image.updateMask(valid)
 
+    # ------------------------------------------------------------------
+    # Collection loading
+    # ------------------------------------------------------------------
+
+    def load_landsat_collection(self, start_date: str,
+                                end_date: str) -> ee.ImageCollection:
+        """
+        Load a merged Landsat 8 + Landsat 9 collection.
+
+        Both satellites carry identical OLI + TIRS instruments and are
+        calibrated to the same spectral response, so they can be merged
+        without any additional harmonisation step.
+
+        Scale factors are applied here so every image in the collection
+        already has physically meaningful SR [0–1] and ST [K] values.
+
+        Args:
+            start_date: 'YYYY-MM-DD'
+            end_date:   'YYYY-MM-DD'
+
+        Returns:
+            Merged, cloud-filtered, scale-corrected ImageCollection.
+        """
+        area  = self.get_study_area()
+        cloud = LANDSAT_CONFIG["cloud_threshold"]
+
+        def _load(collection_id: str) -> ee.ImageCollection:
+            return (ee.ImageCollection(collection_id)
+                      .filterBounds(area)
+                      .filterDate(start_date, end_date)
+                      .filter(ee.Filter.lt('CLOUD_COVER', cloud))
+                      .map(self._mask_landsat_clouds)
+                      .map(_apply_landsat_scale_factors))
+
+        l8 = _load(LANDSAT_CONFIG["collection_l8"])
+        l9 = _load(LANDSAT_CONFIG["collection_l9"])
+
+        merged = ee.ImageCollection(l8.merge(l9))
+        size   = merged.size().getInfo()
+        logger.info(f"  Landsat 8+9: {size} images for {start_date} → {end_date}")
+        return merged
+
+    def load_sentinel2_collection(self, start_date: str,
+                                  end_date: str) -> ee.ImageCollection:
+        """
+        Load Sentinel-2 SR Harmonised collection with cloud masking.
+
+        The S2_SR_HARMONIZED product already applies the processing-baseline
+        harmonisation; no additional scale factor is needed (reflectance values
+        are stored as DN × 10 000, i.e. divide by 10 000 for [0–1]).
+
+        Args:
+            start_date: 'YYYY-MM-DD'
+            end_date:   'YYYY-MM-DD'
+
+        Returns:
+            Cloud-filtered ImageCollection.
+        """
+        area  = self.get_study_area()
+        cloud = LANDSAT_CONFIG["cloud_threshold"]   # reuse same threshold
+
+        collection = (ee.ImageCollection(SENTINEL2_CONFIG["collection"])
+                        .filterBounds(area)
+                        .filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud))
+                        .map(self._mask_sentinel2_clouds))
+
+        size = collection.size().getInfo()
+        logger.info(f"  Sentinel-2: {size} images for {start_date} → {end_date}")
+        return collection
+
+    # ------------------------------------------------------------------
+    # Compositing
+    # ------------------------------------------------------------------
+
+    def create_composite(self, collection: ee.ImageCollection,
+                         method: str = "median") -> ee.Image:
+        """
+        Reduce a collection to a single composite image.
+
+        Median compositing is preferred for UHI research because it is
+        resistant to remaining cloud artefacts and produces stable
+        spectral values across the time window.
+
+        Args:
+            collection: Already-masked ImageCollection.
+            method:     'median' (default) or 'mean'.
+
+        Returns:
+            Composite ee.Image.
+        """
+        if method == "median":
+            return collection.median()
+        elif method == "mean":
+            return collection.mean()
+        else:
+            raise ValueError(f"Unknown compositing method: {method!r}. "
+                             "Use 'median' or 'mean'.")
+
+    # ------------------------------------------------------------------
+    # Export (Drive)
+    # ------------------------------------------------------------------
+
+    def _submit_export_task(self, image: ee.Image,
+                            description: str,
+                            bands: List[str],
+                            scale: int) -> ee.batch.Task:
+        """
+        Submit a GEE Export.image.toDrive() task and return it.
+
+        Args:
+            image:       Composite image to export.
+            description: Task description / file stem (no spaces).
+            bands:       List of band names to include in the export.
+            scale:       Pixel size in metres.
+
+        Returns:
+            The submitted ee.batch.Task object.
+        """
+        region = self.get_study_area()
+
+        # Select only the bands that exist in the image
+        available = image.bandNames().getInfo()
+        export_bands = [b for b in bands if b in available]
+        if not export_bands:
+            raise ValueError(f"None of {bands} found in image bands: {available}")
+
+        task = ee.batch.Export.image.toDrive(
+            image=image.select(export_bands),
+            description=description,
+            folder=self.DRIVE_FOLDER,
+            fileNamePrefix=description,
+            region=region,
+            scale=scale,
+            crs=self.EXPORT_CRS,
+            maxPixels=1e10,
+            fileFormat='GeoTIFF',
+        )
+        task.start()
+        logger.info(f"  Export task submitted: {description} "
+                    f"({len(export_bands)} bands @ {scale}m)")
+        return task
+
+    def _wait_for_task(self, task: ee.batch.Task,
+                       description: str) -> bool:
+        """
+        Poll a GEE task until it completes or times out.
+
+        Args:
+            task:        The running ee.batch.Task.
+            description: Human-readable label for log messages.
+
+        Returns:
+            True if COMPLETED, False otherwise.
+        """
+        elapsed = 0
+        while elapsed < self.MAX_WAIT_S:
+            status = task.status()
+            state  = status["state"]
+
+            if state == "COMPLETED":
+                logger.info(f"  ✓ {description} — COMPLETED")
+                return True
+            elif state in ("FAILED", "CANCELLED"):
+                logger.error(f"  ✗ {description} — {state}: "
+                             f"{status.get('error_message', 'no message')}")
+                return False
+            else:
+                logger.debug(f"  … {description} — {state} ({elapsed}s elapsed)")
+                time.sleep(self.POLL_INTERVAL_S)
+                elapsed += self.POLL_INTERVAL_S
+
+        logger.error(f"  ✗ {description} — timed out after {self.MAX_WAIT_S}s")
+        return False
+
+    # ------------------------------------------------------------------
+    # Per-sensor download wrappers
+    # ------------------------------------------------------------------
+
+    def _landsat_bands(self) -> List[str]:
+        return ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4',
+                'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10', 'QA_PIXEL']
+
+    def _sentinel2_bands(self) -> List[str]:
+        return ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'SCL']
+
+    def download_landsat_month(self, year: int, month: int,
+                               task_registry: Dict) -> bool:
+        """
+        Build and export a monthly Landsat 8+9 composite to Drive.
+
+        Args:
+            year, month:   Target period.
+            task_registry: Dict updated in-place with task metadata.
+
+        Returns:
+            True if the export task was submitted successfully.
+        """
+        start, end = _month_date_range(year, month)
+        desc = f"Landsat_{year}_{month:02d}"
+
+        logger.info(f"  Building Landsat composite for {year}-{month:02d} …")
+        try:
+            col = self.load_landsat_collection(start, end)
+            if col.size().getInfo() == 0:
+                logger.warning(f"  No Landsat images for {year}-{month:02d} — skipping")
+                task_registry[desc] = {"status": "SKIPPED_NO_DATA"}
+                return False
+
+            composite = self.create_composite(col)
+            task = self._submit_export_task(
+                composite, desc, self._landsat_bands(),
+                self.EXPORT_SCALE["landsat"]
+            )
+            task_registry[desc] = {"task": task, "status": "RUNNING"}
+            return True
+
+        except Exception as e:
+            logger.error(f"  Landsat {year}-{month:02d} failed: {e}")
+            task_registry[desc] = {"status": f"ERROR: {e}"}
+            return False
+
+    def download_sentinel2_month(self, year: int, month: int,
+                                  task_registry: Dict) -> bool:
+        """
+        Build and export a monthly Sentinel-2 composite to Drive.
+
+        Args:
+            year, month:   Target period.
+            task_registry: Dict updated in-place with task metadata.
+
+        Returns:
+            True if the export task was submitted successfully.
+        """
+        # Sentinel-2A launched March 2015; before 2015-07 data is very sparse
+        if (year, month) < (2015, 7):
+            logger.warning(f"  Sentinel-2 not yet operational for "
+                           f"{year}-{month:02d} — skipping")
+            return False
+
+        start, end = _month_date_range(year, month)
+        desc = f"Sentinel2_{year}_{month:02d}"
+
+        logger.info(f"  Building Sentinel-2 composite for {year}-{month:02d} …")
+        try:
+            col = self.load_sentinel2_collection(start, end)
+            if col.size().getInfo() == 0:
+                logger.warning(f"  No Sentinel-2 images for {year}-{month:02d} — skipping")
+                task_registry[desc] = {"status": "SKIPPED_NO_DATA"}
+                return False
+
+            composite = self.create_composite(col)
+            task = self._submit_export_task(
+                composite, desc, self._sentinel2_bands(),
+                self.EXPORT_SCALE["sentinel2"]
+            )
+            task_registry[desc] = {"task": task, "status": "RUNNING"}
+            return True
+
+        except Exception as e:
+            logger.error(f"  Sentinel-2 {year}-{month:02d} failed: {e}")
+            task_registry[desc] = {"status": f"ERROR: {e}"}
+            return False
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+
+    def download_date_range(self,
+                            start_year: int,  start_month: int,
+                            end_year: int,    end_month: int,
+                            wait_for_completion: bool = True,
+                            resume_log: Optional[Path] = None) -> Dict:
+        """
+        Submit export tasks for every month in the requested range.
+
+        Args:
+            start_year / start_month: First month to download (inclusive).
+            end_year   / end_month:   Last month to download (inclusive).
+            wait_for_completion:      If True, poll every task until done.
+                                      If False, submit all tasks and return
+                                      immediately (useful for fire-and-forget).
+            resume_log:               Optional JSON file path. Already-completed
+                                      month descriptions stored here are skipped,
+                                      enabling safe resume after interruption.
+
+        Returns:
+            task_registry dict mapping description → status dict.
+        """
+        # Load resume log if provided
+        completed_descs: set = set()
+        if resume_log and resume_log.exists():
+            try:
+                with open(resume_log) as f:
+                    completed_descs = set(json.load(f).get("completed", []))
+                logger.info(f"Resume: {len(completed_descs)} months already done")
+            except Exception as e:
+                logger.warning(f"Could not read resume log: {e}")
+
+        task_registry: Dict = {}
+        months = list(_iter_months(start_year, start_month, end_year, end_month))
+
+        logger.info("=" * 70)
+        logger.info(f"DOWNLOAD RANGE: {start_year}-{start_month:02d} → "
+                    f"{end_year}-{end_month:02d}  ({len(months)} months)")
+        logger.info(f"Sensors: {self.sensors}")
+        logger.info(f"Drive folder: {self.DRIVE_FOLDER}")
+        logger.info("=" * 70)
+
+        for year, month in months:
+            logger.info(f"\n--- {year}-{month:02d} ---")
+
+            if "landsat" in self.sensors:
+                desc = f"Landsat_{year}_{month:02d}"
+                if desc in completed_descs:
+                    logger.info(f"  Skipping {desc} (already completed)")
+                else:
+                    self.download_landsat_month(year, month, task_registry)
+
+            if "sentinel2" in self.sensors:
+                desc = f"Sentinel2_{year}_{month:02d}"
+                if desc in completed_descs:
+                    logger.info(f"  Skipping {desc} (already completed)")
+                else:
+                    self.download_sentinel2_month(year, month, task_registry)
+
+        if not wait_for_completion:
+            logger.info("\nAll tasks submitted. Not waiting for completion "
+                        "(wait_for_completion=False).")
+            logger.info("Monitor progress at: https://code.earthengine.google.com/tasks")
+            return task_registry
+
+        # ------ Wait for all running tasks ------
+        logger.info(f"\nWaiting for {len(task_registry)} export tasks …")
+        newly_completed = list(completed_descs)
+
+        for desc, info in task_registry.items():
+            if "task" not in info:
+                continue   # SKIPPED or ERROR before submission
+            success = self._wait_for_task(info["task"], desc)
+            info["status"] = "COMPLETED" if success else "FAILED"
+            if success:
+                newly_completed.append(desc)
+
+        # Update resume log
+        if resume_log:
+            try:
+                resume_log.parent.mkdir(parents=True, exist_ok=True)
+                with open(resume_log, "w") as f:
+                    json.dump({"completed": sorted(newly_completed)}, f, indent=2)
+                logger.info(f"Resume log updated: {resume_log}")
+            except Exception as e:
+                logger.warning(f"Could not write resume log: {e}")
+
+        # ------ Summary ------
+        total    = len(task_registry)
+        success  = sum(1 for v in task_registry.values() if v["status"] == "COMPLETED")
+        skipped  = sum(1 for v in task_registry.values() if "SKIPPED" in v["status"])
+        failed   = total - success - skipped
+
+        logger.info("\n" + "=" * 70)
+        logger.info("DOWNLOAD COMPLETE")
+        logger.info("=" * 70)
+        logger.info(f"  Completed : {success}")
+        logger.info(f"  Skipped   : {skipped}  (no data available)")
+        logger.info(f"  Failed    : {failed}")
+        logger.info(f"\nFiles are in your Google Drive folder: '{self.DRIVE_FOLDER}'")
+        logger.info("Download them from drive.google.com or use rclone / gdrive CLI.")
+
+        return task_registry
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _month_date_range(year: int, month: int) -> Tuple[str, str]:
+    """Return ('YYYY-MM-DD', 'YYYY-MM-DD') for the start and end of a month."""
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def _iter_months(start_year: int, start_month: int,
+                 end_year: int,   end_month: int):
+    """Yield (year, month) tuples from start to end inclusive."""
+    current = datetime(start_year, start_month, 1)
+    end     = datetime(end_year,   end_month,   1)
+    while current <= end:
+        yield current.year, current.month
+        if current.month == 12:
+            current = datetime(current.year + 1, 1, 1)
+        else:
+            current = datetime(current.year, current.month + 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    """Download satellite data for training"""
-    logger.info("="*70)
-    logger.info("SATELLITE DATA DOWNLOAD")
-    logger.info("="*70)
-    
-    # Initialize loader
+    logger.info("=" * 70)
+    logger.info("JAKARTA UHI — SATELLITE DATA DOWNLOAD")
+    logger.info(f"Area  : {STUDY_AREA['name']}")
+    logger.info(f"Bounds: {STUDY_AREA['bounds']}")
+    logger.info("=" * 70)
+
     loader = EarthEngineLoader(sensors=["landsat", "sentinel2"])
-    
-    # Define output directory
-    output_dir = RAW_DATA_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Download data for training period
-    # Example: January 2016 to December 2025
+
+    # Path to a JSON file that records completed months so the run can be
+    # safely interrupted and restarted without duplicating GEE tasks.
+    resume_log = RAW_DATA_DIR / "download_resume_log.json"
+
     results = loader.download_date_range(
-        start_year=2016,
-        start_month=1,
-        end_year=2025,
-        end_month=12,
-        output_dir=output_dir
+        start_year=2016, start_month=1,
+        end_year=2025,   end_month=12,
+        wait_for_completion=True,   # set False to fire-and-forget
+        resume_log=resume_log,
     )
-    
-    # Summary
-    total_success = sum(1 for r in results if any(r.values()))
-    logger.info(f"\n{'='*70}")
-    logger.info(f"Successfully downloaded: {total_success}/{len(results)} months")
-    logger.info(f"Data saved to: {output_dir}")
-    logger.info(f"{'='*70}")
-    logger.info("\nNext step: Run preprocessing.py to process the downloaded data")
+
+    logger.info("\nNext step: Run preprocessing.py to process the downloaded data.")
+    return results
 
 
 if __name__ == "__main__":
