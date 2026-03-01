@@ -1,6 +1,8 @@
 """
-IMPROVED Configuration file for Urban Heat Island Detection System
-Changes focus on: reducing overfitting, better generalization, stronger regularization
+Configuration file for Urban Heat Island Detection System
+Study area  : Greater Jakarta (Jabodetabek)
+Satellite   : Landsat 8 + Landsat 9 only
+Date range  : January 2016 – December 2025
 """
 import os
 from pathlib import Path
@@ -27,17 +29,16 @@ for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, MODEL_DIR, OUTPUT_D
 # Extended slightly beyond admin boundary to capture urban fringe / rural reference
 # ============================================================================
 STUDY_AREA = {
-    "name": "Jakarta Metropolitan Area (DKI Jakarta)",
+    "name": "Greater Jakarta (Jabodetabek)",
     "bounds": {
-        "min_lon": 106.65,   # Western edge (Jakarta Barat coast)
-        "max_lon": 107.00,   # Eastern edge (Jakarta Timur boundary)
-        "min_lat": -6.40,    # Southern edge (Jakarta Selatan border)
-        "max_lat": -6.00,    # Northern edge (includes Kepulauan Seribu waters)
+        "min_lon": 106.40,   # Western edge — covers Tangerang / Banten fringe
+        "max_lon": 107.20,   # Eastern edge — covers Bekasi / Karawang border
+        "min_lat":  -6.70,   # Southern edge — covers Depok / Bogor outskirts
+        "max_lat":  -6.00,   # Northern edge — includes Jakarta Bay coastline
     },
-    # NOTE: Kepulauan Seribu extends far north (~-5.4°), but including the full
-    # archipelago chain adds mostly open sea. Set max_lat=-5.85 to include the
-    # nearest island cluster while keeping the AOI manageable. Adjust if needed.
-    "epsg": 32748,  # WGS84 / UTM Zone 48S
+    # Jabodetabek: Jakarta, Bogor, Depok, Tangerang, Bekasi
+    # EPSG:32748 — WGS84 / UTM Zone 48S; standard projection for Java.
+    "epsg": 32748,
     "buffer_km": 5
 }
 
@@ -76,24 +77,6 @@ LANDSAT_CONFIG = {
     "thermal_scale": 100    # meters (TIRS native, resampled to 30 m in C2)
 }
 
-SENTINEL2_CONFIG = {
-    "collection": "COPERNICUS/S2_SR_HARMONIZED",
-    "bands": {
-        "blue":  "B2",
-        "green": "B3",
-        "red":   "B4",
-        "nir":   "B8",
-        "swir1": "B11",
-        "swir2": "B12",
-        "scl":   "SCL"
-    },
-    # SCL classes to mask out:
-    # 1=Saturated/Defective, 3=Cloud Shadow, 8=Cloud Med, 9=Cloud High,
-    # 10=Cirrus, 11=Snow/Ice
-    "cloud_classes": [1, 3, 8, 9, 10, 11],
-    "scale": 10  # meters
-}
-
 # Landsat 8/9 TIRS thermal constants (Band 10)
 THERMAL_CONSTANTS = {
     "K1": 774.8853,       # W/(m²·sr·μm)
@@ -107,8 +90,8 @@ THERMAL_CONSTANTS = {
 # ============================================================================
 DATE_RANGE = {
     # Full download window — 10 years of data (2016-01-01 to 2025-12-31)
-    # NOTE: Sentinel-2A launched March 2015; regular S2 data for Indonesia
-    # is available from mid-2015. Landsat 8 data is available from 2013.
+    # Landsat 8 operational from April 2013; Landsat 9 from September 2021.
+    # Both are available for the full 2016–2025 range (L9 contributes from late 2021).
     "all_data_start": "2016-01-01",
     "all_data_end":   "2025-12-31",
 
@@ -350,9 +333,14 @@ NAFAS_CONFIG = {
 
 BMKG_CONFIG = {
     "stations": [
-        {"id": "96749", "name": "Kemayoran",    "lat": -6.1667, "lon": 106.8500},
-        {"id": "96745", "name": "Tanjung Priok","lat": -6.1167, "lon": 106.8833},
-        {"id": "96747", "name": "Halim",        "lat": -6.2667, "lon": 106.8833}
+        {"id": "96749", "name": "Kemayoran (Jakarta Pusat)",   "lat": -6.1667, "lon": 106.8500},
+        {"id": "96745", "name": "Tanjung Priok (Jakarta Utara)","lat": -6.1167, "lon": 106.8833},
+        {"id": "96747", "name": "Halim (Jakarta Timur)",       "lat": -6.2667, "lon": 106.8833},
+        {"id": "96743", "name": "Soekarno-Hatta (Tangerang)",  "lat": -6.1167, "lon": 106.6500},
+        {"id": "96751", "name": "Pondok Betung (Tangerang Sel.)","lat": -6.2833, "lon": 106.7333},
+        {"id": "96753", "name": "Citeko (Bogor)",              "lat": -6.7000, "lon": 107.0333},
+        {"id": "96757", "name": "Depok",                       "lat": -6.4000, "lon": 106.8333},
+        {"id": "96759", "name": "Bekasi",                      "lat": -6.2333, "lon": 107.0000},
     ]
 }
 

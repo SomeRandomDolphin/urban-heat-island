@@ -85,9 +85,9 @@ class DecoderBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    """U-Net architecture for LST prediction"""
+    """U-Net architecture for LST prediction (Landsat-only: 10 input channels)"""
     
-    def __init__(self, in_channels: int = 15, out_channels: int = 1):
+    def __init__(self, in_channels: int = 10, out_channels: int = 1):
         super().__init__()
         
         filters = CNN_CONFIG["filters"]
@@ -676,12 +676,12 @@ def initialize_weights(model):
 
 
 def test_model():
-    """Test model architecture"""
-    model = UNet(in_channels=15, out_channels=1)
+    """Test model architecture (Landsat-only: 10 channels)"""
+    model = UNet(in_channels=10, out_channels=1)
     initialize_weights(model)
     
     # Test forward pass
-    x = torch.randn(2, 15, 128, 128)
+    x = torch.randn(2, 10, 128, 128)
     y = model(x)
     
     print(f"Input shape: {x.shape}")
@@ -689,9 +689,9 @@ def test_model():
     print(f"Total parameters: {count_parameters(model):,}")
     
     # Test loss
-    criterion = LSTLoss()
+    criterion = ProgressiveLSTLoss()
     target = torch.randn(2, 1, 128, 128)
-    loss, components = criterion(y, target, x)
+    loss, components = criterion(y, target)
     
     print(f"Total loss: {loss.item():.4f}")
     print(f"Loss components: {components}")
