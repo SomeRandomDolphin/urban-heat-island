@@ -18,14 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class ConvBlock(nn.Module):
-    """Convolutional block with BatchNorm and activation"""
+    """Convolutional block with BatchNorm, activation, and residual connection"""
     
     def __init__(self, in_channels: int, out_channels: int, 
                  dropout: float = 0.1, use_batchnorm: bool = True):
         super().__init__()
         
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=not use_batchnorm)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=not use_batchnorm)
         
         self.bn1 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
         self.bn2 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
@@ -33,17 +33,26 @@ class ConvBlock(nn.Module):
         self.dropout = nn.Dropout2d(dropout)
         self.relu = nn.ReLU(inplace=True)
         
+        # Residual projection: needed when in_channels != out_channels
+        self.residual = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
+        
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
+        identity = self.residual(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
         
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
+        out = self.conv2(out)
+        out = self.bn2(out)
         
-        x = self.dropout(x)
-        return x
+        out = out + identity          # residual shortcut
+        out = self.relu(out)
+        out = self.dropout(out)
+        return out
 
 
 class EncoderBlock(nn.Module):
@@ -84,8 +93,55 @@ class DecoderBlock(nn.Module):
         return x
 
 
+class ASPPBlock(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling — captures multi-scale context at the
+    bottleneck, critical for urban scenes where heat sources span 1–10 pixels.
+    """
+    def __init__(self, in_channels: int, out_channels: int,
+                 dilations: tuple = (1, 2, 4, 8)):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                          padding=d, dilation=d, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+            for d in dilations
+        ])
+        # Global pooling branch
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        # Projection: fuse (len(dilations)+1) branches → out_channels
+        self.proj = nn.Sequential(
+            nn.Conv2d(out_channels * (len(dilations) + 1), out_channels,
+                      kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.3),
+        )
+
+    def forward(self, x):
+        h, w = x.shape[2], x.shape[3]
+        outs = [b(x) for b in self.branches]
+        gp = self.global_pool(x)
+        gp = F.interpolate(gp, size=(h, w), mode='bilinear', align_corners=False)
+        outs.append(gp)
+        return self.proj(torch.cat(outs, dim=1))
+
+
 class UNet(nn.Module):
-    """U-Net architecture for LST prediction (Landsat-only: 10 input channels)"""
+    """U-Net architecture for LST prediction (Landsat-only: 10 input channels)
+    
+    Improvements:
+    - Residual connections in ConvBlock (better gradient flow)
+    - ASPP bottleneck (multi-scale urban context)
+    """
     
     def __init__(self, in_channels: int = 10, out_channels: int = 1):
         super().__init__()
@@ -99,8 +155,9 @@ class UNet(nn.Module):
         self.enc3 = EncoderBlock(filters[1], filters[2], dropout_rates[2])
         self.enc4 = EncoderBlock(filters[2], filters[3], dropout_rates[3])
         
-        # Bottleneck
-        self.bottleneck = ConvBlock(filters[3], filters[4], dropout_rates[4])
+        # Bottleneck: ASPP replaces plain ConvBlock for multi-scale context
+        self.bottleneck = ASPPBlock(filters[3], filters[4],
+                                    dilations=(1, 2, 4, 8))
         
         # Decoder
         self.dec4 = DecoderBlock(filters[4], filters[3], dropout_rates[3])
@@ -118,7 +175,7 @@ class UNet(nn.Module):
         x, skip3 = self.enc3(x)
         x, skip4 = self.enc4(x)
         
-        # Bottleneck
+        # Bottleneck (ASPP)
         x = self.bottleneck(x)
         
         # Decoder path with skip connections
@@ -169,29 +226,29 @@ class ProgressiveLSTLoss(nn.Module):
 
         if progress < 0.3:
             # Phase 1 – WARMUP: lead with weighted MSE; light regularisation
-            self.mse_weight      = 0.65
-            self.variance_weight = 0.10
-            self.range_weight    = 0.10
+            self.mse_weight      = 0.55
+            self.variance_weight = 0.18   # stronger than before to resist collapse early
+            self.range_weight    = 0.15
             self.bias_weight     = 0.05
-            self.gradient_weight = 0.10
+            self.gradient_weight = 0.07
             phase = "WARMUP"
 
         elif progress < 0.6:
             # Phase 2 – REFINEMENT: increase variance/range pressure
-            self.mse_weight      = 0.50
-            self.variance_weight = 0.18
-            self.range_weight    = 0.18
+            self.mse_weight      = 0.40
+            self.variance_weight = 0.25   # was 0.18
+            self.range_weight    = 0.22   # was 0.18
             self.bias_weight     = 0.07
-            self.gradient_weight = 0.07
+            self.gradient_weight = 0.06
             phase = "REFINEMENT"
 
         else:
-            # Phase 3 – FINE-TUNING: balance all terms
-            self.mse_weight      = 0.40
-            self.variance_weight = 0.22
-            self.range_weight    = 0.20
-            self.bias_weight     = 0.10
-            self.gradient_weight = 0.08
+            # Phase 3 – FINE-TUNING: max variance / range pressure
+            self.mse_weight      = 0.33
+            self.variance_weight = 0.30   # was 0.22
+            self.range_weight    = 0.25   # was 0.20
+            self.bias_weight     = 0.07
+            self.gradient_weight = 0.05
             phase = "FINE-TUNING"
 
         if epoch % 20 == 0:
@@ -224,15 +281,22 @@ class ProgressiveLSTLoss(nn.Module):
         mse = (weights * (pred - target) ** 2).mean()
         components['mse'] = mse.item()
 
-        # ── 2. Variance preservation ──────────────────────────────────────────
+        # ── 2. Variance preservation (asymmetric) ─────────────────────────────
+        # Penalise under-variance 3× more than over-variance, since the observed
+        # failure mode is pred_std < target_std (compression to mean).
         pred_std   = pred.std()   + 1e-8
         target_std = target.std() + 1e-8
         std_ratio  = pred_std / target_std
-        variance_loss = torch.log(std_ratio) ** 2   # 0 when ratio = 1, symmetric
+        # Asymmetric: under-variance (ratio < 1) costs 3× more
+        sym_log     = torch.log(std_ratio) ** 2
+        asym_boost  = torch.where(std_ratio < 1.0,
+                                  torch.tensor(3.0, device=pred.device),
+                                  torch.tensor(1.0, device=pred.device))
+        variance_loss = sym_log * asym_boost
         components['variance']  = variance_loss.item()
         components['std_ratio'] = std_ratio.item()
 
-        # ── 3. Slope penalty (range compression) ─────────────────────────────
+        # ── 3. Slope penalty (range compression) — asymmetric ─────────────────
         pred_flat     = pred.flatten()
         target_flat   = target.flatten()
         pred_c        = pred_flat   - pred_flat.mean()
@@ -240,7 +304,12 @@ class ProgressiveLSTLoss(nn.Module):
         cov           = (pred_c * target_c).mean()
         target_var    = (target_c ** 2).mean() + 1e-8
         slope         = cov / target_var
-        slope_loss    = (slope - 1.0) ** 2
+        # Asymmetric: penalise slope < 1 (under-spread) 3× harder than slope > 1
+        raw_slope_loss = (slope - 1.0) ** 2
+        asym_slope = torch.where(slope < 1.0,
+                                 torch.tensor(3.0, device=pred.device),
+                                 torch.tensor(1.0, device=pred.device))
+        slope_loss    = raw_slope_loss * asym_slope
         components['slope'] = slope.item()
         components['range'] = slope_loss.item()
 

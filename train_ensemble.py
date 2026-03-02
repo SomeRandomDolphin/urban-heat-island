@@ -210,6 +210,14 @@ class DiagnosticsPlotter:
             mask    = np.isfinite(preds) & np.isfinite(targets)
             preds, targets = preds[mask], targets[mask]
 
+            # Subsample to avoid OOM on large CNN output arrays (>100 k points)
+            _MAX_PLOT_PTS = 100_000
+            if len(preds) > _MAX_PLOT_PTS:
+                _rng = np.random.default_rng(seed=42)
+                _idx = _rng.choice(len(preds), size=_MAX_PLOT_PTS, replace=False)
+                _idx.sort()
+                preds, targets = preds[_idx], targets[_idx]
+
             # Denormalise if values look normalised (mean ≈ 0, std ≈ 1)
             _ns = load_normalization_stats()
             if _ns is not None and abs(targets.mean()) < 5.0 and targets.std() < 5.0:
@@ -282,6 +290,12 @@ class DiagnosticsPlotter:
             self._use_style()
             p = np.asarray(preds).flatten()
             t = np.asarray(targets).flatten()
+            # Subsample to avoid OOM
+            _MAX_PLOT_PTS = 100_000
+            if len(p) > _MAX_PLOT_PTS:
+                _rng = np.random.default_rng(seed=42)
+                _idx = _rng.choice(len(p), size=_MAX_PLOT_PTS, replace=False)
+                p, t = p[_idx], t[_idx]
             # Denormalise if values look normalised
             _ns = load_normalization_stats()
             if _ns is not None and abs(t.mean()) < 5.0 and t.std() < 5.0:
@@ -527,6 +541,12 @@ class DiagnosticsPlotter:
             targets = np.asarray(targets).flatten()
             mask    = np.isfinite(preds) & np.isfinite(targets)
             preds, targets = preds[mask], targets[mask]
+            # Subsample to avoid OOM
+            _MAX_PLOT_PTS = 100_000
+            if len(preds) > _MAX_PLOT_PTS:
+                _rng = np.random.default_rng(seed=42)
+                _idx = _rng.choice(len(preds), size=_MAX_PLOT_PTS, replace=False)
+                preds, targets = preds[_idx], targets[_idx]
             # Denormalise so bin centres are in °C
             _ns = load_normalization_stats()
             if _ns is not None and abs(targets.mean()) < 5.0 and targets.std() < 5.0:
@@ -913,6 +933,26 @@ def prepare_gbm_features(X: np.ndarray, y: np.ndarray,
 
     features_df = pd.DataFrame(features_list)
 
+    # ── Cross-channel ratio features (vegetation / built-up proxies) ─────────
+    # Channels: 0=coastal,1=blue,2=green,3=red,4=nir,5=swir1,6=swir2,7=thermal,8=qa,9=extra
+    # These ratios mirror NDVI, NDBI, MNDWI which are the strongest UHI predictors.
+    eps = 1e-8
+    try:
+        nir  = features_df["ch4_mean"]; red   = features_df["ch3_mean"]
+        swir = features_df["ch5_mean"]; green = features_df["ch2_mean"]
+        blue = features_df["ch1_mean"]
+        features_df["feat_ndvi"]  = (nir - red)   / (nir + red   + eps)
+        features_df["feat_ndbi"]  = (swir - nir)  / (swir + nir  + eps)
+        features_df["feat_mndwi"] = (green - swir) / (green + swir + eps)
+        features_df["feat_ui"]    = (swir - nir)  / (swir + nir  + eps)   # urban index
+        features_df["feat_ebbi"]  = (swir - nir)  / (10 * np.sqrt(np.abs(swir) + eps))
+        # Interaction: NDVI × NDBI captures urban-fringe contrast
+        features_df["feat_ndvi_ndbi"] = features_df["feat_ndvi"] * features_df["feat_ndbi"]
+        logger.info("  Added 6 cross-channel ratio features (NDVI, NDBI, MNDWI, UI, EBBI, interaction)")
+    except KeyError as _ke:
+        logger.warning(f"Cross-channel features skipped (missing channel): {_ke}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── FIX 6: Append CNN bottleneck features if provided ────────────────────
     if cnn_bottleneck_feats is not None:
         bot_cols = [f"cnn_bot_{i}" for i in range(cnn_bottleneck_feats.shape[1])]
@@ -981,12 +1021,13 @@ class GBMTrainer:
     """Trainer for Gradient Boosting Model - Tracks BEST model"""
     
     def __init__(self, config=None):
-        # Use GBM_CONFIG from config.py (already tuned to prevent overfitting:
-        #   num_leaves=31, max_depth=6, min_child_samples=200, stronger L1/L2)
         self.config = config or GBM_CONFIG["params"]
         self.model = None
-        self.best_model = None  # ADDED: Track best model
-        self.best_score = float('inf')  # ADDED: Track best validation RMSE
+        self.best_model = None
+        self.best_score = float('inf')
+        # Post-hoc slope calibration params (fitted on val set after training)
+        self._cal_slope = 1.0
+        self._cal_intercept = 0.0
         
     def train(self, X_train: pd.DataFrame, y_train: np.ndarray,
               X_val: pd.DataFrame, y_val: np.ndarray):
@@ -996,14 +1037,21 @@ class GBMTrainer:
         train_data = lgb.Dataset(X_train, label=y_train)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
         
+        # Use early_stopping_rounds from config, fall back to 75
+        es_rounds = self.config.get("early_stopping_rounds", 75)
         callbacks = [
-            lgb.early_stopping(stopping_rounds=50),
+            lgb.early_stopping(stopping_rounds=es_rounds),
             lgb.log_evaluation(period=100)
         ]
         
+        # Build training params without keys that aren't LightGBM params
+        train_params = {k: v for k, v in self.config.items()
+                        if k not in ("early_stopping_rounds",)}
+        
         self.model = lgb.train(
-            self.config,
+            train_params,
             train_data,
+            num_boost_round=train_params.get("n_estimators", 3000),
             valid_sets=[train_data, val_data],
             valid_names=['train', 'val'],
             callbacks=callbacks
@@ -1011,31 +1059,58 @@ class GBMTrainer:
         
         logger.info(f"GBM training complete. Best iteration: {self.model.best_iteration}")
         
-        # ADDED: Evaluate and save as best if it's better
-        val_preds = self.model.predict(X_val, num_iteration=self.model.best_iteration)
-        val_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+        # Evaluate on val set
+        val_preds_raw = self.model.predict(X_val, num_iteration=self.model.best_iteration)
+        val_rmse = np.sqrt(mean_squared_error(y_val, val_preds_raw))
         
         if val_rmse < self.best_score:
             self.best_score = val_rmse
             self.best_model = self.model
             logger.info(f"✅ New best GBM model: RMSE={val_rmse:.4f} (normalized)")
         
+        # ── Post-hoc slope calibration (std-ratio method) ─────────────────────
+        # GBM suffers from regression-dilution: slope < 1 at val time.
+        # We fit a linear recalibration y_cal = a * y_raw + b on the val set
+        # such that cal_slope → 1.0 and bias → 0. This is saved and applied
+        # at prediction time, correcting range compression without retraining.
+        from scipy.stats import linregress as _lr
+        _pred_std  = float(val_preds_raw.std())
+        _tgt_std   = float(y_val.std())
+        _pred_mean = float(val_preds_raw.mean())
+        _tgt_mean  = float(y_val.mean())
+        self._cal_slope     = _tgt_std / (_pred_std + 1e-8)
+        self._cal_intercept = _tgt_mean - self._cal_slope * _pred_mean
+        _cal_preds = self._cal_slope * val_preds_raw + self._cal_intercept
+        _r2_before = r2_score(y_val, val_preds_raw)
+        _r2_after  = r2_score(y_val, _cal_preds)
+        _sl_before = _lr(val_preds_raw, y_val)[0]
+        _sl_after  = _lr(_cal_preds, y_val)[0]
+        logger.info(f"GBM slope calibration: a={self._cal_slope:.4f}, b={self._cal_intercept:.4f}")
+        logger.info(f"  R²  before={_r2_before:.4f}  after={_r2_after:.4f}")
+        logger.info(f"  Slope before={_sl_before:.4f}  after={_sl_after:.4f}")
+        # ─────────────────────────────────────────────────────────────────────
+
         return self.model
     
-    def predict(self, X: pd.DataFrame, use_best: bool = True) -> np.ndarray:
+    def predict(self, X: pd.DataFrame, use_best: bool = True,
+                calibrate: bool = True) -> np.ndarray:
         """
-        Make predictions
+        Make predictions, optionally applying post-hoc slope calibration.
         
         Args:
             X: Features
             use_best: If True, use best_model; if False, use current model
+            calibrate: If True, apply slope calibration fitted on val set
         """
         model_to_use = self.best_model if (use_best and self.best_model is not None) else self.model
         
         if model_to_use is None:
             raise ValueError("Model not trained yet!")
         
-        return model_to_use.predict(X, num_iteration=model_to_use.best_iteration)
+        preds = model_to_use.predict(X, num_iteration=model_to_use.best_iteration)
+        if calibrate:
+            preds = self._cal_slope * preds + self._cal_intercept
+        return preds
     
     def save(self, path: Path):
         """Save both best and final models"""
@@ -2128,6 +2203,13 @@ class EnsembleTrainer:
             elif key == "ensemble_metrics":
                 if isinstance(values, dict):
                     history_serializable[key] = {k: float(v) for k, v in values.items()}
+            elif key == "ensemble_comparison":
+                # dict[str, dict] — serialize each strategy's metrics
+                if isinstance(values, dict):
+                    history_serializable[key] = {
+                        strategy_name: {k: float(v) for k, v in m.items()}
+                        for strategy_name, m in values.items()
+                    }
             else:
                 history_serializable[key] = [float(v) for v in values]
         

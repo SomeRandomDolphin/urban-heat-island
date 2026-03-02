@@ -172,27 +172,30 @@ CNN_CONFIG = {
 GBM_CONFIG = {
     "algorithm": "lightgbm",
     "params": {
-        "objective": "regression",
-        "metric": "rmse",
+        # IMPROVED: huber objective is more robust to outliers than mse/rmse
+        # and produces less slope compression at the tails.
+        "objective": "huber",
+        "alpha": 0.9,             # huber quantile — focus on upper range (hot areas)
+        "metric": "huber",
         "boosting_type": "gbdt",
 
-        "num_leaves": 31,   # Was 127
-        "max_depth": 6,     # Was 12
+        "num_leaves": 63,         # was 31 — more capacity to fit non-linear tails
+        "max_depth": 8,           # was 6
 
-        "learning_rate": 0.05,
-        "n_estimators": 2000,
+        "learning_rate": 0.03,    # was 0.05 — slower + more trees for better generalisation
+        "n_estimators": 3000,     # was 2000
 
-        "subsample": 0.7,
+        "subsample": 0.75,
         "subsample_freq": 1,
-        "colsample_bytree": 0.4,
+        "colsample_bytree": 0.5,  # was 0.4
 
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.0,
-        "min_child_samples": 50,
+        "reg_alpha": 0.5,         # was 1.0 — slightly less L1 to allow slope recovery
+        "reg_lambda": 0.5,        # was 1.0
+        "min_child_samples": 30,  # was 50 — allows better tail fitting
         "min_child_weight": 1e-3,
-        "min_split_gain": 0.01,
+        "min_split_gain": 0.001,  # was 0.01
 
-        "early_stopping_rounds": 50,
+        "early_stopping_rounds": 75,  # was 50 — more patient
         "verbose": 100,
     }
 }
@@ -210,11 +213,11 @@ TRAINING_CONFIG = {
     "batch_size": 16,
     "epochs": 500,
 
-    "initial_lr": 0.001,
+    "initial_lr": 0.002,    # was 0.001 — higher start for faster initial convergence
     "min_lr": 1e-6,
-    "warmup_epochs": 10,
+    "warmup_epochs": 15,    # was 10
 
-    "patience": 50,
+    "patience": 60,         # was 50 — give more room with SGDR restarts
     "min_delta": 0.0005,
 
     "optimizer": "adamw",
