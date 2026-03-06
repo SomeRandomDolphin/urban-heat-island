@@ -58,7 +58,7 @@ _SENTINEL2_BAND_ORDER = ["B2", "B3", "B4", "B8", "B11", "B12", "SCL"]
 # The value can also be overridden via an environment variable:
 #   export UHI_MAX_PIXELS=8000000
 import os as _os
-_DEFAULT_MAX_PIXELS = 8_000_000
+_DEFAULT_MAX_PIXELS = 2_000_000
 MAX_PIXELS: int = int(_os.environ.get("UHI_MAX_PIXELS", _DEFAULT_MAX_PIXELS))
 
 
@@ -313,7 +313,15 @@ class PreprocessingDiagnostics:
 
         for ax, key in zip(axes, keys):
             arr = raw_data[key]
-            vmin, vmax = np.nanpercentile(arr, [2, 98])
+            valid = arr[np.isfinite(arr)]
+            if valid.size >= 2:
+                vmin, vmax = np.nanpercentile(valid, [2, 98])
+                if vmax - vmin < 1e-6:
+                    vmin, vmax = valid.min(), valid.max()
+                if vmax - vmin < 1e-6:
+                    vmin, vmax = vmin - 0.05, vmax + 0.05
+            else:
+                vmin, vmax = 0.0, 1.0
             im = ax.imshow(arr, cmap="viridis", vmin=vmin, vmax=vmax)
             ax.set_title(key, fontsize=9)
             ax.axis("off")
@@ -354,7 +362,13 @@ class PreprocessingDiagnostics:
 
         for ax, key in zip(axes, keys):
             arr = indices[key]
-            vmin, vmax = np.nanpercentile(arr[np.isfinite(arr)], [2, 98])
+            valid = arr[np.isfinite(arr)]
+            if valid.size >= 2:
+                vmin, vmax = np.nanpercentile(valid, [2, 98])
+                if vmax - vmin < 1e-6:
+                    vmin, vmax = valid.min(), valid.max()
+            else:
+                vmin, vmax = 0.0, 1.0
             cmap = index_cmaps.get(key, "viridis")
             im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
             suffix = "°C" if key == "LST" else ""
@@ -429,6 +443,7 @@ class PreprocessingDiagnostics:
 
         fig.suptitle("Land Surface Temperature – Validation Diagnostics",
                      fontsize=13, fontweight="bold")
+        plt.tight_layout()
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
@@ -493,51 +508,167 @@ class PreprocessingDiagnostics:
     # 5. Patch quality diagnostics
     # ------------------------------------------------------------------
     def plot_patch_diagnostics(self, patches: list,
+                                raster_data: dict = None,
+                                n_preview: int = 12,
                                 filename: str = "05_patch_diagnostics.png"):
-        """Distributions of per-patch LST statistics + example patches."""
+        """
+        Distributions of per-patch LST statistics + optional visual patch previews.
+
+        Patches produced by DatasetCreator.extract_patches() store only
+        position and lightweight statistics  (no data copy):
+            {"position": (row, col), "_lst_mean": float, "_lst_std": float}
+
+        Args:
+            patches      : list of patch dicts from extract_patches()
+            raster_data  : full raster dict (optional).  When provided, a fourth
+                           row of visual patch thumbnails is added — showing the
+                           raw LST slice for a sample of patches spanning the
+                           temperature distribution.  This is useful to diagnose
+                           NaN-fill artefacts (flat blobs) and fusion edge effects.
+            n_preview    : number of patch thumbnails to show (default 12)
+            filename     : output filename
+        """
         if not patches:
             logger.warning("[Diagnostics] plot_patch_diagnostics: no patches.")
             return
 
-        means = [np.nanmean(p["data"]["LST"]) for p in patches]
-        stds  = [np.nanstd(p["data"]["LST"])  for p in patches]
-        mins  = [np.nanmin(p["data"]["LST"])   for p in patches]
-        maxs  = [np.nanmax(p["data"]["LST"])   for p in patches]
+        # Extract per-patch stats — fall back gracefully if keys are missing
+        means = [p.get("_lst_mean", np.nan) for p in patches]
+        stds  = [p.get("_lst_std",  np.nan) for p in patches]
+        means = np.array(means, dtype=float)
+        stds  = np.array(stds,  dtype=float)
 
-        fig = plt.figure(figsize=(16, 10))
-        gs = gridspec.GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.35)
+        # Filter out NaN entries (patches that stored no stats)
+        valid = np.isfinite(means) & np.isfinite(stds)
+        means_v = means[valid]
+        stds_v  = stds[valid]
 
-        # Distributions
-        for col, (vals, label, color) in enumerate(zip(
-                [means, stds, mins, maxs],
-                ["Patch LST Mean (°C)", "Patch LST Std (°C)",
-                 "Patch LST Min (°C)", "Patch LST Max (°C)"],
-                ["steelblue", "darkorange", "seagreen", "crimson"])):
-            ax = fig.add_subplot(gs[0, col])
-            ax.hist(vals, bins=40, color=color, edgecolor="white", alpha=0.85)
-            ax.axvline(np.mean(vals), color="black", linestyle="--", lw=1.5,
-                       label=f"μ={np.mean(vals):.1f}")
-            ax.set_xlabel(label, fontsize=8)
-            ax.set_ylabel("Count")
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
+        has_previews = (raster_data is not None and "LST" in raster_data and
+                        len(patches) > 0)
+        nrows_stats = 1
+        nrows_total = nrows_stats + (1 if has_previews else 0)
 
-        # Example patches (up to 4)
-        n_ex = min(4, len(patches))
-        ex_indices = np.linspace(0, len(patches) - 1, n_ex, dtype=int)
-        for col, idx in enumerate(ex_indices):
-            ax = fig.add_subplot(gs[1, col])
-            lst_patch = patches[idx]["data"]["LST"]
-            im = ax.imshow(lst_patch, cmap="inferno",
-                           vmin=np.nanpercentile(lst_patch, 2),
-                           vmax=np.nanpercentile(lst_patch, 98))
-            ax.set_title(f"Patch #{idx}\nμ={means[idx]:.1f}°C σ={stds[idx]:.1f}°C",
-                         fontsize=8)
-            ax.axis("off")
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig = plt.figure(figsize=(16, 7 + (5 if has_previews else 0)))
+        gs = gridspec.GridSpec(nrows_total, 3, figure=fig, hspace=0.55, wspace=0.35)
 
-        fig.suptitle(f"Patch Quality Diagnostics  (n={len(patches):,} patches)",
-                     fontsize=13, fontweight="bold")
+        # ── Row 0: stat histograms + scatter ──────────────────────────────────
+        # Mean LST distribution
+        ax0 = fig.add_subplot(gs[0, 0])
+        if means_v.size > 0:
+            ax0.hist(means_v, bins=min(40, max(1, means_v.size // 5)),
+                     color="steelblue", edgecolor="white", alpha=0.85)
+            ax0.axvline(means_v.mean(), color="black", linestyle="--", lw=1.5,
+                        label=f"μ={means_v.mean():.1f}°C")
+            ax0.axvline(15.0, color="green",  linestyle=":",  lw=1.2, label="min=15°C")
+            ax0.axvline(58.0, color="crimson", linestyle=":", lw=1.2, label="max=58°C")
+            ax0.legend(fontsize=7)
+        ax0.set_xlabel("Patch LST Mean (°C)", fontsize=8)
+        ax0.set_ylabel("Count")
+        ax0.set_title("Patch LST Mean Distribution")
+        ax0.grid(True, alpha=0.3)
+
+        # Std LST distribution
+        ax1 = fig.add_subplot(gs[0, 1])
+        if stds_v.size > 0:
+            ax1.hist(stds_v, bins=min(40, max(1, stds_v.size // 5)),
+                     color="darkorange", edgecolor="white", alpha=0.85)
+            ax1.axvline(stds_v.mean(), color="black", linestyle="--", lw=1.5,
+                        label=f"μ={stds_v.mean():.1f}°C")
+            ax1.legend(fontsize=8)
+        ax1.set_xlabel("Patch LST Std (°C)", fontsize=8)
+        ax1.set_ylabel("Count")
+        ax1.set_title("Patch LST Std Distribution")
+        ax1.grid(True, alpha=0.3)
+
+        # 2-D scatter: mean vs std (quality overview)
+        ax2 = fig.add_subplot(gs[0, 2])
+        if means_v.size > 0 and stds_v.size > 0:
+            sc = ax2.scatter(means_v, stds_v, c=stds_v, cmap="YlOrRd",
+                             alpha=0.4, s=6, edgecolors="none")
+            plt.colorbar(sc, ax=ax2, label="Patch LST Std (°C)")
+        ax2.set_xlabel("Patch LST Mean (°C)", fontsize=8)
+        ax2.set_ylabel("Patch LST Std (°C)", fontsize=8)
+        ax2.set_title("Patch Quality: Mean vs Std")
+        ax2.grid(True, alpha=0.3)
+
+        # ── Row 1: visual patch thumbnails ────────────────────────────────────
+        if has_previews:
+            lst_raster = raster_data["LST"]
+            patch_size = 64  # default; infer from first patch if possible
+            if patches:
+                r0, c0 = patches[0]["position"]
+                ps_infer = min(64, lst_raster.shape[0] - r0, lst_raster.shape[1] - c0)
+                if ps_infer > 0:
+                    patch_size = ps_infer
+
+            # Select n_preview patches evenly spread across the mean-temperature range
+            valid_patches = [p for p in patches
+                             if np.isfinite(p.get("_lst_mean", np.nan))
+                             and np.isfinite(p.get("_lst_std",  np.nan))]
+            if len(valid_patches) > n_preview:
+                # Evenly spaced by sorted mean temperature
+                sorted_by_mean = sorted(valid_patches, key=lambda p: p["_lst_mean"])
+                step = max(1, len(sorted_by_mean) // n_preview)
+                preview_patches = sorted_by_mean[::step][:n_preview]
+            else:
+                preview_patches = valid_patches[:n_preview]
+
+            n_cols_prev = min(n_preview, 6)
+            n_rows_prev = (len(preview_patches) + n_cols_prev - 1) // n_cols_prev
+
+            # Compute a shared colour scale for all preview tiles
+            sample_slices = []
+            for pp in preview_patches:
+                r, c = pp["position"]
+                sl = lst_raster[r:r+patch_size, c:c+patch_size]
+                finite = sl[np.isfinite(sl)]
+                if finite.size > 0:
+                    sample_slices.append(finite)
+            if sample_slices:
+                all_finite = np.concatenate(sample_slices)
+                vmin_p, vmax_p = np.nanpercentile(all_finite, [2, 98])
+            else:
+                vmin_p, vmax_p = 20.0, 55.0
+
+            inner_gs = gridspec.GridSpecFromSubplotSpec(
+                n_rows_prev, n_cols_prev, subplot_spec=gs[1, :],
+                hspace=0.15, wspace=0.05
+            )
+
+            for tile_idx, pp in enumerate(preview_patches):
+                r, c = pp["position"]
+                sl = lst_raster[r:r+patch_size, c:c+patch_size].copy()
+                nan_frac = float((~np.isfinite(sl)).mean()) if sl.size > 0 else 0.0
+                # Mark NaN pixels red via masked array so they're visible
+                sl_masked = np.ma.masked_invalid(sl)
+
+                ax_t = fig.add_subplot(inner_gs[tile_idx // n_cols_prev,
+                                                tile_idx %  n_cols_prev])
+                cmap_preview = plt.cm.inferno.copy()
+                cmap_preview.set_bad("cyan", alpha=1.0)   # NaN pixels → cyan
+                ax_t.imshow(sl_masked, cmap=cmap_preview,
+                            vmin=vmin_p, vmax=vmax_p, interpolation="nearest")
+
+                # Flag if NaN fraction is high (potential fill artifact)
+                nan_warn = f" ⚠NaN:{nan_frac*100:.0f}%" if nan_frac > 0.02 else ""
+                ax_t.set_title(f"μ={pp['_lst_mean']:.1f}°C\nσ={pp['_lst_std']:.1f}°C"
+                               f"{nan_warn}", fontsize=6, pad=2)
+                ax_t.axis("off")
+
+            # Patch-row caption
+            fig.text(
+                0.5, 0.01,
+                "Visual patch previews (LST °C, inferno scale — cyan = NaN/missing pixels)."
+                "  Thumbnails span cool→hot; flat cyan blobs indicate NaN-fill artefacts.",
+                ha="center", fontsize=7, style="italic", color="dimgray"
+            )
+
+        fig.suptitle(
+            f"Patch Quality Diagnostics  "
+            f"(n={len(patches):,} total, {valid.sum():,} with stats)",
+            fontsize=13, fontweight="bold"
+        )
+        plt.tight_layout(rect=[0, 0.03, 1, 1])
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
@@ -1014,8 +1145,13 @@ class PreprocessingDiagnostics:
         ncols = min(4, n_panels)
         nrows = (n_panels + ncols - 1) // ncols
 
-        fig, axes = plt.subplots(nrows, ncols,
-                                 figsize=(ncols * 4.5, nrows * 4.2))
+        # Use larger per-panel size and constrained_layout so colorbars
+        # never get clipped regardless of how many bands are present.
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(ncols * 5.5, nrows * 5.5),
+            constrained_layout=True,
+        )
         axes = np.array(axes).flatten()
         panel = 0
 
@@ -1077,7 +1213,7 @@ class PreprocessingDiagnostics:
             f"{n_bands_found} total arrays)",
             fontsize=13, fontweight="bold"
         )
-        plt.tight_layout()
+        # constrained_layout handles spacing — no tight_layout needed
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
@@ -1532,18 +1668,52 @@ class PreprocessingDiagnostics:
             if len(s2_vals) > 50_000:
                 s2_vals = np.random.default_rng(0).choice(s2_vals, 50_000, replace=False)
 
-            lo = min(ls_vals.min(), s2_vals.min())
-            hi = max(ls_vals.max(), s2_vals.max())
+            # ── Per-index sensible display range ─────────────────────────
+            # Standard spectral indices live in [-1, 1] (or [-1, 2] for NDVI).
+            # Albedo lives in [0, 1].  Use a tight union of the p1–p99 ranges
+            # from BOTH sensors so outliers / wrong-scale data don't collapse
+            # the histogram.  If a sensor's data lies entirely outside the
+            # display window it means a scaling problem upstream; we still
+            # show the clipped distribution so the mismatch is visible.
+            _INDEX_HARD_LIMITS = {
+                "NDVI":   (-1.0,  1.0),
+                "NDBI":   (-1.0,  1.0),
+                "MNDWI":  (-1.0,  1.0),
+                "BSI":    (-1.0,  1.0),
+                "UI":     (-1.0,  1.0),
+                "albedo": ( 0.0,  1.0),
+            }
+            hard_lo, hard_hi = _INDEX_HARD_LIMITS.get(key, (-1.5, 1.5))
+
+            # Percentile range within hard limits
+            def _pct_range(arr, hard_lo, hard_hi):
+                clipped = arr[(arr >= hard_lo) & (arr <= hard_hi)]
+                if clipped.size < 10:
+                    return hard_lo, hard_hi
+                return float(np.percentile(clipped, 1)), float(np.percentile(clipped, 99))
+
+            ls_lo, ls_hi = _pct_range(ls_vals, hard_lo, hard_hi)
+            s2_lo, s2_hi = _pct_range(s2_vals, hard_lo, hard_hi)
+            lo = max(hard_lo, min(ls_lo, s2_lo))
+            hi = min(hard_hi, max(ls_hi, s2_hi))
+            if hi - lo < 1e-6:
+                lo, hi = hard_lo, hard_hi
+
             bins = np.linspace(lo, hi, 80)
 
-            ax.hist(ls_vals, bins=bins, alpha=0.55, color="#1565C0",
+            # Clip values to display window for histogram
+            ls_plot = np.clip(ls_vals, lo, hi)
+            s2_plot = np.clip(s2_vals, lo, hi)
+
+            ax.hist(ls_plot, bins=bins, alpha=0.55, color="#1565C0",
                     density=True, label="Landsat")
-            ax.hist(s2_vals, bins=bins, alpha=0.55, color="#E65100",
+            ax.hist(s2_plot, bins=bins, alpha=0.55, color="#E65100",
                     density=True, label="Sentinel-2")
+            ax.set_xlim(lo, hi)
 
             # Simple agreement: correlation of binned counts
-            ls_h, _ = np.histogram(ls_vals, bins=bins, density=True)
-            s2_h, _ = np.histogram(s2_vals, bins=bins, density=True)
+            ls_h, _ = np.histogram(ls_plot, bins=bins, density=True)
+            s2_h, _ = np.histogram(s2_plot, bins=bins, density=True)
             if ls_h.std() > 0 and s2_h.std() > 0:
                 agreement = np.corrcoef(ls_h, s2_h)[0, 1]
                 ax.set_title(f"{key}  agreement r={agreement:.3f}", fontsize=9,
@@ -1551,10 +1721,12 @@ class PreprocessingDiagnostics:
             else:
                 ax.set_title(key, fontsize=9)
 
-            # Mean lines
-            ax.axvline(ls_vals.mean(), color="#1565C0", linestyle="--", lw=1.5,
+            # Mean lines (clamped to display window)
+            ls_mean = float(np.clip(ls_vals.mean(), lo, hi))
+            s2_mean = float(np.clip(s2_vals.mean(), lo, hi))
+            ax.axvline(ls_mean, color="#1565C0", linestyle="--", lw=1.5,
                        label=f"LS μ={ls_vals.mean():.3f}")
-            ax.axvline(s2_vals.mean(), color="#E65100", linestyle="--", lw=1.5,
+            ax.axvline(s2_mean, color="#E65100", linestyle="--", lw=1.5,
                        label=f"S2 μ={s2_vals.mean():.3f}")
             ax.set_xlabel(key, fontsize=8)
             ax.set_ylabel("Density")
@@ -1589,22 +1761,33 @@ class PreprocessingDiagnostics:
         s2_arr = s2_data[index].astype(np.float32)
         ls_arr = ls_data[index].astype(np.float32)
 
-        fig = plt.figure(figsize=(16, 10))
-        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+        fig = plt.figure(figsize=(18, 11))
+        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.38)
 
-        # Determine shared colour range
-        all_vals = np.concatenate([s2_arr[np.isfinite(s2_arr)].ravel(),
-                                   ls_arr[np.isfinite(ls_arr)].ravel()])
-        vmin, vmax = np.nanpercentile(all_vals, [2, 98])
+        # ── Per-panel colour ranges (independent) so a blank/uniform S2
+        #    array is still rendered with contrast.
+        def _safe_vrange(arr):
+            valid = arr[np.isfinite(arr)]
+            if valid.size == 0:
+                return 0.0, 1.0
+            lo, hi = np.nanpercentile(valid, [2, 98])
+            if (hi - lo) < 1e-6:
+                lo, hi = valid.min(), valid.max()
+            if (hi - lo) < 1e-6:
+                lo, hi = lo - 0.05, hi + 0.05
+            return float(lo), float(hi)
+
+        s2_vmin, s2_vmax = _safe_vrange(s2_arr)
+        ls_vmin, ls_vmax = _safe_vrange(ls_arr)
 
         ax0 = fig.add_subplot(gs[0, 0])
-        im0 = ax0.imshow(s2_arr, cmap="RdYlGn", vmin=vmin, vmax=vmax)
+        im0 = ax0.imshow(s2_arr, cmap="RdYlGn", vmin=s2_vmin, vmax=s2_vmax)
         ax0.set_title(f"Sentinel-2  {index}\n(10 m native)", fontweight="bold")
         ax0.axis("off")
         plt.colorbar(im0, ax=ax0)
 
         ax1 = fig.add_subplot(gs[0, 1])
-        im1 = ax1.imshow(ls_arr, cmap="RdYlGn", vmin=vmin, vmax=vmax)
+        im1 = ax1.imshow(ls_arr, cmap="RdYlGn", vmin=ls_vmin, vmax=ls_vmax)
         ax1.set_title(f"Landsat  {index}\n(30 m native)", fontweight="bold")
         ax1.axis("off")
         plt.colorbar(im1, ax=ax1)
@@ -1639,10 +1822,25 @@ class PreprocessingDiagnostics:
         x_s2 = np.linspace(0, 1, len(profile_s2))
         x_ls = np.linspace(0, 1, len(profile_ls))
 
-        ax3.plot(x_s2, profile_s2, color="#E65100", lw=1.2, alpha=0.8,
-                 label=f"Sentinel-2 (10 m, {len(profile_s2)} px)")
-        ax3.plot(x_ls, profile_ls, color="#1565C0", lw=2.0, alpha=0.9,
-                 label=f"Landsat (30 m, {len(profile_ls)} px)")
+        # Mask NaNs for clean plotting
+        s2_valid = np.isfinite(profile_s2)
+        ls_valid = np.isfinite(profile_ls)
+
+        if s2_valid.any():
+            ax3.plot(x_s2[s2_valid], profile_s2[s2_valid], color="#E65100", lw=1.2,
+                     alpha=0.8, label=f"Sentinel-2 (10 m, {len(profile_s2)} px)")
+        else:
+            ax3.text(0.5, 0.5, "S2 central row: all NaN",
+                     ha="center", va="center", transform=ax3.transAxes,
+                     fontsize=9, color="#E65100")
+
+        if ls_valid.any():
+            ax3.plot(x_ls[ls_valid], profile_ls[ls_valid], color="#1565C0", lw=2.0,
+                     alpha=0.9, label=f"Landsat (30 m, {len(profile_ls)} px)")
+        else:
+            ax3.text(0.5, 0.4, "Landsat central row: all NaN",
+                     ha="center", va="center", transform=ax3.transAxes,
+                     fontsize=9, color="#1565C0")
         ax3.set_xlabel("Relative position along central row")
         ax3.set_ylabel(index)
         ax3.set_title("Central Row Profile – Spatial Detail Comparison")
@@ -1724,8 +1922,9 @@ class PreprocessingDiagnostics:
 
             # CV map
             ax1 = axes[row, 1]
-            cv_max = np.nanpercentile(pixel_cv[np.isfinite(pixel_cv)], 98)
-            im1 = ax1.imshow(pixel_cv, cmap="YlOrRd", vmin=0, vmax=cv_max)
+            cv_finite = pixel_cv[np.isfinite(pixel_cv)]
+            cv_max = float(np.nanpercentile(cv_finite, 98)) if cv_finite.size > 0 else 1.0
+            im1 = ax1.imshow(pixel_cv, cmap="YlOrRd", vmin=0, vmax=max(cv_max, 1e-6))
             ax1.set_title(f"{key} – Coefficient of Variation\n(temporal instability)",
                           fontsize=9, fontweight="bold")
             ax1.axis("off")
@@ -2592,7 +2791,12 @@ class DatasetCreator:
                     min_valid_ratio: float = 0.95,  # RAISED from 0.8: eliminates NaN-heavy patches
                                                     # that caused the central spike at normalised LST ≈ 0
                     min_variance: float = 0.5,
-                    min_temp: float = 20.0,         # Patch-mean lower bound (°C)
+                    min_temp: float = 15.0,         # Patch-mean lower bound (°C) — LOWERED from 20°C
+                                                    # Jakarta coastal/vegetated patches can reach
+                                                    # 15–20°C in wet-season mornings; the old 20°C
+                                                    # floor was truncating the cool tail and hurting
+                                                    # cool-end calibration. Pixel-level Tier-1
+                                                    # guard (10°C) still catches instrument artifacts.
                     max_temp: float = 58.0) -> List[Dict]:  # Patch-mean upper bound (°C)
         """
         Extract patches from raster data with quality control for Jakarta climate.
@@ -2776,7 +2980,7 @@ class DatasetCreator:
             if position_only:
                 lst_mean = patch["_lst_mean"]
                 lst_std  = patch["_lst_std"]
-                if lst_std < 0.3 or lst_mean < 20.0 or lst_mean > 58.0:
+                if lst_std < 0.3 or lst_mean < 15.0 or lst_mean > 58.0:
                     continue
                 valid_indices.append(idx)
             else:
@@ -2785,7 +2989,7 @@ class DatasetCreator:
                 if fin.mean() < 0.95:
                     continue
                 vt = lst_patch[fin]
-                if vt.size == 0 or not (20.0 <= float(vt.mean()) <= 58.0):
+                if vt.size == 0 or not (15.0 <= float(vt.mean()) <= 58.0):
                     continue
                 valid_indices.append(idx)
 
@@ -2819,17 +3023,63 @@ class DatasetCreator:
                         X[out_idx, :, :, ch_idx] = patch["data"][feat]
                 y[out_idx, :, :, 0] = patch["data"]["LST"].astype(np.float32)
 
-        # ── In-place NaN fill ─────────────────────────────────────────────────
+        # ── In-place NaN fill (neighbourhood median inpainting) ──────────────
+        # WHY NOT MEAN FILL:
+        #   Filling NaN pixels with the patch-global mean collapses local spatial
+        #   structure — it creates flat "blobs" at the mean value wherever data is
+        #   missing (typically at scan-line edges and cloud shadows).  A CNN
+        #   learning on those patches sees artificial step-discontinuities between
+        #   filled and valid pixels, which biases feature learning and inflates
+        #   the observed low-std spike.  Neighbourhood median inpainting preserves
+        #   local gradients far better and is only marginally more expensive.
+        #
+        # STRATEGY: iterative 5×5 median fill — each pass replaces NaN pixels
+        #   whose 5×5 neighbourhood contains ≥4 valid pixels.  We repeat up to
+        #   5 times to handle moderately-sized holes.  Any pixels still NaN after
+        #   5 passes (isolated, whole-patch NaN blocks) fall back to the patch
+        #   median (not mean) as a last resort.
+        from scipy.ndimage import generic_filter as _gf
+
+        def _median_fill_pass(arr2d: np.ndarray, kernel: int = 5) -> int:
+            """One pass of 5×5 neighbourhood median fill.  Returns # pixels filled."""
+            nan_mask = ~np.isfinite(arr2d)
+            if not nan_mask.any():
+                return 0
+            pad = kernel // 2
+
+            def _nanmedian_or_nan(values):
+                """Used inside generic_filter: returns median of finite neighbours."""
+                finite = values[np.isfinite(values)]
+                return float(np.median(finite)) if finite.size >= 4 else np.nan
+
+            # Only run the filter over a padded neighbourhood for speed
+            filled = _gf(arr2d, _nanmedian_or_nan, size=kernel, mode='reflect')
+            newly_filled_mask = nan_mask & np.isfinite(filled)
+            arr2d[newly_filled_mask] = filled[newly_filled_mask]
+            return int(newly_filled_mask.sum())
+
         for s in range(n_samples):
             for ch in range(n_channels):
                 sl = X[s, :, :, ch]
-                nm = ~np.isfinite(sl)
-                if nm.any():
-                    sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
+                if not np.isfinite(sl).all():
+                    for _ in range(5):
+                        if _median_fill_pass(sl) == 0:
+                            break
+                    # Last-resort fallback: patch median (not mean)
+                    still_nan = ~np.isfinite(sl)
+                    if still_nan.any():
+                        finite_vals = sl[~still_nan]
+                        sl[still_nan] = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+
             sl = y[s, :, :, 0]
-            nm = ~np.isfinite(sl)
-            if nm.any():
-                sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
+            if not np.isfinite(sl).all():
+                for _ in range(5):
+                    if _median_fill_pass(sl) == 0:
+                        break
+                still_nan = ~np.isfinite(sl)
+                if still_nan.any():
+                    finite_vals = sl[~still_nan]
+                    sl[still_nan] = float(np.median(finite_vals)) if finite_vals.size > 0 else 35.0
 
         # Tier 3 safety clip — in-place
         np.clip(y, 10.0, 65.0, out=y)
@@ -3784,8 +4034,15 @@ def main():
         return
     
     # Patch quality diagnostic (before patches are freed)
+    # Pass the first raster's LST to enable visual patch thumbnails.
+    # This lets the plot reveal NaN-fill artefacts (flat cyan blobs) directly.
     try:
-        diag.plot_patch_diagnostics(all_patches, filename="05_patch_diagnostics.png")
+        _diag_raster = all_rasters[0][0] if all_rasters else None
+        diag.plot_patch_diagnostics(
+            all_patches,
+            raster_data=_diag_raster,
+            filename="05_patch_diagnostics.png",
+        )
     except Exception as _e:
         logger.warning(f"[Diagnostics] patch plot failed: {_e}")
 
@@ -3896,7 +4153,6 @@ def main():
     logger.info("="*70)
     
     # Use enhanced dataset creator
-    from preprocessing import EnhancedDatasetCreator
     dataset_creator = EnhancedDatasetCreator()
     
     # Stratified split with spatial-temporal distribution
@@ -3977,6 +4233,61 @@ def main():
         logger.info("[Diagnostics] Split distribution plot saved.")
     except Exception as _e:
         logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
+
+    # ── Normalisation diagnostics (needs raw X/y before norm — snapshot already
+    #    taken above; here we generate the plot from the normalised splits and
+    #    the norm_stats to reconstruct a before/after approximation) ──────────
+    try:
+        # Reconstruct raw values from normalised splits using norm_stats
+        # (avoids storing a second full copy of X/y in memory)
+        X_train_norm = splits.get("X_train")
+        y_train_norm = splits.get("y_train")
+        if X_train_norm is not None and y_train_norm is not None:
+            n_ch = X_train_norm.shape[-1]
+            # Un-normalise a small sample (first 200 patches) to get "raw" approx
+            sample_size = min(200, X_train_norm.shape[0])
+            X_raw_approx = X_train_norm[:sample_size].copy()
+            y_raw_approx = y_train_norm[:sample_size].copy()
+            for ch in range(n_ch):
+                ch_key = f"channel_{ch}"
+                if ch_key in norm_stats.get("features", {}):
+                    mean_ = norm_stats["features"][ch_key]["mean"]
+                    std_  = norm_stats["features"][ch_key]["std"]
+                    if std_ > 1e-8:
+                        X_raw_approx[:, :, :, ch] = (
+                            X_train_norm[:sample_size, :, :, ch] * std_ + mean_
+                        )
+            t_mean = norm_stats.get("target", {}).get("mean", 0.0)
+            t_std  = norm_stats.get("target", {}).get("std",  1.0)
+            y_raw_approx = y_train_norm[:sample_size] * t_std + t_mean
+
+            diag.plot_normalization_diagnostics(
+                X_raw_approx, X_train_norm[:sample_size],
+                y_raw_approx, y_train_norm[:sample_size],
+                channel_names=channel_names,
+                filename="07_normalization.png",
+            )
+            logger.info("[Diagnostics] Normalisation diagnostics plot saved.")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] normalisation plot failed: {_e}")
+
+    try:
+        X_train_norm = splits.get("X_train")
+        if X_train_norm is not None:
+            diag.plot_channel_correlation(
+                X_train_norm,
+                channel_names=channel_names,
+                filename="08_channel_correlation.png",
+            )
+            logger.info("[Diagnostics] Channel correlation plot saved.")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] channel correlation plot failed: {_e}")
+
+    try:
+        diag.plot_pipeline_summary(splits, metadata, filename="10_pipeline_summary.png")
+        logger.info("[Diagnostics] Pipeline summary dashboard saved.")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] pipeline summary plot failed: {_e}")
     # ──────────────────────────────────────────────────────────────────────
 
 
