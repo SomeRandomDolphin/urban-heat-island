@@ -188,6 +188,7 @@ CNN_CONFIG = {
 
 GBM_CONFIG = {
     "algorithm": "lightgbm",
+    "bottleneck_pca_components": 32,  # CNN bottleneck dims passed to GBM (after PCA compression)
     "params": {
         "objective": "regression",
         "metric": "rmse",
@@ -196,8 +197,8 @@ GBM_CONFIG = {
         "num_leaves": 31,   # Was 127
         "max_depth": 6,     # Was 12
 
-        "learning_rate": 0.05,
-        "n_estimators": 2000,
+        "learning_rate": 0.03,   # Reduced from 0.05 — finer convergence, better slope
+        "n_estimators": 3000,    # Increased from 2000 — more room with lower LR
 
         "subsample": 0.7,
         "subsample_freq": 1,
@@ -209,7 +210,7 @@ GBM_CONFIG = {
         "min_child_weight": 1e-3,
         "min_split_gain": 0.01,
 
-        "early_stopping_rounds": 50,
+        "early_stopping_rounds": 100,  # Increased from 50 to allow more patience
         "verbose": 100,
     }
 }
@@ -235,13 +236,13 @@ TRAINING_CONFIG = {
     "min_delta": 0.0005,
 
     "optimizer": "adamw",
-    "weight_decay": 0.001,
+    "weight_decay": 0.01,   # Increased from 0.001 — weight norm was growing to 500+, must be capped
 
     "loss_weights": {
-        "mse":      0.50,
-        "variance": 0.20,
+        "mse":      0.30,   # Reduced — pure MSE encourages mean-regression (slope collapse)
+        "variance": 0.40,   # Increased from 0.20 — directly combats slope=0.67 / std_ratio=0.75
         "range":    0.15,
-        "bias":     0.15,
+        "bias":     0.15,   # Keeps MBE near zero
         "spatial":  0.00,
         "physical": 0.00,
     },

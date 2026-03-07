@@ -31,6 +31,33 @@ sys.stderr.reconfigure(encoding="utf-8")
 logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
+
+def _safe_kde(data: np.ndarray, x_grid: np.ndarray):
+    """Return KDE values on x_grid, or None if data has near-zero variance."""
+    flat = np.asarray(data).ravel()
+    flat = flat[np.isfinite(flat)]
+    if flat.std() < 1e-6 or len(flat) < 2:
+        logger.warning("_safe_kde: near-zero variance or insufficient data — skipping KDE")
+        return None
+    try:
+        return stats.gaussian_kde(flat)(x_grid)
+    except Exception as _e:
+        logger.warning(f"_safe_kde: gaussian_kde failed ({_e}) — skipping KDE")
+        return None
+
+
+def _safe_kde_2d(x: np.ndarray, y: np.ndarray):
+    """Return 2-D KDE density values, or None on degenerate input."""
+    try:
+        if np.asarray(x).std() < 1e-6 or np.asarray(y).std() < 1e-6:
+            raise ValueError("Near-zero variance")
+        xy = np.vstack([x, y])
+        return stats.gaussian_kde(xy)(xy)
+    except Exception as _e:
+        logger.warning(f"_safe_kde_2d: 2-D KDE failed ({_e}) — falling back to uniform density")
+        return None
+
+
 # ─── Shared style ────────────────────────────────────────────────────────────
 _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
@@ -63,8 +90,12 @@ def _diag_array(name: str, arr: np.ndarray) -> None:
     """Log rich per-array statistics."""
     flat = arr[~np.isnan(arr)]
     q1, median, q3 = np.percentile(flat, [25, 50, 75])
-    skew = float(stats.skew(flat))
-    kurt = float(stats.kurtosis(flat))
+    # Guard against catastrophic cancellation on near-constant arrays
+    if flat.std() > 1e-6:
+        skew = float(stats.skew(flat))
+        kurt = float(stats.kurtosis(flat))
+    else:
+        skew, kurt = 0.0, 0.0
     logger.info(f"  {name}:")
     logger.info(f"    shape={arr.shape}  dtype={arr.dtype}  NaN={np.isnan(arr).sum()}")
     logger.info(f"    min={flat.min():.4f}  max={flat.max():.4f}  mean={flat.mean():.4f}  std={flat.std():.4f}")
@@ -235,8 +266,9 @@ class UHIAnalyzer:
         ax.hist(flat, bins=80, color="#4393c3", edgecolor="none",
                 density=True, alpha=0.7, label="All pixels")
         kde_x = np.linspace(flat.min(), flat.max(), 500)
-        kde = stats.gaussian_kde(flat)
-        ax.plot(kde_x, kde(kde_x), color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(flat, kde_x)
+        if kde_vals is not None:
+            ax.plot(kde_x, kde_vals, color="#b2182b", lw=2, label="KDE")
         # normal overlay
         mu, sigma = flat.mean(), flat.std()
         ax.plot(kde_x, stats.norm.pdf(kde_x, mu, sigma),
@@ -266,12 +298,14 @@ class UHIAnalyzer:
                                        (u_vals, "#d6604d", "Urban")]:
                 ax.hist(vals, bins=60, color=color, density=True,
                         alpha=0.55, edgecolor="none", label=f"{label} (n={len(vals):,})")
-                kde_v = stats.gaussian_kde(vals)
                 x_v = np.linspace(vals.min(), vals.max(), 500)
-                ax.plot(x_v, kde_v(x_v), color=color, lw=2)
+                kde_v = _safe_kde(vals, x_v)
+                if kde_v is not None:
+                    ax.plot(x_v, kde_v, color=color, lw=2)
             t_stat, p_val = stats.ttest_ind(u_vals, r_vals, equal_var=False)
-            d_cohen = (u_vals.mean() - r_vals.mean()) / np.sqrt(
-                (u_vals.std()**2 + r_vals.std()**2) / 2)
+            _pooled_std = np.sqrt((u_vals.std()**2 + r_vals.std()**2) / 2)
+            d_cohen = ((u_vals.mean() - r_vals.mean()) / _pooled_std
+                       if _pooled_std > 1e-8 else float("nan"))
             ax.text(0.02, 0.97,
                     f"Welch t={t_stat:.3f}  p={p_val:.2e}\nCohen's d={d_cohen:.3f}",
                     transform=ax.transAxes, va="top", ha="left", fontsize=8.5,
@@ -327,9 +361,10 @@ class UHIAnalyzer:
         ax = fig.add_subplot(gs[0, 1])
         ax.hist(flat, bins=100, color="#4393c3", edgecolor="none",
                 density=True, alpha=0.7, label="UHI values")
-        kde = stats.gaussian_kde(flat)
         x_k = np.linspace(flat.min(), flat.max(), 500)
-        ax.plot(x_k, kde(x_k), color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(flat, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
         for thr, col, lbl in [(0, "#99d594", "0 °C"),
                                (1, "#fee08b", "1 °C"),
                                (2, "#fc8d59", "2 °C"),
@@ -756,9 +791,10 @@ class HotspotDetector:
         flat = gi.ravel()
         ax.hist(flat, bins=100, color="#92c5de", edgecolor="none",
                 density=True, alpha=0.8)
-        kde = stats.gaussian_kde(flat)
         x_k = np.linspace(flat.min(), flat.max(), 500)
-        ax.plot(x_k, kde(x_k), color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(flat, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
         for thr, lbl, col in [(1.96, "95% CI", "orange"),
                                (2.58, "99% CI", "red"),
                                (-1.96, "Cold-spot 95%", "steelblue")]:
@@ -976,11 +1012,10 @@ class ValidationAnalyzer:
         ax = axes[0, 0]
         # density-coloured scatter
         idx = np.random.choice(len(obs), min(5000, len(obs)), replace=False)
-        from scipy.stats import gaussian_kde
-        xy    = np.vstack([obs[idx], pred[idx]])
-        z     = gaussian_kde(xy)(xy)
-        scat  = ax.scatter(obs[idx], pred[idx], c=z, cmap="plasma",
-                           s=6, alpha=0.7)
+        z = _safe_kde_2d(obs[idx], pred[idx])
+        scat  = ax.scatter(obs[idx], pred[idx],
+                           c=z if z is not None else pred[idx],
+                           cmap="plasma", s=6, alpha=0.7)
         fig.colorbar(scat, ax=ax, label="Density")
         ax.plot([mn, mx], [mn, mx], "r--", lw=1.5, label="1:1 line")
         x_fit = np.array([mn, mx])
@@ -1011,9 +1046,10 @@ class ValidationAnalyzer:
         ax = axes[0, 2]
         ax.hist(res, bins=80, color="#92c5de", edgecolor="none",
                 density=True, alpha=0.75, label="Residuals")
-        kde = stats.gaussian_kde(res)
         x_k = np.linspace(res.min(), res.max(), 500)
-        ax.plot(x_k, kde(x_k), color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(res, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
         mu, sigma = res.mean(), res.std()
         ax.plot(x_k, stats.norm.pdf(x_k, mu, sigma),
                 color="grey", lw=1.5, ls="--",

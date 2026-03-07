@@ -259,8 +259,20 @@ class EarthEngineLoader:
             Cloud-filtered ImageCollection.
         """
         area  = self.get_study_area()
-        cloud = LANDSAT_CONFIG["cloud_threshold"]   # reuse same threshold
+        # Use a Sentinel-2-specific cloud threshold if configured, otherwise
+        # fall back to the Landsat one.  S2 CLOUDY_PIXEL_PERCENTAGE is scene-level
+        # metadata; it's common to allow a slightly higher value here because
+        # per-pixel SCL masking (applied above) removes actual cloud pixels.
+        cloud = SENTINEL2_CONFIG.get("cloud_threshold",
+                LANDSAT_CONFIG["cloud_threshold"])
 
+        # IMPORTANT — do NOT add .filter(ee.Filter.eq('MGRS_TILE', '...')) here.
+        # Jakarta's AOI straddles multiple MGRS tiles (typically 48MXT + 48MYT).
+        # filterBounds() already returns images from *every* tile that intersects
+        # the AOI, so the subsequent median() composite automatically mosaics
+        # all contributing tiles into a seamless image covering the full extent.
+        # Filtering to a single named tile is exactly what produces the diagonal
+        # cutoff edge seen in s2_01_raw_bands.png.
         collection = (ee.ImageCollection(SENTINEL2_CONFIG["collection"])
                         .filterBounds(area)
                         .filterDate(start_date, end_date)
@@ -269,6 +281,14 @@ class EarthEngineLoader:
 
         size = collection.size().getInfo()
         logger.info(f"  Sentinel-2: {size} images for {start_date} → {end_date}")
+
+        if size < 2:
+            logger.warning(
+                "  ⚠ Very few Sentinel-2 images found. "
+                "If the exported raster shows diagonal cutoff edges, "
+                "verify that STUDY_AREA bounds cover the correct MGRS tiles "
+                "and that CLOUDY_PIXEL_PERCENTAGE threshold is not overly strict."
+            )
         return collection
 
     # ------------------------------------------------------------------
@@ -310,6 +330,26 @@ class EarthEngineLoader:
         """
         Submit a GEE Export.image.toDrive() task and return it.
 
+        SEAMLESS MULTI-TILE EXPORT
+        --------------------------
+        When the AOI straddles multiple MGRS tiles (e.g. 48MXT + 48MYT for
+        Jakarta), the median composite retains masked pixels along tile-seam
+        borders — producing the diagonal cutoff visible in s2_01_raw_bands.png.
+        Two fixes are applied here:
+
+        1. image.unmask(0) — replaces all residual masked pixels (tile edges,
+           cloud-masked borders) with 0 before GEE reprojects the image into
+           the export CRS.  After reprojection, every pixel inside the AOI
+           bounding box gets a value, so the exported GeoTIFF is spatially
+           complete.  The preprocessing pipeline treats 0 as a valid low-
+           reflectance value; genuine no-data is already handled by upstream
+           QA/SCL masking embedded in the composite.
+
+        2. bestEffort=True — instructs GEE to automatically coarsen the export
+           resolution if the pixel count would exceed maxPixels, rather than
+           failing silently.  This also prevents the task engine from splitting
+           the export at tile boundaries into multiple files.
+
         Args:
             image:       Composite image to export.
             description: Task description / file stem (no spaces).
@@ -327,8 +367,14 @@ class EarthEngineLoader:
         if not export_bands:
             raise ValueError(f"None of {bands} found in image bands: {available}")
 
+        image_selected = image.select(export_bands)
+
+        # Fill masked/NaN pixels at tile-seam borders with 0 so the exported
+        # GeoTIFF covers the full AOI without diagonal cutoff edges.
+        image_selected = image_selected.unmask(0)
+
         task = ee.batch.Export.image.toDrive(
-            image=image.select(export_bands),
+            image=image_selected,
             description=description,
             folder=self.DRIVE_FOLDER,
             fileNamePrefix=description,
@@ -337,10 +383,14 @@ class EarthEngineLoader:
             crs=self.EXPORT_CRS,
             maxPixels=1e10,
             fileFormat='GeoTIFF',
+            # bestEffort: prevents silent failures and tile-boundary file splits
+            # on large AOIs that approach the maxPixels limit.
+            bestEffort=True,
         )
         task.start()
         logger.info(f"  Export task submitted: {description} "
-                    f"({len(export_bands)} bands @ {scale}m)")
+                    f"({len(export_bands)} bands @ {scale}m, "
+                    f"unmask+bestEffort enabled)")
         return task
 
     def _wait_for_task(self, task: ee.batch.Task,

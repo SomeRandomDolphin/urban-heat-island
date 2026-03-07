@@ -12,7 +12,7 @@ from shapely.geometry import box
 from typing import Dict, Tuple, List, Optional
 import logging
 from pathlib import Path
-from scipy.ndimage import uniform_filter, generic_filter, zoom
+from scipy.ndimage import uniform_filter, zoom
 import pyproj
 from datetime import datetime, timedelta
 from sklearn.model_selection import train_test_split, StratifiedKFold
@@ -20,7 +20,11 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 import rasterio
 from rasterio.enums import Resampling as RasterioResampling
 
-from config import *
+from config import (
+    RAW_DATA_DIR, PROCESSED_DATA_DIR,
+    LANDSAT_CONFIG, SENTINEL2_CONFIG,
+    LOGGING_CONFIG,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -39,7 +43,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 
 # ---------------------------------------------------------------------------
-# GeoTIFF / NPZ unified band loader
+# GeoTIFF band loader
 # ---------------------------------------------------------------------------
 
 _LANDSAT_BAND_ORDER = [
@@ -110,7 +114,7 @@ def load_tif_as_bands(tif_path: Path,
                        max_pixels: int = MAX_PIXELS) -> Optional[Dict[str, np.ndarray]]:
     """
     Load a GeoTIFF exported by earth_engine_loader.py and return a dict of
-    {band_name: 2-D float32 array}, mirroring the format of np.load(npz).
+    {band_name: 2-D float32 array}.
 
     Band identification priority:
       1. Rasterio band description stored in the file (set by GEE export).
@@ -194,89 +198,6 @@ def load_tif_as_bands(tif_path: Path,
         return bands
     except Exception as exc:
         logger.error(f"  Failed to load {tif_path}: {exc}")
-        return None
-
-
-def _downsample_npz_bands(data: Dict[str, np.ndarray],
-                           max_pixels: int = MAX_PIXELS) -> Dict[str, np.ndarray]:
-    """
-    Apply adaptive downsampling to a dict of arrays loaded from a legacy .npz.
-
-    Uses scipy.ndimage.zoom with order=1 (bilinear) for continuous bands and
-    order=0 (nearest-neighbour) for QA/mask bands.
-
-    Args:
-        data       : {band_name: 2-D ndarray} loaded from np.load(npz)
-        max_pixels : pixel budget
-
-    Returns:
-        Same dict with arrays resampled in-place (or original if no downsample).
-    """
-    _MASK_BAND_NAMES = {"QA_PIXEL", "SCL", "QA60"}
-
-    # Determine shape from the first 2-D array
-    ref_shape = None
-    for arr in data.values():
-        if isinstance(arr, np.ndarray) and arr.ndim == 2:
-            ref_shape = arr.shape
-            break
-    if ref_shape is None:
-        return data
-
-    native_rows, native_cols = ref_shape
-    n_bands = sum(1 for v in data.values() if isinstance(v, np.ndarray) and v.ndim == 2)
-    factor = _compute_downsample_factor(native_rows, native_cols, n_bands, max_pixels)
-
-    if factor >= 1.0:
-        return data  # nothing to do
-
-    logger.warning(
-        f"  [Downsample/npz] native {native_rows}×{native_cols} "
-        f"→ factor={factor:.3f}. Downsampling all 2-D bands."
-    )
-
-    out: Dict[str, np.ndarray] = {}
-    for name, arr in data.items():
-        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
-            out[name] = arr   # pass through scalars / 1-D metadata as-is
-            continue
-        # Use the same factor even if this particular band has a different shape
-        # (e.g. a higher-res ancillary band) — keep relative shapes consistent.
-        band_factor_r = factor * (native_rows / arr.shape[0])
-        band_factor_c = factor * (native_cols / arr.shape[1])
-        zoom_order = 0 if name in _MASK_BAND_NAMES else 1
-        out[name] = zoom(
-            arr.astype(np.float32),
-            (band_factor_r, band_factor_c),
-            order=zoom_order,
-            prefilter=False,
-        ).astype(np.float32)
-    return out
-
-
-def load_raw_file(raw_file: Path,
-                   max_pixels: int = MAX_PIXELS) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Unified loader: GeoTIFF (.tif/.tiff) or legacy NumPy archive (.npz).
-    Returns {band_name: float32 np.ndarray} or None on failure.
-
-    Adaptive downsampling is applied automatically when the raster exceeds
-    *max_pixels* per band — see load_tif_as_bands / _downsample_npz_bands.
-    """
-    suffix = raw_file.suffix.lower()
-    if suffix in (".tif", ".tiff"):
-        return load_tif_as_bands(raw_file, max_pixels=max_pixels)
-    elif suffix == ".npz":
-        try:
-            data = dict(np.load(raw_file))
-            data = _downsample_npz_bands(data, max_pixels=max_pixels)
-            logger.info(f"  Loaded {len(data)} arrays from {raw_file.name} (npz)")
-            return data
-        except Exception as exc:
-            logger.error(f"  Failed to load {raw_file}: {exc}")
-            return None
-    else:
-        logger.error(f"  Unsupported file format: {raw_file.suffix}")
         return None
 
 
@@ -2197,7 +2118,7 @@ class SatellitePreprocessor:
             return None
         
         # Detect whether ST_B10 is already in Kelvin (GeoTIFF, scale applied
-        # at export) or raw Collection-2 DN integers (legacy .npz).
+        # at export) or raw Collection-2 DN integers.
         # Jakarta surface temps: ~295–330 K. Raw DN values are ~7 000–15 000.
         sample     = thermal_band[np.isfinite(thermal_band)]
         median_val = float(np.nanmedian(sample)) if sample.size > 0 else 0.0
@@ -2337,7 +2258,7 @@ class SatellitePreprocessor:
             swir1 = _f32(bands["SR_B6"])
             swir2 = _f32(bands["SR_B7"])
 
-            # Detect DN (legacy .npz) vs pre-scaled reflectance (GeoTIFF).
+            # Detect DN (legacy export) vs pre-scaled reflectance (GeoTIFF).
             # Pre-scaled values are in [0, 1]; raw DN medians are ~5 000–30 000.
             _s = red[np.isfinite(red)]
             if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
@@ -2442,10 +2363,10 @@ class SatellitePreprocessor:
     def process_raw_file(self, raw_file: Path,
                         calculate_lst: bool = True) -> Optional[Dict[str, np.ndarray]]:
         """
-        Process a single raw data file
+        Process a single raw GeoTIFF file.
         
         Args:
-            raw_file: Path to raw .npz file
+            raw_file: Path to raw .tif file
             calculate_lst: Whether to calculate LST from thermal band
             
         Returns:
@@ -2454,8 +2375,8 @@ class SatellitePreprocessor:
         logger.info(f"Processing: {raw_file.name}")
         
         try:
-            # Load raw data — supports both .tif (new) and .npz (legacy)
-            raw_data = load_raw_file(raw_file)
+            # Load raw data from GeoTIFF
+            raw_data = load_tif_as_bands(raw_file)
             if raw_data is None:
                 return None
             logger.info(f"  Loaded {len(raw_data)} raw bands")
@@ -2957,11 +2878,6 @@ class DatasetCreator:
             ]
 
         position_only = "data" not in patches[0]
-        patch_size    = patches[0]["data"]["LST"].shape[0] if not position_only \
-                        else raster_data["LST"][
-                            patches[0]["position"][0]:patches[0]["position"][0]+64,
-                            patches[0]["position"][1]:patches[0]["position"][1]+64,
-                        ].shape[0]
         # Derive patch_size robustly
         if position_only and raster_data is not None:
             r0, c0   = patches[0]["position"]
@@ -2974,16 +2890,14 @@ class DatasetCreator:
 
         n_channels = len(channel_order)
 
-        # ── Pass 1: lightweight QC scan ───────────────────────────────────────
-        valid_indices = []
-        for idx, patch in enumerate(patches):
-            if position_only:
-                lst_mean = patch["_lst_mean"]
-                lst_std  = patch["_lst_std"]
-                if lst_std < 0.3 or lst_mean < 15.0 or lst_mean > 58.0:
-                    continue
-                valid_indices.append(idx)
-            else:
+        # ── QC scan for legacy data-carrying patches only ─────────────────────
+        # Position-only patches are already fully QC'd by extract_patches(),
+        # so we skip the redundant scan and use all indices directly.
+        if position_only:
+            valid_indices = list(range(len(patches)))
+        else:
+            valid_indices = []
+            for idx, patch in enumerate(patches):
                 lst_patch = patch["data"]["LST"].astype(np.float32)
                 fin       = np.isfinite(lst_patch)
                 if fin.mean() < 0.95:
@@ -3031,32 +2945,33 @@ class DatasetCreator:
         #   learning on those patches sees artificial step-discontinuities between
         #   filled and valid pixels, which biases feature learning and inflates
         #   the observed low-std spike.  Neighbourhood median inpainting preserves
-        #   local gradients far better and is only marginally more expensive.
+        #   local gradients far better.
         #
-        # STRATEGY: iterative 5×5 median fill — each pass replaces NaN pixels
-        #   whose 5×5 neighbourhood contains ≥4 valid pixels.  We repeat up to
+        # STRATEGY: vectorised iterative median fill — each pass uses
+        #   scipy.ndimage.median_filter on a NaN-replaced copy (NaNs filled with
+        #   the patch median as a neutral placeholder), then writes filtered values
+        #   back only where the original was NaN.  This is ~100× faster than using
+        #   generic_filter with a Python callback per pixel.  We repeat up to
         #   5 times to handle moderately-sized holes.  Any pixels still NaN after
-        #   5 passes (isolated, whole-patch NaN blocks) fall back to the patch
-        #   median (not mean) as a last resort.
-        from scipy.ndimage import generic_filter as _gf
+        #   5 passes fall back to the patch median as a last resort.
+        from scipy.ndimage import median_filter as _mf
 
         def _median_fill_pass(arr2d: np.ndarray, kernel: int = 5) -> int:
-            """One pass of 5×5 neighbourhood median fill.  Returns # pixels filled."""
+            """One fast vectorised pass of kernel×kernel median fill.
+            Returns number of NaN pixels filled."""
             nan_mask = ~np.isfinite(arr2d)
             if not nan_mask.any():
                 return 0
-            pad = kernel // 2
-
-            def _nanmedian_or_nan(values):
-                """Used inside generic_filter: returns median of finite neighbours."""
-                finite = values[np.isfinite(values)]
-                return float(np.median(finite)) if finite.size >= 4 else np.nan
-
-            # Only run the filter over a padded neighbourhood for speed
-            filled = _gf(arr2d, _nanmedian_or_nan, size=kernel, mode='reflect')
-            newly_filled_mask = nan_mask & np.isfinite(filled)
-            arr2d[newly_filled_mask] = filled[newly_filled_mask]
-            return int(newly_filled_mask.sum())
+            # Temporarily fill NaNs with the patch median so median_filter
+            # doesn't spread NaNs — finite values act as neutral placeholders.
+            finite_vals = arr2d[~nan_mask]
+            placeholder = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+            tmp = arr2d.copy()
+            tmp[nan_mask] = placeholder
+            filtered = _mf(tmp, size=kernel, mode='reflect')
+            # Only accept filter output for pixels that were originally NaN
+            arr2d[nan_mask] = filtered[nan_mask]
+            return int(nan_mask.sum())
 
         for s in range(n_samples):
             for ch in range(n_channels):
@@ -3280,80 +3195,6 @@ class DatasetCreator:
         
         logger.info("="*70)
         
-    def create_train_val_test_split(self, X: np.ndarray, y: np.ndarray,
-                                   dates: np.ndarray,
-                                   split_method: str = "temporal",
-                                   split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15)) -> Dict:
-        """
-        Create train/validation/test splits
-        
-        Args:
-            X: Features array
-            y: Target array
-            dates: Array of dates
-            split_method: 'temporal' or 'random'
-            split_ratios: (train, val, test) ratios
-            
-        Returns:
-            Dictionary with train/val/test splits
-        """
-        if split_method == "temporal":
-            # Sort by date
-            sort_idx = np.argsort(dates)
-            X = X[sort_idx]
-            y = y[sort_idx]
-            dates = dates[sort_idx]
-            
-            # Calculate split indices
-            n_train = int(split_ratios[0] * len(X))
-            n_val = int(split_ratios[1] * len(X))
-            
-            splits = {
-                "X_train": X[:n_train],
-                "y_train": y[:n_train],
-                "dates_train": dates[:n_train],
-                "X_val": X[n_train:n_train+n_val],
-                "y_val": y[n_train:n_train+n_val],
-                "dates_val": dates[n_train:n_train+n_val],
-                "X_test": X[n_train+n_val:],
-                "y_test": y[n_train+n_val:],
-                "dates_test": dates[n_train+n_val:]
-            }
-            
-        elif split_method == "random":
-            from sklearn.model_selection import train_test_split
-            
-            test_size = split_ratios[2]
-            val_ratio = split_ratios[1] / (1 - split_ratios[0])
-            
-            X_train, X_temp, y_train, y_temp, dates_train, dates_temp = train_test_split(
-                X, y, dates, test_size=(1-split_ratios[0]), random_state=42
-            )
-            X_val, X_test, y_val, y_test, dates_val, dates_test = train_test_split(
-                X_temp, y_temp, dates_temp, test_size=val_ratio, random_state=42
-            )
-            
-            splits = {
-                "X_train": X_train,
-                "y_train": y_train,
-                "dates_train": dates_train,
-                "X_val": X_val,
-                "y_val": y_val,
-                "dates_val": dates_val,
-                "X_test": X_test,
-                "y_test": y_test,
-                "dates_test": dates_test
-            }
-        else:
-            raise ValueError(f"Unknown split method: {split_method}")
-        
-        logger.info(f"Created {split_method} split ({split_ratios}):")
-        logger.info(f"  Train: {len(splits['X_train'])} samples")
-        logger.info(f"  Val: {len(splits['X_val'])} samples")
-        logger.info(f"  Test: {len(splits['X_test'])} samples")
-        
-        return splits
-    
     def save_dataset(self, splits: Dict, output_dir: Path, metadata: Dict, 
                     norm_stats: Optional[Dict] = None):
         """
@@ -3759,13 +3600,11 @@ def main():
         
         landsat_files = sorted(
             list(landsat_dir.glob("Landsat_*.tif")) +   # GEE export (new)
-            list(landsat_dir.glob("landsat_*.tif")) +   # lower-case variant
-            list(landsat_dir.glob("landsat_*.npz"))     # legacy npz
+            list(landsat_dir.glob("landsat_*.tif"))     # lower-case variant
         )
         logger.info(f"Found {len(landsat_files)} Landsat files")
         
         for raw_file in landsat_files:
-            # Handles both Landsat_YYYY_MM.tif and landsat_YYYY_MM.npz
             parts = raw_file.stem.split('_')
             try:
                 year  = int(parts[-2])
@@ -3803,7 +3642,7 @@ def main():
             # ── DIAGNOSTIC PLOTS (first file only) ────────────────────
             if len(landsat_processed) == 1:
                 try:
-                    raw_data_for_plot = load_raw_file(raw_file) or {}
+                    raw_data_for_plot = load_tif_as_bands(raw_file) or {}
                     diag.plot_raw_bands(
                         raw_data_for_plot,
                         title=f"Raw Bands – {raw_file.name}",
@@ -3848,13 +3687,11 @@ def main():
         
         sentinel2_files = sorted(
             list(sentinel2_dir.glob("Sentinel2_*.tif")) +   # GEE export (new)
-            list(sentinel2_dir.glob("sentinel2_*.tif")) +   # lower-case variant
-            list(sentinel2_dir.glob("sentinel2_*.npz"))     # legacy npz
+            list(sentinel2_dir.glob("sentinel2_*.tif"))     # lower-case variant
         )
         logger.info(f"Found {len(sentinel2_files)} Sentinel-2 files")
         
         for raw_file in sentinel2_files:
-            # Handles both Sentinel2_YYYY_MM.tif and sentinel2_YYYY_MM.npz
             parts = raw_file.stem.split('_')
             try:
                 year  = int(parts[-2])
@@ -3882,7 +3719,7 @@ def main():
             # ── DIAGNOSTIC PLOTS (first S2 file only) ─────────────────
             if len(sentinel2_processed) == 1:
                 try:
-                    raw_s2_data = load_raw_file(raw_file) or {}
+                    raw_s2_data = load_tif_as_bands(raw_file) or {}
                     diag.plot_s2_raw_bands(
                         raw_s2_data,
                         filename="s2_01_raw_bands.png",
@@ -4147,9 +3984,9 @@ def main():
 
     dates = dates_all[:n_samples]
 
-    # Step 6: Create splits - MODIFIED
+    # Step 6: Create splits
     logger.info("\n" + "="*70)
-    logger.info("STEP 5: Create train/val/test splits")
+    logger.info("STEP 6: Create train/val/test splits")
     logger.info("="*70)
     
     # Use enhanced dataset creator
@@ -4165,7 +4002,7 @@ def main():
 
     # Step 6.5: Compute normalization statistics from training data
     logger.info("\n" + "="*70)
-    logger.info("STEP 5.5: Compute normalization statistics")
+    logger.info("STEP 6.5: Compute normalization statistics")
     logger.info("="*70)
 
     output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
@@ -4176,7 +4013,7 @@ def main():
     )
 
     logger.info("\n" + "="*70)
-    logger.info("STEP 5.5.1: Verify no data leakage (RAW)")
+    logger.info("STEP 6.5.1: Verify no data leakage (RAW)")
     logger.info("="*70)
 
     dataset_creator.verify_no_data_leakage(
@@ -4188,8 +4025,15 @@ def main():
 
     # Step 6.6: Normalize all splits
     logger.info("\n" + "="*70)
-    logger.info("STEP 5.6: Normalize data")
+    logger.info("STEP 6.6: Normalize data")
     logger.info("="*70)
+
+    # Snapshot a small raw sample before normalisation for the diagnostics plot.
+    # 200 patches is negligible memory cost and avoids the approximate
+    # un-normalisation reconstruction that was used previously.
+    _snap_size = min(200, splits['X_train'].shape[0])
+    X_raw_snap = splits['X_train'][:_snap_size].copy()
+    y_raw_snap = splits['y_train'][:_snap_size].copy()
 
     logger.info("Normalizing training data...")
     splits['X_train'], splits['y_train'] = dataset_creator.normalize_data(
@@ -4234,40 +4078,20 @@ def main():
     except Exception as _e:
         logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
 
-    # ── Normalisation diagnostics (needs raw X/y before norm — snapshot already
-    #    taken above; here we generate the plot from the normalised splits and
-    #    the norm_stats to reconstruct a before/after approximation) ──────────
+    # ── Normalisation diagnostics — uses the pre-norm snapshot taken above ──
     try:
-        # Reconstruct raw values from normalised splits using norm_stats
-        # (avoids storing a second full copy of X/y in memory)
         X_train_norm = splits.get("X_train")
         y_train_norm = splits.get("y_train")
         if X_train_norm is not None and y_train_norm is not None:
-            n_ch = X_train_norm.shape[-1]
-            # Un-normalise a small sample (first 200 patches) to get "raw" approx
-            sample_size = min(200, X_train_norm.shape[0])
-            X_raw_approx = X_train_norm[:sample_size].copy()
-            y_raw_approx = y_train_norm[:sample_size].copy()
-            for ch in range(n_ch):
-                ch_key = f"channel_{ch}"
-                if ch_key in norm_stats.get("features", {}):
-                    mean_ = norm_stats["features"][ch_key]["mean"]
-                    std_  = norm_stats["features"][ch_key]["std"]
-                    if std_ > 1e-8:
-                        X_raw_approx[:, :, :, ch] = (
-                            X_train_norm[:sample_size, :, :, ch] * std_ + mean_
-                        )
-            t_mean = norm_stats.get("target", {}).get("mean", 0.0)
-            t_std  = norm_stats.get("target", {}).get("std",  1.0)
-            y_raw_approx = y_train_norm[:sample_size] * t_std + t_mean
-
+            snap_size = X_raw_snap.shape[0]
             diag.plot_normalization_diagnostics(
-                X_raw_approx, X_train_norm[:sample_size],
-                y_raw_approx, y_train_norm[:sample_size],
+                X_raw_snap, X_train_norm[:snap_size],
+                y_raw_snap, y_train_norm[:snap_size],
                 channel_names=channel_names,
                 filename="07_normalization.png",
             )
             logger.info("[Diagnostics] Normalisation diagnostics plot saved.")
+            del X_raw_snap, y_raw_snap
     except Exception as _e:
         logger.warning(f"[Diagnostics] normalisation plot failed: {_e}")
 

@@ -140,8 +140,12 @@ class RealMapOverlay:
         from io import BytesIO
         import base64
         
-        # Normalize LST to 0-255
-        lst_norm = ((lst_map - lst_map.min()) / (lst_map.max() - lst_map.min()) * 255).astype(np.uint8)
+        # Normalize LST to 0-255 — guard against flat (constant) arrays
+        _lst_range = lst_map.max() - lst_map.min()
+        if _lst_range > 1e-6:
+            lst_norm = ((lst_map - lst_map.min()) / _lst_range * 255).astype(np.uint8)
+        else:
+            lst_norm = np.full(lst_map.shape, 128, dtype=np.uint8)
         
         # Create RGBA image with colormap
         from matplotlib import cm
@@ -220,15 +224,17 @@ class RealMapOverlay:
         heat_data = []
         lst_min = float(lst_map.min())
         lst_max = float(lst_map.max())
-        
+        _lst_range = lst_max - lst_min
+
         for i in range(0, height, step):
             for j in range(0, width, step):
                 # Calculate lat/lon for this pixel
                 lat = float(self.bounds[1] + (i / height) * (self.bounds[3] - self.bounds[1]))
                 lon = float(self.bounds[0] + (j / width) * (self.bounds[2] - self.bounds[0]))
-                
-                # Normalize temperature to 0-1 for weight
-                weight = float((lst_map[i, j] - lst_min) / (lst_max - lst_min))
+
+                # Normalize temperature to 0-1 for weight — guard flat array
+                weight = (float((lst_map[i, j] - lst_min) / _lst_range)
+                          if _lst_range > 1e-6 else 0.5)
                 
                 heat_data.append([lat, lon, weight])
         
