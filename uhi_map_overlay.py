@@ -578,8 +578,15 @@ def demo_usage():
     logger.info("REAL MAP OVERLAY DEMO")
     logger.info("="*60)
     
-    # Example: Jakarta bounds (adjust to your actual data)
-    bounds = (106.6, -6.4, 107.1, -6.0)  # (west, south, east, north)
+    # Use bounds from config (reads STUDY_AREA defined in config.py)
+    cfg_bounds = STUDY_AREA["bounds"]
+    bounds = (
+        cfg_bounds["min_lon"],
+        cfg_bounds["min_lat"],
+        cfg_bounds["max_lon"],
+        cfg_bounds["max_lat"],
+    )
+    logger.info(f"Using STUDY_AREA bounds from config: {bounds}")
     
     # Load example data (replace with your actual data)
     data_dir = OUTPUT_DIR / "predictions" / "data"

@@ -221,10 +221,13 @@ class InferenceDiagnosticsPlotter:
         """
         Side-by-side spatial maps: CNN · GBM (broadcast) · Ensemble · Error (if targets given).
 
+        An additional figure (03b) shows the full mosaicked ensemble prediction
+        across all patches, giving a whole-area view of the inference result.
+
         Args:
             results:   Output dict from predict_ensemble().
             targets:   Optional (N, H, W) ground-truth for error column.
-            n_samples: How many patches to display (rows).
+            n_samples: How many patches to display (rows) in the per-patch figure.
         """
         try:
             self._use_style()
@@ -298,8 +301,104 @@ class InferenceDiagnosticsPlotter:
 
             plt.tight_layout()
             self._save(fig, "03_spatial_predictions")
+
+            # ── 03b: Full mosaicked map across ALL patches ────────────────────
+            self._plot_full_mosaic(ensemble, cnn, gbm, targets)
+
         except Exception as e:
             logger.warning(f"plot_spatial_predictions failed: {e}")
+
+    def _mosaic_patches(self, patches: np.ndarray) -> np.ndarray:
+        """Tile (N, H, W) patches into a single (rows*H, cols*W) mosaic."""
+        N, H, W = patches.shape
+        cols = int(np.ceil(np.sqrt(N)))
+        rows = int(np.ceil(N / cols))
+        padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
+        padded[:N] = patches
+        return padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+
+    def _plot_full_mosaic(self, ensemble: np.ndarray, cnn: np.ndarray,
+                          gbm: np.ndarray, targets: np.ndarray = None):
+        """
+        Figure 03b — full mosaicked inference result covering the entire study area.
+
+        Shows: CNN mosaic · GBM mosaic · Ensemble mosaic · Error mosaic (if targets given).
+        """
+        try:
+            N_total = len(ensemble)
+            logger.info(f"  Mosaicking {N_total} patches for full-area map …")
+
+            ens_mosaic = self._mosaic_patches(ensemble)
+            cnn_mosaic = self._mosaic_patches(cnn)
+
+            # GBM: broadcast per-patch scalar or per-patch spatial map
+            H, W = ensemble.shape[1], ensemble.shape[2]
+            if gbm.ndim == 1:
+                gbm_tiles = np.stack([np.full((H, W), float(v)) for v in gbm])
+            else:
+                gbm_tiles = gbm
+            gbm_mosaic = self._mosaic_patches(gbm_tiles)
+
+            has_targets = targets is not None
+            n_cols = 4 if has_targets else 3
+            col_titles = ["CNN", "GBM", "Ensemble", "Error (Ens − Target)"][:n_cols]
+
+            fig_w = max(10, 5 * n_cols)
+            fig_h = max(6, int(fig_w * ens_mosaic.shape[0] / (ens_mosaic.shape[1] * n_cols)) + 2)
+            fig, axes = plt.subplots(1, n_cols, figsize=(fig_w, fig_h))
+            if n_cols == 1:
+                axes = [axes]
+
+            vmin = float(np.nanmin(ens_mosaic)); vmax = float(np.nanmax(ens_mosaic))
+
+            for ax, data, title in zip(axes[:3], [cnn_mosaic, gbm_mosaic, ens_mosaic],
+                                       col_titles[:3]):
+                im = ax.imshow(data, vmin=vmin, vmax=vmax, cmap="hot",
+                               interpolation="bilinear")
+                ax.set_title(title, fontsize=10, fontweight="bold")
+                ax.axis("off")
+                cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cb.set_label("LST (°C)", fontsize=8)
+                # Annotate stats
+                ax.text(0.02, 0.02,
+                        f"mean={np.nanmean(data):.1f}°C\nstd={np.nanstd(data):.2f}°C\n"
+                        f"[{np.nanmin(data):.1f}, {np.nanmax(data):.1f}]",
+                        transform=ax.transAxes, fontsize=7,
+                        color="white", va="bottom",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
+
+            if has_targets:
+                tgt_arr = np.asarray(targets)
+                if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
+                    tgt_arr = tgt_arr[:, 0]
+                tgt_mosaic = self._mosaic_patches(tgt_arr)
+                err_mosaic = ens_mosaic - tgt_mosaic
+                err_abs = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
+                norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                im_err = axes[3].imshow(err_mosaic, norm=norm_err, cmap="RdBu_r",
+                                        interpolation="bilinear")
+                axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
+                axes[3].axis("off")
+                cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
+                cb_err.set_label("Error (°C)", fontsize=8)
+                rmse_all = float(np.sqrt(np.nanmean(err_mosaic ** 2)))
+                axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
+                             transform=axes[3].transAxes, fontsize=7,
+                             color="white", va="bottom",
+                             bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
+
+            cols_grid = int(np.ceil(np.sqrt(N_total)))
+            rows_grid = int(np.ceil(N_total / cols_grid))
+            fig.suptitle(
+                f"Inference – Full Study-Area Mosaic  "
+                f"({N_total} patches → {rows_grid}×{cols_grid} grid, "
+                f"{ens_mosaic.shape[0]}×{ens_mosaic.shape[1]} px)",
+                fontsize=12, fontweight="bold")
+            plt.tight_layout()
+            self._save(fig, "03b_full_mosaic_predictions")
+
+        except Exception as e:
+            logger.warning(f"_plot_full_mosaic failed: {e}")
 
     # ── 4. Uncertainty maps ───────────────────────────────────────────────────
 
@@ -1059,6 +1158,33 @@ class EnsemblePredictor:
                            f"{[str(p) for p in _cal_candidates]}). "
                            "Predictions will NOT be calibrated — re-run training to generate it.")
 
+        # Load bottleneck PCA (fitted during training to compress 3*C_bot dims → 32).
+        # Without this, _extract_cnn_bottleneck_features returns 3*256=768 columns,
+        # which causes the "inference=890, training=154" feature-mismatch warning.
+        _model_root = Path(cnn_model_path).parent
+        _pca_candidates = [
+            _model_root / "bottleneck_pca.pkl",
+            _model_root.parent / "bottleneck_pca.pkl",
+        ]
+        _pca_path = next((p for p in _pca_candidates if p.exists()), None)
+        if _pca_path is not None:
+            try:
+                import joblib
+                self._bottleneck_pca = joblib.load(_pca_path)
+                logger.info(f"✅ Loaded bottleneck PCA ({self._bottleneck_pca.n_components_} "
+                            f"components) from {_pca_path}")
+            except Exception as _pe:
+                self._bottleneck_pca = None
+                logger.warning(f"⚠️ Could not load bottleneck PCA ({_pe}); "
+                               "bottleneck features will be passed raw and may cause a feature mismatch")
+        else:
+            self._bottleneck_pca = None
+            logger.warning(
+                "⚠️ bottleneck_pca.pkl not found — GBM feature count may not match training. "
+                "To fix: re-run train_ensemble.py (the updated version now saves the PCA). "
+                f"Searched: {[str(p) for p in _pca_candidates]}"
+            )
+
         # Diagnostics plotter — saves all inference figures to MODEL_DIR/inference_diagnostics/
         self.plotter = InferenceDiagnosticsPlotter(
             save_dir=Path(cnn_model_path).parent.parent / "inference_diagnostics"
@@ -1195,6 +1321,7 @@ class EnsemblePredictor:
         # ── FIX 6: Append CNN bottleneck features ──────────────────────────────
         try:
             bot_feats = self._extract_cnn_bottleneck_features(X)
+            bot_feats = self._apply_bottleneck_pca(bot_feats)   # compress to training dims
             bot_cols  = [f"cnn_bot_{i}" for i in range(bot_feats.shape[1])]
             bot_df    = pd.DataFrame(bot_feats, columns=bot_cols)
             features_df = pd.concat([features_df, bot_df], axis=1)
@@ -1271,6 +1398,21 @@ class EnsemblePredictor:
             all_stats.append(stats)
 
         return np.vstack(all_stats)
+
+    def _apply_bottleneck_pca(self, bot_feats: np.ndarray) -> np.ndarray:
+        """
+        Apply the PCA that was fitted during training to compress raw bottleneck
+        statistics.  If no PCA was loaded (e.g. old checkpoint), returns raw feats
+        and emits a warning so the caller can fall back to column-alignment padding.
+        """
+        if self._bottleneck_pca is not None:
+            try:
+                compressed = self._bottleneck_pca.transform(bot_feats)
+                logger.info(f"  PCA: {bot_feats.shape[1]} → {compressed.shape[1]} bottleneck dims")
+                return compressed
+            except Exception as _e:
+                logger.warning(f"  ⚠️ PCA transform failed ({_e}); using raw bottleneck features")
+        return bot_feats
     
     def predict_ensemble(self, X: np.ndarray, batch_size: int = 8, 
                         return_uncertainty: bool = False,

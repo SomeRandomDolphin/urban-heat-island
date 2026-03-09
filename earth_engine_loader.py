@@ -345,10 +345,9 @@ class EarthEngineLoader:
            reflectance value; genuine no-data is already handled by upstream
            QA/SCL masking embedded in the composite.
 
-        2. bestEffort=True — instructs GEE to automatically coarsen the export
-           resolution if the pixel count would exceed maxPixels, rather than
-           failing silently.  This also prevents the task engine from splitting
-           the export at tile boundaries into multiple files.
+        maxPixels=1e10 handles the pixel limit, and unmask(0) fills tile-seam
+        borders so the exported GeoTIFF covers the full AOI without diagonal
+        cutoff edges.
 
         Args:
             image:       Composite image to export.
@@ -383,14 +382,11 @@ class EarthEngineLoader:
             crs=self.EXPORT_CRS,
             maxPixels=1e10,
             fileFormat='GeoTIFF',
-            # bestEffort: prevents silent failures and tile-boundary file splits
-            # on large AOIs that approach the maxPixels limit.
-            bestEffort=True,
         )
         task.start()
         logger.info(f"  Export task submitted: {description} "
                     f"({len(export_bands)} bands @ {scale}m, "
-                    f"unmask+bestEffort enabled)")
+                    f"unmask enabled)")
         return task
 
     def _wait_for_task(self, task: ee.batch.Task,

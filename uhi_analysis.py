@@ -532,6 +532,7 @@ class UHIAnalyzer:
         """
         Moran's I approximation via row/column lag autocorrelation.
         Plots ACF in both spatial directions.
+        Uses numpy-only correlation to avoid repeated stats.pearsonr on large maps.
         """
         if self.uhi_map is None:
             raise ValueError("Call calculate_uhi_intensity() first.")
@@ -541,6 +542,12 @@ class UHIAnalyzer:
         fig.suptitle("Spatial Autocorrelation of UHI", fontsize=14, fontweight="bold")
 
         uhi = self.uhi_map
+
+        def _fast_corr(a: np.ndarray, b: np.ndarray) -> float:
+            """Pearson r without scipy overhead."""
+            a = a - a.mean(); b = b - b.mean()
+            denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
+            return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
 
         for ax, direction, data in [
             (axes[0], "N–S (row lag)", uhi),
@@ -553,9 +560,8 @@ class UHIAnalyzer:
                     ci_upper.append(1.0)
                 else:
                     a = data[:-lag, :].ravel()
-                    b = data[lag:, :].ravel()
-                    r, _ = stats.pearsonr(a, b)
-                    acf_vals.append(r)
+                    b = data[lag:,  :].ravel()
+                    acf_vals.append(_fast_corr(a, b))
                     ci_upper.append(1.96 / np.sqrt(len(a)))
                 lags.append(lag)
 
@@ -570,7 +576,6 @@ class UHIAnalyzer:
             ax.set_ylim(-1.05, 1.05)
             ax.grid(True, alpha=0.3)
 
-            # Log key lags
             logger.info(f"  {direction}: lag-1={acf_vals[1]:.4f}  "
                         f"lag-5={acf_vals[min(5,max_lag)]:.4f}  "
                         f"lag-10={acf_vals[min(10,max_lag)]:.4f}")
@@ -598,54 +603,53 @@ class HotspotDetector:
         logger.info(f"  Resolution: {resolution} m/pixel")
 
     def calculate_gi_star(self, search_radius: float = 500.0) -> np.ndarray:
-        logger.info(f"Calculating Gi* statistic (radius={search_radius}m)...")
+        """
+        Vectorised Getis-Ord Gi* using scipy.ndimage.uniform_filter.
+
+        The original implementation used an O(N²) nested Python loop — one full
+        (H×W) distance matrix per pixel — which freezes on any map larger than
+        ~128×128.  This version runs in O(N) time by replacing the per-pixel loop
+        with two uniform_filter passes (sum of values, sum of weights) over the
+        entire array at once, which is equivalent to a binary disc kernel Gi*.
+        """
+        from scipy.ndimage import uniform_filter
+
+        logger.info(f"Calculating Gi* statistic (radius={search_radius}m, vectorised)...")
 
         height, width = self.lst_map.shape
-        gi_star = np.zeros_like(self.lst_map)
+        n = self.lst_map.size
 
-        y_coords, x_coords = np.mgrid[0:height, 0:width] * self.resolution
+        # Kernel half-width in pixels (equivalent to the search radius disc)
+        kernel_px = max(1, int(search_radius / self.resolution))
+        # uniform_filter size must be odd
+        ksize = 2 * kernel_px + 1
 
-        X_bar = np.mean(self.lst_map)
-        S     = np.std(self.lst_map)
-        n     = self.lst_map.size
+        logger.info(f"  Kernel size : {ksize}×{ksize} px  "
+                    f"({ksize * self.resolution:.0f}×{ksize * self.resolution:.0f} m)")
 
-        step = max(1, int(search_radius / self.resolution / 2))
+        X_bar = float(self.lst_map.mean())
+        S     = float(self.lst_map.std())
 
-        for i in tqdm(range(0, height, step), desc="Gi* calculation"):
-            for j in range(0, width, step):
-                dist_y    = (y_coords - y_coords[i, j]) ** 2
-                dist_x    = (x_coords - x_coords[i, j]) ** 2
-                distances = np.sqrt(dist_y + dist_x)
+        if S < 1e-6:
+            logger.warning("  ⚠️ LST map has near-zero variance — Gi* will be all zeros")
+            gi_star = np.zeros_like(self.lst_map, dtype=np.float32)
+            self.hotspot_map = gi_star
+            return gi_star
 
-                weights = np.zeros_like(distances)
-                in_r    = distances <= search_radius
-                weights[in_r] = 1.0 / (distances[in_r] + 1e-6)
-                w_sum   = weights.sum()
-                if w_sum > 0:
-                    weights /= w_sum
+        # uniform_filter computes a local mean; multiply by ksize² to get local sum
+        w_sum    = float(ksize * ksize)          # all weights = 1 (binary disc approx.)
+        w_sum_sq = w_sum                         # sum of w² = sum of 1² = w_sum
 
-                weighted_sum   = np.sum(weights * self.lst_map)
-                sum_weights    = np.sum(weights)
-                sum_weights_sq = np.sum(weights ** 2)
+        local_sum = uniform_filter(self.lst_map.astype(np.float64),
+                                   size=ksize, mode="reflect") * w_sum
 
-                if sum_weights > 0:
-                    numerator   = weighted_sum - X_bar * sum_weights
-                    denominator = S * np.sqrt(
-                        (n * sum_weights_sq - sum_weights ** 2) / (n - 1))
-                    if denominator > 1e-6:
-                        gi_star[i, j] = numerator / denominator
+        numerator   = local_sum - X_bar * w_sum
+        denominator = S * np.sqrt((n * w_sum_sq - w_sum ** 2) / max(n - 1, 1))
 
-        if step > 1:
-            from scipy.interpolate import RegularGridInterpolator
-            y_sub = np.arange(0, height, step)
-            x_sub = np.arange(0, width, step)
-            interp = RegularGridInterpolator(
-                (y_sub, x_sub), gi_star[::step, ::step],
-                method="linear", bounds_error=False, fill_value=0)
-            y_full, x_full = np.mgrid[0:height, 0:width]
-            gi_star = interp(
-                np.column_stack([y_full.ravel(), x_full.ravel()])
-            ).reshape(height, width)
+        if denominator > 1e-6:
+            gi_star = (numerator / denominator).astype(np.float32)
+        else:
+            gi_star = np.zeros_like(self.lst_map, dtype=np.float32)
 
         self.hotspot_map = gi_star
 
@@ -1225,6 +1229,21 @@ def run_all_diagnostics(
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: List[Path] = []
 
+    # Delegate to the new composable plotter (same interface, inference-style output)
+    plotter = AnalysisDiagnosticsPlotter(save_dir=output_dir)
+    saved = plotter.plot_all(
+        lst_map=lst_map,
+        uhi_map=uhi_map,
+        gi_star=gi_star,
+        hotspots_df=hotspots_df,
+        predictions=predictions,
+        ground_truth=ground_truth,
+        urban_mask=urban_mask,
+        rural_mask=rural_mask,
+    )
+    return saved
+
+    # ── Legacy per-class calls kept below for reference (unreachable) ──────────
     analyzer = UHIAnalyzer(lst_map)
     if uhi_map is not None:
         analyzer.uhi_map = uhi_map
@@ -1274,6 +1293,710 @@ def run_all_diagnostics(
 
     logger.info(f"\n✅  All diagnostic plots saved ({len(saved)} figures) → {output_dir}")
     return saved
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AnalysisDiagnosticsPlotter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnalysisDiagnosticsPlotter:
+    """
+    Centralised matplotlib diagnostics for the UHI analysis pipeline.
+
+    Mirrors the InferenceDiagnosticsPlotter style from uhi_inference.py, wrapping
+    all UHIAnalyzer, HotspotDetector, and ValidationAnalyzer plot methods into a
+    single, composable class.
+
+    All figures are saved under `save_dir`
+    (default: OUTPUT_DIR / \"analysis_diagnostics\").
+
+    Usage::
+
+        plotter = AnalysisDiagnosticsPlotter()
+        plotter.plot_all(
+            lst_map=lst, uhi_map=uhi, gi_star=gi,
+            hotspots_df=hotspots,
+            predictions=preds, ground_truth=gt,
+            urban_mask=urban, rural_mask=rural,
+        )
+        # — or call individual plot_* methods as needed —
+    """
+
+    _STYLE_CANDIDATES = [
+        "seaborn-v0_8-darkgrid",
+        "seaborn-darkgrid",
+        "ggplot",
+        "default",
+    ]
+
+    def __init__(self, save_dir: Path = None):
+        self.save_dir = Path(save_dir) if save_dir else OUTPUT_DIR / "analysis_diagnostics"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._style = self._resolve_style()
+        logger.info(
+            f"📊 AnalysisDiagnosticsPlotter initialised — "
+            f"style='{self._style}' → {self.save_dir}"
+        )
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @classmethod
+    def _resolve_style(cls) -> str:
+        available = set(plt.style.available)
+        for style in cls._STYLE_CANDIDATES:
+            if style in available:
+                return style
+        return "default"
+
+    def _use_style(self):
+        try:
+            plt.style.use(self._style)
+        except Exception:
+            pass
+
+    def _save(self, fig, name: str) -> Path:
+        path = self.save_dir / f"{name}.png"
+        try:
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            logger.info(f"  ✅ Saved: {path.name}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not save {path.name}: {e}")
+        finally:
+            plt.close(fig)
+        return path
+
+    # ── 1. LST distribution ───────────────────────────────────────────────────
+
+    def plot_lst_distribution(self,
+                              lst_map: np.ndarray,
+                              urban_mask: np.ndarray = None,
+                              rural_mask: np.ndarray = None):
+        """
+        Histogram + KDE of the full LST array; optionally overlaid with
+        separate urban and rural distributions.
+
+        Args:
+            lst_map:    2-D LST array (H, W) in °C.
+            urban_mask: Optional boolean mask selecting urban pixels.
+            rural_mask: Optional boolean mask selecting rural pixels.
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle("Analysis – LST Distribution", fontsize=14, fontweight="bold")
+
+            flat = lst_map.flatten()
+            flat = flat[np.isfinite(flat)]
+
+            # Left: full histogram + KDE
+            ax = axes[0]
+            ax.hist(flat, bins=60, density=True, color="#EF5350", alpha=0.65,
+                    edgecolor="white", linewidth=0.3, label="All pixels")
+            x_grid = np.linspace(flat.min(), flat.max(), 300)
+            kde_vals = _safe_kde(flat, x_grid)
+            if kde_vals is not None:
+                ax.plot(x_grid, kde_vals, color="#B71C1C", lw=1.8, label="KDE")
+            ax.axvline(float(np.nanmean(flat)), color="navy", ls="--", lw=1.2,
+                       label=f"Mean {np.nanmean(flat):.1f}°C")
+            ax.axvline(float(np.nanmedian(flat)), color="darkgreen", ls=":", lw=1.2,
+                       label=f"Median {np.nanmedian(flat):.1f}°C")
+            ax.set_xlabel("LST (°C)"); ax.set_ylabel("Density")
+            ax.set_title("Full LST Histogram + KDE"); ax.legend(fontsize=8)
+            ax.text(0.97, 0.97,
+                    f"n={len(flat):,}\nmean={np.nanmean(flat):.2f}°C\n"
+                    f"std={np.nanstd(flat):.2f}°C\n"
+                    f"[{flat.min():.1f}, {flat.max():.1f}]",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            # Right: urban vs rural if masks provided
+            ax = axes[1]
+            if urban_mask is not None and rural_mask is not None:
+                u_vals = lst_map[urban_mask]
+                r_vals = lst_map[rural_mask]
+                u_vals = u_vals[np.isfinite(u_vals)]
+                r_vals = r_vals[np.isfinite(r_vals)]
+                for vals, color, label in [
+                    (u_vals, "#E53935", "Urban"),
+                    (r_vals, "#43A047", "Rural"),
+                ]:
+                    ax.hist(vals, bins=50, density=True, alpha=0.55,
+                            color=color, edgecolor="white", linewidth=0.3, label=label)
+                    xg = np.linspace(vals.min(), vals.max(), 200)
+                    kd = _safe_kde(vals, xg)
+                    if kd is not None:
+                        ax.plot(xg, kd, color=color, lw=1.6)
+                # Cohen's d
+                _pooled = np.sqrt((u_vals.std()**2 + r_vals.std()**2) / 2)
+                d_cohen = ((u_vals.mean() - r_vals.mean()) / _pooled
+                           if _pooled > 1e-8 else float("nan"))
+                ax.set_title(f"Urban vs Rural LST  (Cohen d={d_cohen:.2f})")
+                ax.legend(fontsize=8)
+            else:
+                # Fallback: spatial heatmap as an image
+                im = ax.imshow(lst_map, cmap=_THERMAL_CMAP, interpolation="bilinear")
+                plt.colorbar(im, ax=ax, label="LST (°C)", shrink=0.85)
+                ax.set_title("LST Spatial Map"); ax.axis("off")
+            ax.set_xlabel("LST (°C)"); ax.set_ylabel("Density")
+
+            plt.tight_layout()
+            return self._save(fig, "01_lst_distribution")
+        except Exception as e:
+            logger.warning(f"plot_lst_distribution failed: {e}")
+
+    # ── 2. UHI intensity diagnostics ─────────────────────────────────────────
+
+    def plot_uhi_intensity(self, uhi_map: np.ndarray):
+        """
+        Histogram, spatial map, and cumulative distribution of UHI intensity.
+
+        Args:
+            uhi_map: 2-D UHI intensity array (H, W) in °C (urban − rural).
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+            fig.suptitle("Analysis – UHI Intensity Diagnostics",
+                         fontsize=14, fontweight="bold")
+
+            flat = uhi_map.flatten()
+            flat = flat[np.isfinite(flat)]
+
+            # [0] Histogram + KDE
+            ax = axes[0]
+            ax.hist(flat, bins=60, density=True, color="#FB8C00", alpha=0.7,
+                    edgecolor="white", linewidth=0.3)
+            x_grid = np.linspace(flat.min(), flat.max(), 300)
+            kde_vals = _safe_kde(flat, x_grid)
+            if kde_vals is not None:
+                ax.plot(x_grid, kde_vals, color="#E65100", lw=1.8, label="KDE")
+            ax.axvline(0, color="black", ls="--", lw=1.2, label="Neutral (0°C)")
+            ax.axvline(float(np.nanmean(flat)), color="navy", ls=":", lw=1.2,
+                       label=f"Mean {np.nanmean(flat):.2f}°C")
+            ax.set_xlabel("UHI Intensity (°C)"); ax.set_ylabel("Density")
+            ax.set_title("UHI Distribution"); ax.legend(fontsize=8)
+            ax.text(0.97, 0.97,
+                    f"mean={np.nanmean(flat):.2f}°C\nstd={np.nanstd(flat):.2f}°C\n"
+                    f"% > 0°C: {(flat > 0).mean()*100:.1f}%\n"
+                    f"% > 2°C: {(flat > 2).mean()*100:.1f}%",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            # [1] Spatial map
+            ax = axes[1]
+            vmax_abs = max(abs(float(np.nanpercentile(flat, 2))),
+                           abs(float(np.nanpercentile(flat, 98))))
+            norm = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+            im = ax.imshow(uhi_map, cmap="RdBu_r", norm=norm,
+                           interpolation="bilinear")
+            plt.colorbar(im, ax=ax, label="UHI (°C)", shrink=0.85)
+            ax.set_title("UHI Spatial Map"); ax.axis("off")
+
+            # [2] Cumulative distribution
+            ax = axes[2]
+            sorted_vals = np.sort(flat)
+            cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
+            ax.plot(sorted_vals, cdf * 100, color="#5E35B1", lw=1.8)
+            for threshold, color, ls in [(0, "gray", "--"), (2, "orange", "-."),
+                                         (3, "red", ":")]:
+                pct = float((flat <= threshold).mean() * 100)
+                ax.axvline(threshold, color=color, ls=ls, lw=1.0,
+                           label=f"{threshold}°C → {pct:.0f}%ile")
+            ax.set_xlabel("UHI Intensity (°C)"); ax.set_ylabel("Cumulative % of pixels")
+            ax.set_title("CDF of UHI Intensity"); ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            return self._save(fig, "02_uhi_intensity")
+        except Exception as e:
+            logger.warning(f"plot_uhi_intensity failed: {e}")
+
+    # ── 3. UHI classification breakdown ──────────────────────────────────────
+
+    def plot_uhi_classification(self, uhi_map: np.ndarray):
+        """
+        Pie chart + classified spatial map of UHI intensity categories.
+
+        Args:
+            uhi_map: 2-D UHI intensity array (H, W).
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle("Analysis – UHI Classification Breakdown",
+                         fontsize=14, fontweight="bold")
+
+            classified = np.zeros_like(uhi_map, dtype=np.int8)
+            classified[uhi_map < 0]                            = 0
+            classified[(uhi_map >= 0) & (uhi_map < 1)]        = 1
+            classified[(uhi_map >= 1) & (uhi_map < 2)]        = 2
+            classified[(uhi_map >= 2) & (uhi_map < 3)]        = 3
+            classified[uhi_map >= 3]                           = 4
+
+            counts = [int((classified == i).sum()) for i in range(5)]
+            labels = _UHI_CAT_LABELS
+            colors = _UHI_CAT_COLORS
+
+            # [0] Pie
+            ax = axes[0]
+            non_zero = [(c, l, col) for c, l, col in zip(counts, labels, colors) if c > 0]
+            if non_zero:
+                c_vals, l_vals, col_vals = zip(*non_zero)
+                ax.pie(c_vals, labels=l_vals, colors=col_vals, autopct="%1.1f%%",
+                       startangle=90, pctdistance=0.8)
+                ax.set_title("Area Fraction by Category")
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        transform=ax.transAxes)
+
+            # [1] Spatial classified map
+            ax = axes[1]
+            from matplotlib.colors import ListedColormap, BoundaryNorm as BN
+            cmap_cls = ListedColormap(colors)
+            bnorm    = BN([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap_cls.N)
+            im = ax.imshow(classified, cmap=cmap_cls, norm=bnorm,
+                           interpolation="nearest")
+            cbar = plt.colorbar(im, ax=ax, ticks=[0, 1, 2, 3, 4], shrink=0.85)
+            cbar.ax.set_yticklabels(labels, fontsize=7)
+            ax.set_title("UHI Classification Map"); ax.axis("off")
+
+            plt.tight_layout()
+            return self._save(fig, "03_uhi_classification")
+        except Exception as e:
+            logger.warning(f"plot_uhi_classification failed: {e}")
+
+    # ── 4. Gi* hotspot diagnostics ────────────────────────────────────────────
+
+    def plot_gi_star_diagnostics(self, lst_map: np.ndarray,
+                                 gi_star: np.ndarray):
+        """
+        Gi* spatial map, histogram, and scatter vs LST.
+
+        Args:
+            lst_map: 2-D LST array (H, W).
+            gi_star: 2-D Gi* statistic array (H, W).
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+            fig.suptitle("Analysis – Getis-Ord Gi* Hotspot Diagnostics",
+                         fontsize=14, fontweight="bold")
+
+            gi_flat  = gi_star.flatten()
+            lst_flat = lst_map.flatten()
+            mask     = np.isfinite(gi_flat) & np.isfinite(lst_flat)
+            gi_flat  = gi_flat[mask]
+            lst_flat = lst_flat[mask]
+
+            # [0] Gi* spatial map
+            ax = axes[0]
+            vmax = float(np.abs(np.nanpercentile(gi_flat, [2, 98])).max())
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+            im = ax.imshow(gi_star, cmap="RdBu_r", norm=norm,
+                           interpolation="bilinear")
+            plt.colorbar(im, ax=ax, label="Gi* statistic", shrink=0.85)
+            ax.set_title("Gi* Spatial Distribution"); ax.axis("off")
+
+            # [1] Histogram + significance lines
+            ax = axes[1]
+            ax.hist(gi_flat, bins=60, density=True, color="#26C6DA", alpha=0.7,
+                    edgecolor="white", linewidth=0.3)
+            x_grid  = np.linspace(gi_flat.min(), gi_flat.max(), 300)
+            kde_vals = _safe_kde(gi_flat, x_grid)
+            if kde_vals is not None:
+                ax.plot(x_grid, kde_vals, color="#00838F", lw=1.8)
+            for z, label, color in [(1.65, "90%", "gold"),
+                                     (1.96, "95%", "orange"),
+                                     (2.58, "99%", "red")]:
+                ax.axvline( z, color=color, ls="--", lw=1.0, label=f"+{z} ({label})")
+                ax.axvline(-z, color=color, ls="--", lw=1.0)
+            ax.set_xlabel("Gi* statistic"); ax.set_ylabel("Density")
+            ax.set_title("Gi* Distribution + Significance Thresholds")
+            ax.legend(fontsize=8)
+            pct_hot = float((gi_flat > 2.58).mean() * 100)
+            ax.text(0.97, 0.97,
+                    f"n={len(gi_flat):,}\nmean={gi_flat.mean():.2f}\n"
+                    f"std={gi_flat.std():.2f}\n% > 2.58: {pct_hot:.1f}%",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            # [2] Scatter: LST vs Gi*
+            ax = axes[2]
+            idx = np.random.choice(len(gi_flat), min(8000, len(gi_flat)), replace=False)
+            density = _safe_kde_2d(lst_flat[idx], gi_flat[idx])
+            if density is not None:
+                sc = ax.scatter(lst_flat[idx], gi_flat[idx], c=density,
+                                cmap="plasma", s=6, alpha=0.7)
+                plt.colorbar(sc, ax=ax, label="Density")
+            else:
+                ax.scatter(lst_flat[idx], gi_flat[idx],
+                           c=gi_flat[idx], cmap="plasma", s=6, alpha=0.7)
+            r, p = stats.pearsonr(lst_flat, gi_flat)
+            ax.set_xlabel("LST (°C)"); ax.set_ylabel("Gi* statistic")
+            ax.set_title(f"LST vs Gi*  (r={r:.3f}, p={p:.2e})")
+            ax.axhline(2.58, color="red", ls="--", lw=0.8, label="99% threshold")
+            ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            return self._save(fig, "04_gi_star_diagnostics")
+        except Exception as e:
+            logger.warning(f"plot_gi_star_diagnostics failed: {e}")
+
+    # ── 5. Hotspot ranking ────────────────────────────────────────────────────
+
+    def plot_hotspot_ranking(self, hotspots_df: pd.DataFrame):
+        """
+        Top-N hotspot bar chart and area-vs-LST scatter.
+
+        Args:
+            hotspots_df: DataFrame produced by HotspotDetector.prioritize_hotspots().
+        """
+        try:
+            if hotspots_df is None or len(hotspots_df) == 0:
+                logger.warning("plot_hotspot_ranking: empty hotspots_df, skipping")
+                return
+            self._use_style()
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle("Analysis – Hotspot Ranking", fontsize=14, fontweight="bold")
+
+            top = hotspots_df.sort_values("priority_score", ascending=False).head(15)
+
+            # [0] Bar chart
+            ax = axes[0]
+            ranks = [f"#{int(r)}" for r in top["rank"]] if "rank" in top else \
+                    [str(i + 1) for i in range(len(top))]
+            scores = top["priority_score"].values
+            bars = ax.barh(ranks[::-1], scores[::-1],
+                           color=plt.cm.Reds(scores[::-1] / max(scores.max(), 1e-8)),  # type: ignore
+                           edgecolor="white")
+            ax.set_xlabel("Priority Score"); ax.set_title("Top-15 Hotspots by Priority")
+            ax.set_xlim(0, 1.05)
+
+            # [1] Area vs mean LST scatter
+            ax = axes[1]
+            if "area_km2" in hotspots_df and "mean_lst" in hotspots_df:
+                sc = ax.scatter(hotspots_df["area_km2"],
+                                hotspots_df["mean_lst"],
+                                c=hotspots_df["priority_score"],
+                                cmap="hot", s=40, alpha=0.8, edgecolors="gray", lw=0.3)
+                plt.colorbar(sc, ax=ax, label="Priority score")
+                ax.set_xlabel("Area (km²)"); ax.set_ylabel("Mean LST (°C)")
+                ax.set_title("Hotspot Area vs Mean LST")
+            else:
+                ax.text(0.5, 0.5, "area_km2 / mean_lst columns not found",
+                        ha="center", va="center", transform=ax.transAxes)
+
+            plt.tight_layout()
+            return self._save(fig, "05_hotspot_ranking")
+        except Exception as e:
+            logger.warning(f"plot_hotspot_ranking failed: {e}")
+
+    # ── 6. Spatial autocorrelation ────────────────────────────────────────────
+
+    def plot_spatial_autocorrelation(self, uhi_map: np.ndarray,
+                                     max_lag: int = 20):
+        """
+        Moran's I autocorrelogram showing spatial dependency of UHI intensity.
+
+        Args:
+            uhi_map:  2-D UHI intensity array (H, W).
+            max_lag:  Maximum pixel lag for autocorrelation.
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle("Analysis – Spatial Autocorrelation of UHI",
+                         fontsize=14, fontweight="bold")
+
+            def _fast_corr(a: np.ndarray, b: np.ndarray) -> float:
+                a = a - a.mean(); b = b - b.mean()
+                denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
+                return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
+
+            # [0] 2-D UHI map
+            ax = axes[0]
+            im = ax.imshow(uhi_map, cmap="hot", interpolation="bilinear")
+            plt.colorbar(im, ax=ax, label="UHI (°C)", shrink=0.85)
+            ax.set_title("UHI Intensity Map"); ax.axis("off")
+
+            # [1] Autocorrelogram — numpy only, no stats.pearsonr overhead
+            ax = axes[1]
+            lags, corrs = [], []
+            for lag in range(1, max_lag + 1):
+                h, w = uhi_map.shape
+                a = uhi_map[:h - lag, :w - lag].ravel()
+                b = uhi_map[lag:, lag:].ravel()
+                finite = np.isfinite(a) & np.isfinite(b)
+                if finite.sum() > 10:
+                    lags.append(lag)
+                    corrs.append(_fast_corr(a[finite], b[finite]))
+            ax.bar(lags, corrs, color="#42A5F5", edgecolor="white", linewidth=0.4)
+            ax.axhline(0, color="black", lw=0.8)
+            ax.axhline( 1.96 / np.sqrt(uhi_map.size), color="red",
+                        ls="--", lw=0.9, label="95% CI")
+            ax.axhline(-1.96 / np.sqrt(uhi_map.size), color="red", ls="--", lw=0.9)
+            ax.set_xlabel("Pixel Lag"); ax.set_ylabel("Pearson r")
+            ax.set_title("UHI Spatial Autocorrelogram"); ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            return self._save(fig, "06_spatial_autocorrelation")
+        except Exception as e:
+            logger.warning(f"plot_spatial_autocorrelation failed: {e}")
+
+    # ── 7. Validation ─────────────────────────────────────────────────────────
+
+    def plot_validation(self, predictions: np.ndarray, ground_truth: np.ndarray):
+        """
+        Predicted vs observed scatter, residual distribution, and calibration curve.
+
+        Args:
+            predictions:  Flat predicted LST array (°C).
+            ground_truth: Flat observed LST array (°C).
+        """
+        try:
+            self._use_style()
+
+            preds = np.asarray(predictions).flatten()
+            gt    = np.asarray(ground_truth).flatten()
+            mask  = np.isfinite(preds) & np.isfinite(gt)
+            preds, gt = preds[mask], gt[mask]
+
+            if len(preds) < 2:
+                logger.warning("plot_validation: fewer than 2 finite samples, skipping")
+                return
+
+            # Subsample for scatter / KDE — avoids OOM / freeze on 19M-element arrays.
+            # linregress and metrics still use the full arrays for accuracy.
+            MAX_SCATTER = 10_000
+            if len(preds) > MAX_SCATTER:
+                idx = np.random.choice(len(preds), MAX_SCATTER, replace=False)
+                preds_plot = preds[idx]
+                gt_plot    = gt[idx]
+                logger.info(f"  plot_validation: subsampled {len(preds):,} → {MAX_SCATTER:,} "
+                            f"points for scatter/KDE (metrics use full array)")
+            else:
+                preds_plot = preds
+                gt_plot    = gt
+
+            from scipy.stats import linregress
+            slope, intercept, r_val, *_ = linregress(gt, preds)
+            residuals      = preds      - gt
+            residuals_plot = preds_plot - gt_plot
+
+            fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+            fig.suptitle("Analysis – Validation: Predicted vs Observed",
+                         fontsize=14, fontweight="bold")
+
+            # [0] Scatter
+            ax = axes[0]
+            density = _safe_kde_2d(gt_plot, preds_plot)
+            if density is not None:
+                sc = ax.scatter(gt_plot, preds_plot, c=density, cmap="plasma",
+                                s=8, alpha=0.7)
+                plt.colorbar(sc, ax=ax, label="Density")
+            else:
+                ax.scatter(gt_plot, preds_plot, c=np.abs(residuals_plot),
+                           cmap="RdYlGn_r", s=8, alpha=0.6)
+            lo, hi = min(gt.min(), preds.min()), max(gt.max(), preds.max())
+            ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect")
+            fit_x = np.linspace(lo, hi, 200)
+            ax.plot(fit_x, slope * fit_x + intercept, "r-", lw=1.4,
+                    label=f"Fit slope={slope:.3f}")
+            ax.set_xlabel("Observed (°C)"); ax.set_ylabel("Predicted (°C)")
+            ax.set_title("Predicted vs Observed"); ax.legend(fontsize=8)
+            rmse = float(np.sqrt(np.mean(residuals ** 2)))
+            mae  = float(np.mean(np.abs(residuals)))
+            mbe  = float(np.mean(residuals))
+            ax.text(0.03, 0.97,
+                    f"R²={r_val**2:.4f}\nRMSE={rmse:.3f}°C\n"
+                    f"MAE={mae:.3f}°C\nMBE={mbe:.3f}°C\nslope={slope:.3f}\n"
+                    f"n={len(preds):,}",
+                    transform=ax.transAxes, fontsize=8, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            # [1] Residuals histogram + KDE (subsample)
+            ax = axes[1]
+            ax.hist(residuals_plot, bins=60, density=True, color="#5C6BC0",
+                    alpha=0.7, edgecolor="white", linewidth=0.3)
+            xr = np.linspace(residuals_plot.min(), residuals_plot.max(), 300)
+            kde_r = _safe_kde(residuals_plot, xr)
+            if kde_r is not None:
+                ax.plot(xr, kde_r, color="#283593", lw=1.8)
+            ax.axvline(0, color="black", lw=1.2, ls="--", label="Zero bias")
+            ax.axvline( residuals.std(), color="orange", ls=":", lw=1.0, label="±1σ")
+            ax.axvline(-residuals.std(), color="orange", ls=":", lw=1.0)
+            ax.set_xlabel("Residual (°C)"); ax.set_ylabel("Density")
+            ax.set_title("Residual Distribution"); ax.legend(fontsize=8)
+
+            # [2] Calibration curve — quantile–quantile on full arrays
+            ax = axes[2]
+            n_bins = 20
+            quantiles = np.linspace(0, 100, n_bins + 1)
+            obs_bins  = np.percentile(gt,    quantiles)
+            pred_bins = np.percentile(preds, quantiles)
+            ax.plot(obs_bins, pred_bins, color="#E53935", lw=1.6, marker="o",
+                    ms=4, label="Predicted quantiles")
+            lo_q = min(obs_bins.min(), pred_bins.min())
+            hi_q = max(obs_bins.max(), pred_bins.max())
+            ax.plot([lo_q, hi_q], [lo_q, hi_q], "k--", lw=1.1,
+                    label="Perfect calibration")
+            ax.set_xlabel("Observed LST bin midpoint (°C)")
+            ax.set_ylabel("Predicted LST (°C)")
+            ax.set_title("Calibration Curve (quantile–quantile)")
+            ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            return self._save(fig, "07_validation")
+        except Exception as e:
+            logger.warning(f"plot_validation failed: {e}", exc_info=True)
+
+    # ── 8. Summary dashboard ──────────────────────────────────────────────────
+
+    def plot_summary_dashboard(self,
+                               lst_map: np.ndarray,
+                               uhi_map: np.ndarray = None,
+                               gi_star: np.ndarray = None,
+                               reference_temps: Dict = None):
+        """
+        Single-page overview: LST map · UHI map · Gi* map · reference temperature
+        bar chart.
+
+        Args:
+            lst_map:         2-D LST array (H, W).
+            uhi_map:         Optional 2-D UHI intensity array.
+            gi_star:         Optional 2-D Gi* statistic array.
+            reference_temps: Optional dict with keys T_urban, T_rural, T_diff
+                             (as returned by UHIAnalyzer.define_reference_areas()).
+        """
+        try:
+            self._use_style()
+            n_maps = 1 + (uhi_map is not None) + (gi_star is not None)
+            has_ref = reference_temps is not None and "T_urban" in reference_temps
+
+            n_cols = n_maps + (1 if has_ref else 0)
+            fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
+            if n_cols == 1:
+                axes = [axes]
+            fig.suptitle("Analysis – Summary Dashboard",
+                         fontsize=15, fontweight="bold")
+
+            col = 0
+
+            # LST map
+            im = axes[col].imshow(lst_map, cmap=_THERMAL_CMAP, interpolation="bilinear")
+            plt.colorbar(im, ax=axes[col], label="LST (°C)", shrink=0.85)
+            axes[col].set_title(f"LST  (mean={np.nanmean(lst_map):.1f}°C)")
+            axes[col].axis("off"); col += 1
+
+            # UHI map
+            if uhi_map is not None:
+                vabs = float(np.nanpercentile(np.abs(uhi_map), 98))
+                norm = TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
+                im2  = axes[col].imshow(uhi_map, cmap="RdBu_r", norm=norm,
+                                        interpolation="bilinear")
+                plt.colorbar(im2, ax=axes[col], label="UHI (°C)", shrink=0.85)
+                axes[col].set_title(f"UHI Intensity  (mean={np.nanmean(uhi_map):.1f}°C)")
+                axes[col].axis("off"); col += 1
+
+            # Gi* map
+            if gi_star is not None:
+                vabs = float(np.nanpercentile(np.abs(gi_star), 98))
+                norm = TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
+                im3  = axes[col].imshow(gi_star, cmap="RdBu_r", norm=norm,
+                                        interpolation="bilinear")
+                plt.colorbar(im3, ax=axes[col], label="Gi*", shrink=0.85)
+                axes[col].set_title("Gi* Hotspot Map")
+                axes[col].axis("off"); col += 1
+
+            # Reference temps bar
+            if has_ref:
+                ax = axes[col]
+                t_u = float(reference_temps["T_urban"])
+                t_r = float(reference_temps["T_rural"])
+                t_d = float(reference_temps.get("T_diff", t_u - t_r))
+                labels_bar = ["Urban", "Rural", "UHI Δ"]
+                values_bar = [t_u, t_r, t_d]
+                colors_bar = ["#E53935", "#43A047", "#FB8C00"]
+                ax.bar(labels_bar, values_bar, color=colors_bar,
+                       edgecolor="white", linewidth=0.6)
+                ax.set_ylabel("Temperature (°C)")
+                ax.set_title("Urban vs Rural Reference Temperatures")
+                for i, v in enumerate(values_bar):
+                    ax.text(i, v + 0.05 * abs(v), f"{v:.2f}°C",
+                            ha="center", va="bottom", fontsize=9)
+
+            plt.tight_layout()
+            return self._save(fig, "08_summary_dashboard")
+        except Exception as e:
+            logger.warning(f"plot_summary_dashboard failed: {e}")
+
+    # ── plot_all ──────────────────────────────────────────────────────────────
+
+    def plot_all(self,
+                 lst_map: np.ndarray,
+                 uhi_map: np.ndarray = None,
+                 gi_star: np.ndarray = None,
+                 hotspots_df: pd.DataFrame = None,
+                 predictions: np.ndarray = None,
+                 ground_truth: np.ndarray = None,
+                 urban_mask: np.ndarray = None,
+                 rural_mask: np.ndarray = None,
+                 reference_temps: Dict = None) -> List[Path]:
+        """
+        Run the full diagnostic suite and return the list of saved file paths.
+
+        Args:
+            lst_map:         2-D LST array (H, W) in °C.
+            uhi_map:         2-D UHI intensity array (optional).
+            gi_star:         2-D Gi* statistic array (optional).
+            hotspots_df:     Hotspot prioritisation DataFrame (optional).
+            predictions:     Flat predicted LST array for validation (optional).
+            ground_truth:    Flat observed LST array for validation (optional).
+            urban_mask:      Boolean mask for urban pixels (optional).
+            rural_mask:      Boolean mask for rural pixels (optional).
+            reference_temps: Dict with T_urban / T_rural / T_diff (optional).
+
+        Returns:
+            List of Path objects for each saved figure.
+        """
+        logger.info("=" * 70)
+        logger.info("  AnalysisDiagnosticsPlotter — full diagnostic suite")
+        logger.info("=" * 70)
+        saved: List[Path] = []
+
+        def _run(label, fn, *args, **kwargs):
+            try:
+                p = fn(*args, **kwargs)
+                if p is not None:
+                    saved.append(p)
+            except Exception as _e:
+                logger.warning(f"  ⚠️ {label} failed: {_e}")
+
+        _run("LST distribution",       self.plot_lst_distribution,
+             lst_map, urban_mask, rural_mask)
+
+        if uhi_map is not None:
+            _run("UHI intensity",       self.plot_uhi_intensity,      uhi_map)
+            _run("UHI classification",  self.plot_uhi_classification,  uhi_map)
+            _run("Spatial autocorr.",   self.plot_spatial_autocorrelation, uhi_map)
+
+        if gi_star is not None:
+            _run("Gi* diagnostics",     self.plot_gi_star_diagnostics, lst_map, gi_star)
+
+        if hotspots_df is not None and len(hotspots_df) > 0:
+            _run("Hotspot ranking",     self.plot_hotspot_ranking,     hotspots_df)
+
+        if predictions is not None and ground_truth is not None:
+            _run("Validation",          self.plot_validation,
+                 predictions, ground_truth)
+
+        _run("Summary dashboard",   self.plot_summary_dashboard,
+             lst_map, uhi_map, gi_star, reference_temps)
+
+        logger.info(f"\n✅  AnalysisDiagnosticsPlotter: {len(saved)} figures → {self.save_dir}")
+        return saved
 
 
 if __name__ == "__main__":

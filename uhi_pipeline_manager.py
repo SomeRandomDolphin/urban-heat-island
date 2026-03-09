@@ -306,21 +306,57 @@ def stage_inference(args, predictor: EnsemblePredictor,
 
 # ── Stage 5: Post-processing ─────────────────────────────────────────────────
 
+def _mosaic_patches(patches: np.ndarray) -> np.ndarray:
+    """
+    Assemble an (N, H, W) array of equal-sized patches into a single 2-D mosaic.
+
+    Patches are arranged in a square-ish grid (ceil(sqrt(N)) columns).  For a
+    study area covered by a known grid layout the caller should reorder patches
+    beforehand; here we simply tile them in row-major order, which matches the
+    order in which the CNN dataset builder extracts patches.
+
+    Args:
+        patches: np.ndarray of shape (N, H, W)
+
+    Returns:
+        mosaic: np.ndarray of shape (rows*H, cols*W)
+    """
+    N, H, W = patches.shape
+    cols = int(np.ceil(np.sqrt(N)))
+    rows = int(np.ceil(N / cols))
+    # Pad with NaN so the mosaic is always a full rectangle
+    padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
+    padded[:N] = patches
+    mosaic = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+    return mosaic
+
+
 def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
     _section("STAGE 5 — POST-PROCESSING")
     post_processor = PostProcessor()
-    n_patches = min(len(results["ensemble"]), args.max_patches_analysis)
+
+    # Process ALL available patches (not just max_patches_analysis)
+    n_total  = len(results["ensemble"])
+    n_analysis = min(n_total, args.max_patches_analysis)
+
     processed = []
-    for i in range(n_patches):
+    for i in range(n_total):
         processed.append(post_processor.process(results["ensemble"][i]))
     lst_maps_processed = np.array(processed)
     np.save(data_dir / "lst_processed.npy", lst_maps_processed)
 
-    # Representative single-patch for analysis
-    lst_processed = lst_maps_processed[0]
-    logger.info(f"  Processed {n_patches} patches")
-    logger.info(f"  Representative patch: mean={lst_processed.mean():.2f}°C  "
-                f"std={lst_processed.std():.2f}°C")
+    # ── Mosaic ALL patches into a single full-area map ────────────────────────
+    lst_processed = _mosaic_patches(lst_maps_processed)
+    np.save(data_dir / "lst_processed_mosaic.npy", lst_processed)
+
+    logger.info(f"  Processed {n_total} patches  (analysis cap: {n_analysis})")
+    logger.info(f"  Mosaic shape : {lst_processed.shape}  "
+                f"(from {n_total} patches of {lst_maps_processed.shape[1]}×"
+                f"{lst_maps_processed.shape[2]})")
+    logger.info(f"  Mosaic stats : mean={np.nanmean(lst_processed):.2f}°C  "
+                f"std={np.nanstd(lst_processed):.2f}°C  "
+                f"range=[{np.nanmin(lst_processed):.1f}, {np.nanmax(lst_processed):.1f}]°C")
+
     return lst_processed, lst_maps_processed
 
 
@@ -329,8 +365,11 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
 def stage_uhi_analysis(args, lst_processed: np.ndarray, data_dir: Path) -> dict:
     _section("STAGE 6 — UHI ANALYSIS")
 
-    urban_thr = float(np.percentile(lst_processed, args.urban_percentile))
-    rural_thr = float(np.percentile(lst_processed, args.rural_percentile))
+    logger.info(f"  Input map shape : {lst_processed.shape}  "
+                f"(full mosaicked area — {lst_processed.shape[0]}×{lst_processed.shape[1]} px)")
+
+    urban_thr = float(np.nanpercentile(lst_processed, args.urban_percentile))
+    rural_thr = float(np.nanpercentile(lst_processed, args.rural_percentile))
     urban_mask = lst_processed >= urban_thr
     rural_mask = lst_processed <= rural_thr
 
@@ -562,19 +601,23 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
     unc_key = results.get("_unc_key", "uncertainty")
     uncertainty = results.get(unc_key)
     if uncertainty is not None:
-        unc0 = uncertainty[0] if uncertainty.ndim == 3 else uncertainty
+        # Mosaic uncertainty patches to match the full lst_processed mosaic
+        if uncertainty.ndim == 3:
+            unc_mosaic = _mosaic_patches(uncertainty)
+        else:
+            unc_mosaic = uncertainty
         _try("Uncertainty map",
-             vis.create_uncertainty_map, lst_processed, unc0,
+             vis.create_uncertainty_map, lst_processed, unc_mosaic,
              maps_dir / "uncertainty_map.png",
              title="Prediction Uncertainty (σ)")
 
+        # Use ensemble mosaic for uncertainty analysis plot
+        ens_mosaic = _mosaic_patches(results["ensemble"])
         _try("Uncertainty analysis plot",
              vis.create_uncertainty_analysis_plot,
-             results["ensemble"][0], unc0,
+             ens_mosaic, unc_mosaic,
              maps_dir / "uncertainty_analysis.png",
-             ground_truth=val_ctx["gt_flat"].reshape(results["ensemble"][0].shape)
-             if val_ctx and val_ctx["gt_flat"].size == results["ensemble"][0].size
-             else None)
+             ground_truth=None)  # ground truth is patch-level; skip spatial reshape
 
     # 10c. Statistics dashboard ───────────────────────────────────────────────
     _try("Statistics dashboard",
@@ -593,7 +636,7 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
          uhi_ctx["uhi_stats"],
          uhi_ctx["categories"],
          maps_dir / "comprehensive_dashboard.png",
-         uncertainty=unc0 if uncertainty is not None else None)
+         uncertainty=unc_mosaic if uncertainty is not None else None)
 
     # 10e. Urban vs rural comparison ──────────────────────────────────────────
     _try("Urban vs rural comparison",
@@ -604,15 +647,23 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
          maps_dir / "urban_rural_comparison.png")
 
     # 10f. Model comparison (CNN / GBM / Ensemble) ────────────────────────────
-    model_results = {k: results[k][0] for k in ("cnn", "gbm", "ensemble")
-                     if k in results and results[k].ndim >= 2}
+    # Build per-model mosaics so the comparison shows the full area
+    model_results = {}
+    for k in ("cnn", "gbm", "ensemble"):
+        if k in results:
+            arr = results[k]
+            if arr.ndim == 3:          # (N, H, W)
+                model_results[k] = _mosaic_patches(arr)
+            elif arr.ndim == 1:        # GBM patch-average scalar per patch
+                # Broadcast each scalar to a patch-sized tile, then mosaic
+                H, W = results["ensemble"].shape[1], results["ensemble"].shape[2]
+                tiles = np.stack([np.full((H, W), v) for v in arr])
+                model_results[k] = _mosaic_patches(tiles)
     if model_results:
         _try("Model comparison plot",
              vis.create_model_comparison_plot,
              model_results,
-             val_ctx["gt_flat"].reshape(results["ensemble"][0].shape)
-             if val_ctx and val_ctx["gt_flat"].size == results["ensemble"][0].size
-             else None,
+             None,          # ground truth cannot be reshaped to mosaic size
              maps_dir / "model_comparison.png")
 
     # 10g. Ensemble weights ───────────────────────────────────────────────────
@@ -751,7 +802,8 @@ def print_summary(args, uhi_ctx, hotspot_ctx, val_ctx,
         logger.info(f"    🌐 Web Map       : {output_dir / 'webmap' / 'index.html'}")
 
     logger.info("\n📈  Results:")
-    logger.info(f"    LST  : {lst_processed.mean():.2f} ± {lst_processed.std():.2f} °C")
+    logger.info(f"    LST  : {np.nanmean(lst_processed):.2f} ± {np.nanstd(lst_processed):.2f} °C  "
+                f"(mosaic {lst_processed.shape[0]}×{lst_processed.shape[1]} px)")
     logger.info(f"    UHI  : mean={uhi_ctx['uhi_stats']['mean_intensity']:.2f}°C  "
                 f"max={uhi_ctx['uhi_stats']['max_intensity']:.2f}°C  "
                 f"extent={uhi_ctx['uhi_stats']['spatial_extent_km2']:.2f} km²")

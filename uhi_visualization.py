@@ -460,6 +460,8 @@ class UHIVisualizer:
         # ── [0,1] Histogram with bimodal analysis ─────────────────────────────
         ax = axes[0, 1]
         flat_clip = flat[flat <= p98]
+        if flat_clip.size == 0:
+            flat_clip = flat  # fallback: use all values if filter produced empty array
         ax.hist(flat_clip, bins=80, color="#fc8d59", edgecolor="none",
                 density=True, alpha=0.75)
         x_k = np.linspace(flat_clip.min(), flat_clip.max(), 500)
