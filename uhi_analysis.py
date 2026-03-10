@@ -33,11 +33,15 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_kde(data: np.ndarray, x_grid: np.ndarray):
-    """Return KDE values on x_grid, or None if data has near-zero variance."""
-    flat = np.asarray(data).ravel()
+    """Return KDE values on x_grid, or None if data has near-zero variance or contains inf/NaN."""
+    flat = np.asarray(data, dtype=np.float64).ravel()
     flat = flat[np.isfinite(flat)]
     if flat.std() < 1e-6 or len(flat) < 2:
         logger.warning("_safe_kde: near-zero variance or insufficient data — skipping KDE")
+        return None
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    x_grid = x_grid[np.isfinite(x_grid)]
+    if len(x_grid) == 0:
         return None
     try:
         return stats.gaussian_kde(flat)(x_grid)
@@ -216,19 +220,23 @@ class UHIAnalyzer:
 
         _diag_header("UHI STATISTICS")
 
-        uhi_pos = self.uhi_map[self.uhi_map > 0]
+        # Use NaN-safe functions throughout — the mosaicked map may contain
+        # NaN-padded cells in grid positions where QC filtering removed patches.
+        uhi_flat = self.uhi_map.ravel()
+        uhi_finite = uhi_flat[np.isfinite(uhi_flat)]
+        uhi_pos = uhi_finite[uhi_finite > 0]
 
-        q5, q25, q75, q95 = np.percentile(self.uhi_map, [5, 25, 75, 95])
-        skew = float(stats.skew(self.uhi_map.ravel()))
-        kurt = float(stats.kurtosis(self.uhi_map.ravel()))
+        q5, q25, q75, q95 = np.nanpercentile(self.uhi_map, [5, 25, 75, 95])
+        skew = float(stats.skew(uhi_finite)) if len(uhi_finite) > 1 else float("nan")
+        kurt = float(stats.kurtosis(uhi_finite)) if len(uhi_finite) > 1 else float("nan")
 
         stat_dict: Dict[str, float] = {
-            "max_intensity":          float(self.uhi_map.max()),
-            "min_intensity":          float(self.uhi_map.min()),
-            "mean_intensity":         float(self.uhi_map.mean()),
+            "max_intensity":          float(np.nanmax(self.uhi_map)),
+            "min_intensity":          float(np.nanmin(self.uhi_map)),
+            "mean_intensity":         float(np.nanmean(self.uhi_map)),
             "mean_positive_intensity":float(uhi_pos.mean()) if len(uhi_pos) else 0.0,
-            "median_intensity":       float(np.median(self.uhi_map)),
-            "std_intensity":          float(self.uhi_map.std()),
+            "median_intensity":       float(np.nanmedian(self.uhi_map)),
+            "std_intensity":          float(np.nanstd(self.uhi_map)),
             "p5":  float(q5),
             "p25": float(q25),
             "p75": float(q75),
@@ -237,7 +245,7 @@ class UHIAnalyzer:
             "kurtosis":               kurt,
             "spatial_extent_km2":     float((self.uhi_map > 2).sum() * 0.0025),
             "magnitude":              float(uhi_pos.sum()),
-            "pct_positive":           float(len(uhi_pos) / self.uhi_map.size * 100),
+            "pct_positive":           float(len(uhi_pos) / max(len(uhi_finite), 1) * 100),
         }
 
         for k, v in stat_dict.items():
@@ -348,7 +356,7 @@ class UHIAnalyzer:
 
         # ── [0,0] UHI spatial map ─────────────────────────────────────────────
         ax = fig.add_subplot(gs[0, 0])
-        vabs = np.percentile(np.abs(flat), 98)
+        vabs = max(float(np.percentile(np.abs(flat), 98)), 1e-6)
         norm = TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
         im   = ax.imshow(uhi, cmap="RdBu_r", norm=norm,
                          interpolation="nearest", aspect="auto")
@@ -617,7 +625,6 @@ class HotspotDetector:
         logger.info(f"Calculating Gi* statistic (radius={search_radius}m, vectorised)...")
 
         height, width = self.lst_map.shape
-        n = self.lst_map.size
 
         # Kernel half-width in pixels (equivalent to the search radius disc)
         kernel_px = max(1, int(search_radius / self.resolution))
@@ -627,8 +634,8 @@ class HotspotDetector:
         logger.info(f"  Kernel size : {ksize}×{ksize} px  "
                     f"({ksize * self.resolution:.0f}×{ksize * self.resolution:.0f} m)")
 
-        X_bar = float(self.lst_map.mean())
-        S     = float(self.lst_map.std())
+        X_bar = float(np.nanmean(self.lst_map))
+        S     = float(np.nanstd(self.lst_map))
 
         if S < 1e-6:
             logger.warning("  ⚠️ LST map has near-zero variance — Gi* will be all zeros")
@@ -636,11 +643,20 @@ class HotspotDetector:
             self.hotspot_map = gi_star
             return gi_star
 
+        # Replace NaN cells with the global mean before filtering so boundary
+        # NaN-padding (from QC-filtered mosaic cells) does not pull the local
+        # sums toward zero and suppress Gi* values near the edges.
+        lst_filled = np.where(np.isfinite(self.lst_map), self.lst_map, X_bar)
+
+        # Count of valid (non-NaN) pixels for the global n
+        n_valid = int(np.isfinite(self.lst_map).sum())
+        n       = max(n_valid, 1)
+
         # uniform_filter computes a local mean; multiply by ksize² to get local sum
         w_sum    = float(ksize * ksize)          # all weights = 1 (binary disc approx.)
         w_sum_sq = w_sum                         # sum of w² = sum of 1² = w_sum
 
-        local_sum = uniform_filter(self.lst_map.astype(np.float64),
+        local_sum = uniform_filter(lst_filled.astype(np.float64),
                                    size=ksize, mode="reflect") * w_sum
 
         numerator   = local_sum - X_bar * w_sum
@@ -833,11 +849,18 @@ class HotspotDetector:
         ax.scatter(self.lst_map.ravel()[idx], gi.ravel()[idx],
                    c=gi.ravel()[idx], cmap="RdYlBu_r",
                    vmin=-vmax, vmax=vmax, s=4, alpha=0.5)
-        # trend line
-        r, p = stats.pearsonr(self.lst_map.ravel()[idx], gi.ravel()[idx])
+        # trend line — guard against constant arrays (ConstantInputWarning → nan r)
+        _lst_s = self.lst_map.ravel()[idx]
+        _gi_s  = gi.ravel()[idx]
+        if _lst_s.std() > 1e-8 and _gi_s.std() > 1e-8:
+            r, p = stats.pearsonr(_lst_s, _gi_s)
+            _r_label = f"r={r:.3f}, p={p:.2e}"
+        else:
+            r, p = float("nan"), float("nan")
+            _r_label = "r=N/A (constant input)"
         ax.set_xlabel("LST (°C)")
         ax.set_ylabel("Gi*")
-        ax.set_title(f"LST vs Gi*  (r={r:.3f}, p={p:.2e})")
+        ax.set_title(f"LST vs Gi*  ({_r_label})")
         ax.axhline(1.96, color="orange", ls="--", lw=1, label="95% CI")
         ax.axhline(2.58, color="red",    ls="--", lw=1, label="99% CI")
         ax.legend(fontsize=8)
@@ -1593,6 +1616,11 @@ class AnalysisDiagnosticsPlotter:
             # [0] Gi* spatial map
             ax = axes[0]
             vmax = float(np.abs(np.nanpercentile(gi_flat, [2, 98])).max())
+            # Guard: TwoSlopeNorm requires vmin < vcenter < vmax strictly.
+            # When all Gi* values are the same sign (or near-zero), vmax can be
+            # 0 or equal to |vmin|, collapsing the norm → ValueError.
+            if vmax < 1e-6:
+                vmax = 1e-6
             norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
             im = ax.imshow(gi_star, cmap="RdBu_r", norm=norm,
                            interpolation="bilinear")
@@ -1633,9 +1661,17 @@ class AnalysisDiagnosticsPlotter:
             else:
                 ax.scatter(lst_flat[idx], gi_flat[idx],
                            c=gi_flat[idx], cmap="plasma", s=6, alpha=0.7)
-            r, p = stats.pearsonr(lst_flat, gi_flat)
+            # Guard: pearsonr raises ConstantInputWarning (and returns nan r/p)
+            # when either array has zero variance — e.g. all Gi* = 0 because
+            # the LST map had near-zero variance going into calculate_gi_star().
+            if lst_flat.std() > 1e-8 and gi_flat.std() > 1e-8:
+                r, p = stats.pearsonr(lst_flat, gi_flat)
+                _r_label = f"r={r:.3f}, p={p:.2e}"
+            else:
+                r, p = float("nan"), float("nan")
+                _r_label = "r=N/A (constant input)"
             ax.set_xlabel("LST (°C)"); ax.set_ylabel("Gi* statistic")
-            ax.set_title(f"LST vs Gi*  (r={r:.3f}, p={p:.2e})")
+            ax.set_title(f"LST vs Gi*  ({_r_label})")
             ax.axhline(2.58, color="red", ls="--", lw=0.8, label="99% threshold")
             ax.legend(fontsize=8)
 
@@ -1892,7 +1928,7 @@ class AnalysisDiagnosticsPlotter:
 
             # UHI map
             if uhi_map is not None:
-                vabs = float(np.nanpercentile(np.abs(uhi_map), 98))
+                vabs = max(float(np.nanpercentile(np.abs(uhi_map), 98)), 1e-6)
                 norm = TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
                 im2  = axes[col].imshow(uhi_map, cmap="RdBu_r", norm=norm,
                                         interpolation="bilinear")
@@ -1902,7 +1938,7 @@ class AnalysisDiagnosticsPlotter:
 
             # Gi* map
             if gi_star is not None:
-                vabs = float(np.nanpercentile(np.abs(gi_star), 98))
+                vabs = max(float(np.nanpercentile(np.abs(gi_star), 98)), 1e-6)
                 norm = TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
                 im3  = axes[col].imshow(gi_star, cmap="RdBu_r", norm=norm,
                                         interpolation="bilinear")

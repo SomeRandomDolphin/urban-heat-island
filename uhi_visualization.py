@@ -32,13 +32,18 @@ logger = logging.getLogger(__name__)
 def _safe_kde(data: np.ndarray, x_grid: np.ndarray) -> Optional[np.ndarray]:
     """
     Evaluate a Gaussian KDE on x_grid, returning None if the data have
-    near-zero variance (which makes gaussian_kde raise LinAlgError).
+    near-zero variance (which makes gaussian_kde raise LinAlgError) or
+    contain inf/NaN values that would propagate into the KDE bandwidth matrix.
     Callers should skip the KDE line when None is returned.
     """
-    flat = np.asarray(data).ravel()
+    flat = np.asarray(data, dtype=np.float64).ravel()
     flat = flat[np.isfinite(flat)]
     if flat.std() < 1e-6 or len(flat) < 2:
         logger.warning("_safe_kde: data has near-zero variance or too few points — skipping KDE")
+        return None
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    x_grid = x_grid[np.isfinite(x_grid)]
+    if len(x_grid) == 0:
         return None
     try:
         return stats.gaussian_kde(flat)(x_grid)
@@ -50,13 +55,18 @@ def _safe_kde(data: np.ndarray, x_grid: np.ndarray) -> Optional[np.ndarray]:
 def _safe_kde_2d(x: np.ndarray, y: np.ndarray) -> Optional[np.ndarray]:
     """
     Evaluate a 2-D Gaussian KDE for density-coloured scatterplots.
-    Returns None when the data are degenerate (singular covariance).
+    Returns None when the data are degenerate (singular covariance) or
+    contain non-finite values.
     """
     try:
-        xy = np.vstack([x, y])
+        x = np.asarray(x, dtype=np.float64).ravel()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
         # Guard: both dimensions need variance
         if x.std() < 1e-6 or y.std() < 1e-6:
             raise ValueError("Near-zero variance in one dimension")
+        xy = np.vstack([x, y])
         return stats.gaussian_kde(xy)(xy)
     except Exception as _e:
         logger.warning(f"_safe_kde_2d: 2-D KDE failed ({_e}) — falling back to uniform density")
@@ -495,30 +505,43 @@ class UHIVisualizer:
         ax = axes[1, 0]
         pred_flat = predictions.ravel()
         unc_flat  = uncertainty.ravel()
-        # use only non-outlier points for the scatter
-        valid = unc_flat <= anom_thr
+        # use only non-outlier, finite points for the scatter
+        valid = (unc_flat <= anom_thr) & np.isfinite(unc_flat) & np.isfinite(pred_flat)
         pf, uf = pred_flat[valid], unc_flat[valid]
-        idx = np.random.choice(len(pf), min(8000, len(pf)), replace=False)
-        density = _safe_kde_2d(pf[idx], uf[idx])
-        sc = ax.scatter(pf[idx], uf[idx],
-                        c=density if density is not None else uf[idx],
-                        cmap="plasma", s=5, alpha=0.6)
-        fig.colorbar(sc, ax=ax, label="Density")
-        r_p, _  = stats.pearsonr(pf[idx], uf[idx])
-        r_s, _  = stats.spearmanr(pf[idx], uf[idx])
-        ax.set_xlabel("Predicted LST (°C)")
-        ax.set_ylabel("Uncertainty σ (°C)")
-        ax.set_title(f"LST vs Uncertainty\n"
-                     f"Pearson r={r_p:.3f}  Spearman ρ={r_s:.3f}")
-        ax.grid(True, alpha=0.3)
-        # flag high-uncertainty / high-LST regime
-        high_unc = uf > np.percentile(uf, 90)
-        high_lst = pf > np.percentile(pf, 90)
-        n_both   = int((high_unc & high_lst).sum())
-        ax.text(0.02, 0.97,
-                f"High-σ & high-LST pixels: {n_both} ({n_both/len(pf)*100:.1f}%)",
-                transform=ax.transAxes, va='top', fontsize=8,
-                bbox=dict(fc='white', ec='grey', alpha=0.8))
+
+        if len(pf) < 2:
+            # Not enough data after filtering — skip scatter, show a notice
+            ax.text(0.5, 0.5, "Insufficient valid points\nfor scatter plot",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=10,
+                    color='grey')
+            ax.set_title("LST vs Uncertainty\n(insufficient data)")
+            ax.set_xlabel("Predicted LST (°C)")
+            ax.set_ylabel("Uncertainty σ (°C)")
+        else:
+            idx = np.random.choice(len(pf), min(8000, len(pf)), replace=False)
+            density = _safe_kde_2d(pf[idx], uf[idx])
+            sc = ax.scatter(pf[idx], uf[idx],
+                            c=density if density is not None else uf[idx],
+                            cmap="plasma", s=5, alpha=0.6)
+            fig.colorbar(sc, ax=ax, label="Density")
+            if len(pf[idx]) >= 2:
+                r_p, _ = stats.pearsonr(pf[idx], uf[idx])
+                r_s, _ = stats.spearmanr(pf[idx], uf[idx])
+            else:
+                r_p = r_s = float('nan')
+            ax.set_xlabel("Predicted LST (°C)")
+            ax.set_ylabel("Uncertainty σ (°C)")
+            ax.set_title(f"LST vs Uncertainty\n"
+                         f"Pearson r={r_p:.3f}  Spearman ρ={r_s:.3f}")
+            ax.grid(True, alpha=0.3)
+            # flag high-uncertainty / high-LST regime
+            high_unc = uf > np.percentile(uf, 90)
+            high_lst = pf > np.percentile(pf, 90)
+            n_both   = int((high_unc & high_lst).sum())
+            ax.text(0.02, 0.97,
+                    f"High-σ & high-LST pixels: {n_both} ({n_both/len(pf)*100:.1f}%)",
+                    transform=ax.transAxes, va='top', fontsize=8,
+                    bbox=dict(fc='white', ec='grey', alpha=0.8))
 
         # ── [1,1] 95% CI width map — capped ───────────────────────────────────
         ax = axes[1, 1]

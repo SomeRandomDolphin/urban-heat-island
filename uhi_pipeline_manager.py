@@ -150,6 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Percentile threshold for rural mask")
     p.add_argument("--max-patches-analysis", type=int, default=10,
                    help="Max number of patches post-processed for analysis")
+    p.add_argument("--patch-grid-cols", type=int, default=None,
+                   help="Number of patch columns in the spatial grid used during dataset "
+                        "creation. When omitted the pipeline reads patch_grid_shape from "
+                        "the dataset metadata; if absent it falls back to sqrt(N) layout. "
+                        "Setting this explicitly is most reliable -- check the dataset "
+                        "builder log for the grid dimensions.")
 
     # Diagnostics / output switches
     p.add_argument("--skip-diagnostics",  action="store_true",
@@ -268,6 +274,40 @@ def stage_inference(args, predictor: EnsemblePredictor,
                     X_test: np.ndarray, data_dir: Path) -> dict:
     _section("STAGE 4 — INFERENCE")
 
+    # ── Propagate grid_cols to the inference plotter BEFORE running predictions
+    # so that any diagnostic mosaic (03b) saved during predict_ensemble[_with_tta]
+    # uses the correct spatial layout rather than the jumbling sqrt fallback.
+    grid_cols = getattr(args, "patch_grid_cols", None)
+    if grid_cols is None:
+        _gs = _load_patch_grid_shape(Path(args.test_data))
+        if _gs is not None:
+            grid_cols = _gs[1]
+    if grid_cols is not None:
+        predictor.plotter.set_grid_cols(grid_cols)
+        logger.info(f"  Plotter grid_cols set to {grid_cols}")
+    else:
+        logger.warning(
+            "  ⚠ grid_cols unknown at inference time — diagnostic mosaic 03b will "            "use sqrt fallback.  Pass --patch-grid-cols=<N> to fix."
+        )
+
+    # ── Load per-patch spatial positions so the mosaic assembler places each
+    # patch at its original grid cell (fixes jumbled output when QC filtering
+    # has removed some patches from the full scan grid).
+    _pos_path = Path(args.test_data) / "patch_positions.npy"
+    if _pos_path.exists():
+        try:
+            _patch_positions = np.load(_pos_path)
+            predictor.plotter.set_patch_positions(_patch_positions)
+            logger.info(f"  Loaded patch_positions.npy ({len(_patch_positions)} entries)")
+        except Exception as _pe:
+            logger.warning(f"  ⚠ Could not load patch_positions.npy: {_pe}")
+    else:
+        logger.warning(
+            "  ⚠ patch_positions.npy not found in test data dir — mosaic will use "
+            "sequential placement (patches shifted if any were QC-filtered). "
+            "Re-run preprocessing to regenerate the dataset with position metadata."
+        )
+
     if args.use_tta:
         logger.info(f"  Mode: TTA  (n_augmentations={args.tta_augs})")
         results = predictor.predict_ensemble_with_tta(
@@ -306,27 +346,96 @@ def stage_inference(args, predictor: EnsemblePredictor,
 
 # ── Stage 5: Post-processing ─────────────────────────────────────────────────
 
-def _mosaic_patches(patches: np.ndarray) -> np.ndarray:
+def _load_patch_grid_shape(test_data_dir: Path) -> tuple:
     """
-    Assemble an (N, H, W) array of equal-sized patches into a single 2-D mosaic.
+    Try to read the patch grid shape (grid_rows, grid_cols) saved by the
+    dataset builder.  Returns None if no metadata file is found.
 
-    Patches are arranged in a square-ish grid (ceil(sqrt(N)) columns).  For a
-    study area covered by a known grid layout the caller should reorder patches
-    beforehand; here we simply tile them in row-major order, which matches the
-    order in which the CNN dataset builder extracts patches.
+    The dataset builder is expected to write one of:
+      <test_data_dir>/patch_grid_shape.npy   — np.array([rows, cols])
+      <test_data_dir>/dataset_metadata.json  — {"patch_grid_rows": R, "patch_grid_cols": C}
+      <test_data_dir>/../patch_grid_shape.npy  (parent dir, i.e. cnn_dataset/)
+      <test_data_dir>/../dataset_metadata.json
+    """
+    candidates = [
+        test_data_dir / "patch_grid_shape.npy",
+        test_data_dir / "dataset_metadata.json",
+        test_data_dir.parent / "patch_grid_shape.npy",
+        test_data_dir.parent / "dataset_metadata.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix == ".npy":
+                shape = tuple(int(x) for x in np.load(path))
+                logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
+                return shape   # (grid_rows, grid_cols)
+            else:
+                meta = json.loads(path.read_text())
+                if "patch_grid_rows" in meta and "patch_grid_cols" in meta:
+                    shape = (int(meta["patch_grid_rows"]), int(meta["patch_grid_cols"]))
+                    logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
+                    return shape
+        except Exception as exc:
+            logger.warning(f"  Could not parse {path}: {exc}")
+    return None
+
+
+def _mosaic_patches(patches: np.ndarray,
+                    grid_cols: int = None,
+                    grid_rows: int = None,
+                    patch_positions: np.ndarray = None) -> np.ndarray:
+    """
+    Assemble an (N, H, W) array of equal-sized patches into a single 2-D mosaic
+    that faithfully reproduces the spatial layout of the study area.
 
     Args:
-        patches: np.ndarray of shape (N, H, W)
+        patches:         np.ndarray of shape (N, H, W)
+        grid_cols:       number of patch columns in the original spatial grid.
+        grid_rows:       number of patch rows (alternative to grid_cols).
+        patch_positions: (N, 2) int32 array of (grid_row, grid_col) per patch.
+                         When supplied, patches are placed at their correct spatial
+                         positions (NaN-gaps for QC-filtered patches) rather than
+                         being packed sequentially — which shifts all downstream
+                         patches when any patches were filtered out.
 
     Returns:
-        mosaic: np.ndarray of shape (rows*H, cols*W)
+        mosaic: np.ndarray of shape (grid_rows*H, grid_cols*W), NaN-padded.
     """
     N, H, W = patches.shape
-    cols = int(np.ceil(np.sqrt(N)))
-    rows = int(np.ceil(N / cols))
-    # Pad with NaN so the mosaic is always a full rectangle
+
+    if patch_positions is not None and np.any(patch_positions >= 0):
+        valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
+        rows = int(patch_positions[valid_mask, 0].max()) + 1
+        cols = int(patch_positions[valid_mask, 1].max()) + 1
+        if grid_cols is not None:
+            cols = max(cols, int(grid_cols))
+        if grid_rows is not None:
+            rows = max(rows, int(grid_rows))
+        canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
+        for idx in range(N):
+            gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])
+            if gr < 0 or gc < 0 or gr >= rows or gc >= cols:
+                continue
+            canvas[gr * H:(gr + 1) * H, gc * W:(gc + 1) * W] = patches[idx]
+        return canvas
+
+    if grid_cols is not None:
+        cols = int(grid_cols)
+        rows = int(np.ceil(N / cols))
+    elif grid_rows is not None:
+        rows = int(grid_rows)
+        cols = int(np.ceil(N / rows))
+    else:
+        cols = int(np.ceil(np.sqrt(N)))
+        rows = int(np.ceil(N / cols))
+
+    # Pad so we have a full rows×cols grid
     padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
     padded[:N] = patches
+
+    # Reshape: (rows, cols, H, W) → interleave spatial axes → (rows*H, cols*W)
     mosaic = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
     return mosaic
 
@@ -335,8 +444,8 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
     _section("STAGE 5 — POST-PROCESSING")
     post_processor = PostProcessor()
 
-    # Process ALL available patches (not just max_patches_analysis)
-    n_total  = len(results["ensemble"])
+    # Process ALL available patches
+    n_total    = len(results["ensemble"])
     n_analysis = min(n_total, args.max_patches_analysis)
 
     processed = []
@@ -345,17 +454,42 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
     lst_maps_processed = np.array(processed)
     np.save(data_dir / "lst_processed.npy", lst_maps_processed)
 
-    # ── Mosaic ALL patches into a single full-area map ────────────────────────
-    lst_processed = _mosaic_patches(lst_maps_processed)
+    # ── Determine grid layout ──────────────────────────────────────────────────
+    # Priority: CLI arg  >  saved metadata  >  sqrt fallback (may jumble patches!)
+    grid_cols = getattr(args, "patch_grid_cols", None)
+
+    if grid_cols is not None:
+        grid_shape = None   # derive rows inside _mosaic_patches
+        logger.info(f"  Grid layout  : {grid_cols} cols (from --patch-grid-cols)")
+    else:
+        grid_shape = _load_patch_grid_shape(Path(args.test_data))
+        if grid_shape is not None:
+            grid_cols = grid_shape[1]
+            logger.info(f"  Grid layout  : {grid_shape[0]}r × {grid_shape[1]}c "                        f"(from dataset metadata)")
+        else:
+            # sqrt fallback — warn loudly
+            grid_cols = int(np.ceil(np.sqrt(n_total)))
+            logger.warning(
+                f"  ⚠ No patch grid metadata found and --patch-grid-cols not set. "                f"Falling back to sqrt grid ({grid_cols} cols for {n_total} patches). "                f"This will JUMBLE the mosaic unless the study area is square in "                f"patch-count terms.  Re-run with --patch-grid-cols=<N> to fix."            )
+
+    # ── Mosaic ALL patches into a single full-area map ─────────────────────────
+    # Load per-patch spatial positions for position-aware mosaic assembly.
+    _pos_path = Path(args.test_data) / "patch_positions.npy"
+    _patch_positions = None
+    if _pos_path.exists():
+        try:
+            _patch_positions = np.load(_pos_path)
+            logger.info(f"  Loaded patch_positions.npy ({len(_patch_positions)} entries)")
+        except Exception as _pe:
+            logger.warning(f"  Could not load patch_positions.npy: {_pe}")
+
+    lst_processed = _mosaic_patches(lst_maps_processed, grid_cols=grid_cols,
+                                    patch_positions=_patch_positions)
     np.save(data_dir / "lst_processed_mosaic.npy", lst_processed)
 
-    logger.info(f"  Processed {n_total} patches  (analysis cap: {n_analysis})")
-    logger.info(f"  Mosaic shape : {lst_processed.shape}  "
-                f"(from {n_total} patches of {lst_maps_processed.shape[1]}×"
-                f"{lst_maps_processed.shape[2]})")
-    logger.info(f"  Mosaic stats : mean={np.nanmean(lst_processed):.2f}°C  "
-                f"std={np.nanstd(lst_processed):.2f}°C  "
-                f"range=[{np.nanmin(lst_processed):.1f}, {np.nanmax(lst_processed):.1f}]°C")
+    logger.info(f"  Processed    : {n_total} patches  (analysis cap: {n_analysis})")
+    logger.info(f"  Mosaic shape : {lst_processed.shape}  "                f"(from {n_total} patches of "                f"{lst_maps_processed.shape[1]}×{lst_maps_processed.shape[2]})")
+    logger.info(f"  Mosaic stats : mean={np.nanmean(lst_processed):.2f}°C  "                f"std={np.nanstd(lst_processed):.2f}°C  "                f"range=[{np.nanmin(lst_processed):.1f}, "                f"{np.nanmax(lst_processed):.1f}]°C")
 
     return lst_processed, lst_maps_processed
 
@@ -578,6 +712,34 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
                           results, val_ctx, maps_dir) -> None:
     _section("STAGE 10 — STANDARD VISUALIZATIONS (uhi_visualization)")
 
+    # ── Resolve grid_cols with the same 3-priority logic as stage_postprocess ─
+    # getattr(args, "patch_grid_cols") alone is not enough: it returns None when
+    # the CLI flag is omitted, causing all _mosaic_patches calls here to fall
+    # back to the sqrt heuristic and produce the horizontal-stripe artefact.
+    _gc = getattr(args, "patch_grid_cols", None)
+    if _gc is None:
+        _gs = _load_patch_grid_shape(Path(args.test_data))
+        if _gs is not None:
+            _gc = _gs[1]
+            logger.info(f"  Visualizations grid_cols: {_gc} (from dataset metadata)")
+        else:
+            n_patches = len(results.get("ensemble", []))
+            _gc = int(np.ceil(np.sqrt(n_patches))) if n_patches > 0 else None
+            logger.warning(
+                f"  ⚠ No patch grid metadata found for visualizations. "                f"Using sqrt fallback (grid_cols={_gc}). "                f"Re-run preprocessing or pass --patch-grid-cols=<N> to fix."
+            )
+    # Store so inner lambdas / _try calls can reference it
+    _resolved_grid_cols = _gc
+
+    # ── Load per-patch positions for position-aware mosaic assembly ───────────
+    _pos_path = Path(args.test_data) / "patch_positions.npy"
+    _patch_positions = None
+    if _pos_path.exists():
+        try:
+            _patch_positions = np.load(_pos_path)
+        except Exception:
+            pass
+
     vis = UHIVisualizer(figsize=(12, 10), dpi=300)
 
     # 10a. Core maps ──────────────────────────────────────────────────────────
@@ -603,7 +765,8 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
     if uncertainty is not None:
         # Mosaic uncertainty patches to match the full lst_processed mosaic
         if uncertainty.ndim == 3:
-            unc_mosaic = _mosaic_patches(uncertainty)
+            unc_mosaic = _mosaic_patches(uncertainty, grid_cols=_resolved_grid_cols,
+                                         patch_positions=_patch_positions)
         else:
             unc_mosaic = uncertainty
         _try("Uncertainty map",
@@ -612,7 +775,8 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
              title="Prediction Uncertainty (σ)")
 
         # Use ensemble mosaic for uncertainty analysis plot
-        ens_mosaic = _mosaic_patches(results["ensemble"])
+        ens_mosaic = _mosaic_patches(results["ensemble"], grid_cols=_resolved_grid_cols,
+                                     patch_positions=_patch_positions)
         _try("Uncertainty analysis plot",
              vis.create_uncertainty_analysis_plot,
              ens_mosaic, unc_mosaic,
@@ -653,12 +817,14 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
         if k in results:
             arr = results[k]
             if arr.ndim == 3:          # (N, H, W)
-                model_results[k] = _mosaic_patches(arr)
+                model_results[k] = _mosaic_patches(arr, grid_cols=_resolved_grid_cols,
+                                                   patch_positions=_patch_positions)
             elif arr.ndim == 1:        # GBM patch-average scalar per patch
                 # Broadcast each scalar to a patch-sized tile, then mosaic
                 H, W = results["ensemble"].shape[1], results["ensemble"].shape[2]
                 tiles = np.stack([np.full((H, W), v) for v in arr])
-                model_results[k] = _mosaic_patches(tiles)
+                model_results[k] = _mosaic_patches(tiles, grid_cols=_resolved_grid_cols,
+                                                   patch_positions=_patch_positions)
     if model_results:
         _try("Model comparison plot",
              vis.create_model_comparison_plot,

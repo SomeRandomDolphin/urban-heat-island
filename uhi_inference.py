@@ -60,13 +60,53 @@ class InferenceDiagnosticsPlotter:
         "default",
     ]
 
-    def __init__(self, save_dir: Path = None):
+    def __init__(self, save_dir: Path = None, grid_cols: int = None):
         self.save_dir = Path(save_dir) if save_dir else MODEL_DIR / "inference_diagnostics"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self._style = self._resolve_style()
+        self._grid_cols = grid_cols   # patch grid columns — set via set_grid_cols() or here
         logger.info(
             f"📊 InferenceDiagnosticsPlotter initialised — "
             f"style='{self._style}' → {self.save_dir}"
+        )
+
+    def set_grid_cols(self, grid_cols: int) -> None:
+        """
+        Tell the plotter how many patch columns are in the study-area grid.
+        Must be set BEFORE plot_spatial_predictions / plot_all is called,
+        otherwise the full-area mosaic (03b) will use a sqrt fallback that
+        produces a jumbled checkerboard.
+
+        Typically called from the pipeline manager::
+
+            predictor.plotter.set_grid_cols(args.patch_grid_cols)
+        """
+        self._grid_cols = grid_cols
+        logger.info(f"  InferenceDiagnosticsPlotter: grid_cols set to {grid_cols}")
+
+    def set_patch_positions(self, patch_positions: np.ndarray) -> None:
+        """
+        Supply per-patch spatial grid positions so the mosaic assembler can
+        place each patch at its original (grid_row, grid_col) cell even after
+        QC filtering removed some patches from the full grid.
+
+        Args:
+            patch_positions: (N, 2) int32 array of (grid_row, grid_col).
+                             Loaded from ``patch_positions.npy`` saved by the
+                             preprocessing pipeline alongside ``X.npy``.
+                             Rows with value -1 denote patches without spatial
+                             metadata (legacy mode) and are placed sequentially.
+
+        Typically called from the pipeline manager::
+
+            pos = np.load(test_dir / "patch_positions.npy")
+            predictor.plotter.set_patch_positions(pos)
+        """
+        self._patch_positions = np.asarray(patch_positions, dtype=np.int32)
+        n_valid = int(np.any(self._patch_positions >= 0, axis=1).sum())
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: patch_positions set "
+            f"({n_valid}/{len(self._patch_positions)} patches have valid positions)"
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -217,7 +257,9 @@ class InferenceDiagnosticsPlotter:
 
     def plot_spatial_predictions(self, results: Dict[str, np.ndarray],
                                  targets: np.ndarray = None,
-                                 n_samples: int = 4):
+                                 n_samples: int = 4,
+                                 grid_cols: int = None,
+                                 patch_positions: np.ndarray = None):
         """
         Side-by-side spatial maps: CNN · GBM (broadcast) · Ensemble · Error (if targets given).
 
@@ -228,9 +270,19 @@ class InferenceDiagnosticsPlotter:
             results:   Output dict from predict_ensemble().
             targets:   Optional (N, H, W) ground-truth for error column.
             n_samples: How many patches to display (rows) in the per-patch figure.
+            grid_cols: Number of patch columns in the spatial grid used during
+                       dataset creation.  MUST be supplied for a correct mosaic
+                       layout; omitting it triggers a sqrt fallback that jumbles
+                       patches unless the study area is square in patch count.
         """
         try:
             self._use_style()
+            # Only override the stored grid_cols when the caller passes an explicit
+            # (non-None) value.  If grid_cols is None, preserve whatever was set
+            # earlier via set_grid_cols() — clobbering it with None is the root
+            # cause of the 03b mosaic falling back to the sqrt layout.
+            if grid_cols is not None:
+                self._grid_cols = grid_cols
 
             ensemble = np.asarray(results.get("ensemble", results.get("ensemble_patch")))
             cnn      = np.asarray(results.get("cnn"))
@@ -303,33 +355,101 @@ class InferenceDiagnosticsPlotter:
             self._save(fig, "03_spatial_predictions")
 
             # ── 03b: Full mosaicked map across ALL patches ────────────────────
-            self._plot_full_mosaic(ensemble, cnn, gbm, targets)
+            self._plot_full_mosaic(ensemble, cnn, gbm, targets,
+                                       grid_cols=getattr(self, "_grid_cols", None),
+                                       patch_positions=getattr(self, "_patch_positions", None))
 
         except Exception as e:
             logger.warning(f"plot_spatial_predictions failed: {e}")
 
-    def _mosaic_patches(self, patches: np.ndarray) -> np.ndarray:
-        """Tile (N, H, W) patches into a single (rows*H, cols*W) mosaic."""
+    def _mosaic_patches(self, patches: np.ndarray,
+                        grid_cols: int = None,
+                        grid_rows: int = None,
+                        patch_positions: np.ndarray = None) -> np.ndarray:
+        """
+        Tile (N, H, W) patches into a single (grid_rows*H, grid_cols*W) mosaic.
+
+        Args:
+            patches:         (N, H, W) array of predictions.
+            grid_cols:       Patch columns in the original spatial grid.  When given,
+                             rows = ceil(N / grid_cols).  Prefer this over grid_rows.
+            grid_rows:       Alternative: patch rows in the grid.  Ignored when
+                             grid_cols is also supplied.
+            patch_positions: Optional (N, 2) int array of (grid_row, grid_col)
+                             for each patch.  When supplied, patches are placed at
+                             their original spatial positions (NaN-filling gaps left
+                             by QC-filtered patches) instead of being packed
+                             sequentially.  This is required for a correct mosaic
+                             when QC filtering has removed some patches from the grid.
+            If neither grid_cols nor patch_positions is given the layout falls back
+            to ceil(sqrt(N)) columns, which is only correct when the study area is
+            square in patch count.
+        """
         N, H, W = patches.shape
-        cols = int(np.ceil(np.sqrt(N)))
-        rows = int(np.ceil(N / cols))
-        padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
-        padded[:N] = patches
-        return padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+
+        # ── Determine grid dimensions ─────────────────────────────────────────
+        if patch_positions is not None and np.any(patch_positions >= 0):
+            # Use spatial metadata to size the canvas correctly.
+            valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
+            rows = int(patch_positions[valid_mask, 0].max()) + 1
+            cols = int(patch_positions[valid_mask, 1].max()) + 1
+            if grid_cols is not None:
+                cols = max(cols, int(grid_cols))
+            if grid_rows is not None:
+                rows = max(rows, int(grid_rows))
+        elif grid_cols is not None:
+            cols = int(grid_cols)
+            rows = int(np.ceil(N / cols))
+        elif grid_rows is not None:
+            rows = int(grid_rows)
+            cols = int(np.ceil(N / rows))
+        else:
+            cols = int(np.ceil(np.sqrt(N)))
+            rows = int(np.ceil(N / cols))
+
+        canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
+
+        if patch_positions is not None and np.any(patch_positions >= 0):
+            # Position-aware placement: put each patch at its exact grid cell.
+            for idx in range(N):
+                gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])
+                if gr < 0 or gc < 0 or gr >= rows or gc >= cols:
+                    continue   # invalid / out-of-bounds position — skip
+                canvas[gr * H:(gr + 1) * H, gc * W:(gc + 1) * W] = patches[idx]
+        else:
+            # Legacy sequential placement (only correct when no patches were filtered).
+            padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
+            padded[:N] = patches
+            canvas = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+
+        return canvas
 
     def _plot_full_mosaic(self, ensemble: np.ndarray, cnn: np.ndarray,
-                          gbm: np.ndarray, targets: np.ndarray = None):
+                          gbm: np.ndarray, targets: np.ndarray = None,
+                          grid_cols: int = None,
+                          patch_positions: np.ndarray = None):
         """
         Figure 03b — full mosaicked inference result covering the entire study area.
 
         Shows: CNN mosaic · GBM mosaic · Ensemble mosaic · Error mosaic (if targets given).
+
+        Args:
+            grid_cols:       Number of patch columns in the spatial grid.  Pass this
+                             from the dataset metadata or CLI arg to get a correct
+                             spatial layout.  None → sqrt fallback.
+            patch_positions: (N, 2) int array of (grid_row, grid_col) per patch.
+                             When supplied, QC-filtered gaps are correctly preserved
+                             as NaN rather than causing all subsequent patches to
+                             shift by one cell.
         """
         try:
             N_total = len(ensemble)
             logger.info(f"  Mosaicking {N_total} patches for full-area map …")
 
-            ens_mosaic = self._mosaic_patches(ensemble)
-            cnn_mosaic = self._mosaic_patches(cnn)
+            ens_mosaic = self._mosaic_patches(ensemble, grid_cols=grid_cols,
+                                              patch_positions=patch_positions)
+            cnn_mosaic = self._mosaic_patches(cnn, grid_cols=grid_cols,
+                                              patch_positions=patch_positions)
 
             # GBM: broadcast per-patch scalar or per-patch spatial map
             H, W = ensemble.shape[1], ensemble.shape[2]
@@ -337,7 +457,8 @@ class InferenceDiagnosticsPlotter:
                 gbm_tiles = np.stack([np.full((H, W), float(v)) for v in gbm])
             else:
                 gbm_tiles = gbm
-            gbm_mosaic = self._mosaic_patches(gbm_tiles)
+            gbm_mosaic = self._mosaic_patches(gbm_tiles, grid_cols=grid_cols,
+                                              patch_positions=patch_positions)
 
             has_targets = targets is not None
             n_cols = 4 if has_targets else 3
@@ -371,7 +492,8 @@ class InferenceDiagnosticsPlotter:
                 tgt_arr = np.asarray(targets)
                 if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
                     tgt_arr = tgt_arr[:, 0]
-                tgt_mosaic = self._mosaic_patches(tgt_arr)
+                tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
+                                                  patch_positions=patch_positions)
                 err_mosaic = ens_mosaic - tgt_mosaic
                 err_abs = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
                 norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
@@ -387,11 +509,11 @@ class InferenceDiagnosticsPlotter:
                              color="white", va="bottom",
                              bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
 
-            cols_grid = int(np.ceil(np.sqrt(N_total)))
-            rows_grid = int(np.ceil(N_total / cols_grid))
+            actual_cols = grid_cols if grid_cols is not None else int(np.ceil(np.sqrt(N_total)))
+            actual_rows = int(np.ceil(N_total / actual_cols))
             fig.suptitle(
                 f"Inference – Full Study-Area Mosaic  "
-                f"({N_total} patches → {rows_grid}×{cols_grid} grid, "
+                f"({N_total} patches → {actual_rows}×{actual_cols} grid, "
                 f"{ens_mosaic.shape[0]}×{ens_mosaic.shape[1]} px)",
                 fontsize=12, fontweight="bold")
             plt.tight_layout()
@@ -942,25 +1064,31 @@ class InferenceDiagnosticsPlotter:
                  cal_slope: float = 1.0,
                  cal_intercept: float = 0.0,
                  weights: Dict = None,
-                 label: str = "Ensemble"):
+                 label: str = "Ensemble",
+                 grid_cols: int = None,
+                 patch_positions: np.ndarray = None):
         """
         Convenience wrapper — calls every available plot method.
 
         Args:
-            results:       Output from EnsemblePredictor.predict_ensemble() or
-                           predict_ensemble_with_tta() — values in Celsius.
-            X:             Raw input patches (N, H, W, C) — used only for
-                           context; not strictly required.
-            targets:       Optional ground-truth LST patches (°C, denormalised).
-            cal_slope:     Calibration slope (from EnsemblePredictor.cal_slope).
-            cal_intercept: Calibration intercept.
-            weights:       {"cnn": float, "gbm": float} from EnsemblePredictor.weights.
-            label:         Label for scatter / residual plot titles.
+            results:         Output from EnsemblePredictor.predict_ensemble() or
+                             predict_ensemble_with_tta() — values in Celsius.
+            X:               Raw input patches (N, H, W, C) — used only for
+                             context; not strictly required.
+            targets:         Optional ground-truth LST patches (°C, denormalised).
+            cal_slope:       Calibration slope (from EnsemblePredictor.cal_slope).
+            cal_intercept:   Calibration intercept.
+            weights:         {"cnn": float, "gbm": float} from EnsemblePredictor.weights.
+            label:           Label for scatter / residual plot titles.
+            patch_positions: (N, 2) int32 (grid_row, grid_col) per patch — loaded
+                             from patch_positions.npy.  Used by the mosaic assembler
+                             to place QC-filtered patches at their correct grid cells.
         """
         logger.info("\n📊 Generating all inference diagnostic plots...")
 
         self.plot_prediction_distribution(results, targets=targets)
-        self.plot_spatial_predictions(results, targets=targets)
+        self.plot_spatial_predictions(results, targets=targets, grid_cols=grid_cols,
+                                      patch_positions=patch_positions)
         self.plot_model_agreement(results)
         self.plot_uncertainty_maps(results)
         self.plot_tta_variance(results)
@@ -1853,6 +1981,8 @@ class EnsemblePredictor:
                     cal_intercept=self.cal_intercept,
                     weights=self.weights,
                     label="Ensemble+TTA",
+                    grid_cols=getattr(self.plotter, "_grid_cols", None),
+                    patch_positions=getattr(self.plotter, "_patch_positions", None),
                 )
             except Exception as _pe:
                 logger.warning(f"Inference TTA diagnostic plots failed: {_pe}")
