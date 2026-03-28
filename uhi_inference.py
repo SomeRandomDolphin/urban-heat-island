@@ -65,6 +65,8 @@ class InferenceDiagnosticsPlotter:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self._style = self._resolve_style()
         self._grid_cols = grid_cols   # patch grid columns — set via set_grid_cols() or here
+        self._rows_per_epoch = None   # single-epoch patch row count (None = unknown)
+        self._n_epochs = None         # number of temporal epochs (None = unknown)
         logger.info(
             f"📊 InferenceDiagnosticsPlotter initialised — "
             f"style='{self._style}' → {self.save_dir}"
@@ -107,6 +109,34 @@ class InferenceDiagnosticsPlotter:
         logger.info(
             f"  InferenceDiagnosticsPlotter: patch_positions set "
             f"({n_valid}/{len(self._patch_positions)} patches have valid positions)"
+        )
+
+    def set_rows_per_epoch(self, rows_per_epoch: int, n_epochs: int = None) -> None:
+        """
+        Supply the authoritative per-epoch patch row count from dataset metadata.
+
+        This is the number of patch ROWS in a single temporal epoch's spatial
+        grid.  When the dataset spans multiple epochs, the mosaic's total patch
+        rows = n_epochs × rows_per_epoch.  Providing this value allows
+        _collapse_epochs to slice the tall mosaic correctly rather than
+        inferring the slice height from the aspect ratio (which is fragile
+        when the per-epoch grid is non-square or the aspect ratio is not an
+        integer multiple of rows_per_epoch).
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+
+        Args:
+            rows_per_epoch: Number of patch rows per epoch (from metadata key
+                            ``patch_grid_rows_per_epoch``).
+            n_epochs:       Total number of temporal epochs.  Optional — used
+                            only for logging and as a safety-check on the
+                            slice count.
+        """
+        self._rows_per_epoch = int(rows_per_epoch)
+        self._n_epochs = int(n_epochs) if n_epochs is not None else None
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: rows_per_epoch={self._rows_per_epoch}"
+            + (f", n_epochs={self._n_epochs}" if self._n_epochs else "")
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -381,41 +411,88 @@ class InferenceDiagnosticsPlotter:
                              by QC-filtered patches) instead of being packed
                              sequentially.  This is required for a correct mosaic
                              when QC filtering has removed some patches from the grid.
-            If neither grid_cols nor patch_positions is given the layout falls back
-            to ceil(sqrt(N)) columns, which is only correct when the study area is
-            square in patch count.
+
+        Multi-epoch note
+        ────────────────
+        When the dataset spans multiple temporal epochs, preprocessing offsets each
+        epoch's grid_row so that epochs stack vertically in patch_positions (epoch 0
+        occupies rows 0…R-1, epoch 1 occupies rows R…2R-1, etc.).  The total canvas
+        height is therefore n_epochs × per_epoch_grid_rows.  grid_cols remains the
+        SAME for every epoch, so supplying it from dataset metadata is always correct.
+
+        If neither grid_cols nor patch_positions is given the layout falls back to
+        ceil(sqrt(N)) columns, which is only correct when the study area is square
+        in patch count.
         """
         N, H, W = patches.shape
 
         # ── Determine grid dimensions ─────────────────────────────────────────
         if patch_positions is not None and np.any(patch_positions >= 0):
-            # Use spatial metadata to size the canvas correctly.
             valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
-            rows = int(patch_positions[valid_mask, 0].max()) + 1
-            cols = int(patch_positions[valid_mask, 1].max()) + 1
+            if not valid_mask.any():
+                # All positions invalid — fall through to sequential layout below
+                patch_positions = None
+            else:
+                rows = int(patch_positions[valid_mask, 0].max()) + 1
+                # ── Column count: always prefer the authoritative grid_cols from
+                # dataset metadata over max(col)+1 from patch_positions.
+                # Reason: the test split may be missing patches from the rightmost
+                # column (QC-filtered), causing max(col)+1 to be one less than the
+                # true grid width and shifting every subsequent patch one cell left.
+                if grid_cols is not None:
+                    cols = int(grid_cols)
+                else:
+                    cols = int(patch_positions[valid_mask, 1].max()) + 1
+                    logger.warning(
+                        f"  ⚠ _mosaic_patches: grid_cols not supplied — inferring "
+                        f"cols={cols} from max patch_positions col index.  "
+                        f"If the test split is missing rightmost-column patches, "
+                        f"the mosaic will be one column too narrow.  "
+                        f"Pass --patch-grid-cols=<N> or ensure patch_grid_shape.npy "
+                        f"is present in the dataset directory to fix this."
+                    )
+                # rows already accounts for multi-epoch vertical stacking
+                # (each epoch offsets its grid_row by per_epoch_grid_rows).
+                # Do NOT recompute rows from grid_cols here.
+
+        if patch_positions is None or not np.any(patch_positions >= 0):
+            # No valid spatial metadata — use sequential / dimension-based layout.
             if grid_cols is not None:
-                cols = max(cols, int(grid_cols))
-            if grid_rows is not None:
-                rows = max(rows, int(grid_rows))
-        elif grid_cols is not None:
-            cols = int(grid_cols)
-            rows = int(np.ceil(N / cols))
-        elif grid_rows is not None:
-            rows = int(grid_rows)
-            cols = int(np.ceil(N / rows))
-        else:
-            cols = int(np.ceil(np.sqrt(N)))
-            rows = int(np.ceil(N / cols))
+                cols = int(grid_cols)
+                rows = int(np.ceil(N / cols))
+            elif grid_rows is not None:
+                rows = int(grid_rows)
+                cols = int(np.ceil(N / rows))
+            else:
+                cols = int(np.ceil(np.sqrt(N)))
+                rows = int(np.ceil(N / cols))
+                logger.warning(
+                    f"  ⚠ _mosaic_patches: no grid_cols or patch_positions supplied. "
+                    f"Falling back to sqrt layout ({rows}r × {cols}c for {N} patches). "
+                    f"This WILL jumble the mosaic unless the study area is square "
+                    f"in patch-count terms.  Provide patch_positions.npy or pass "
+                    f"--patch-grid-cols to avoid this."
+                )
 
         canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
 
         if patch_positions is not None and np.any(patch_positions >= 0):
             # Position-aware placement: put each patch at its exact grid cell.
+            out_of_bounds = 0
             for idx in range(N):
                 gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])
-                if gr < 0 or gc < 0 or gr >= rows or gc >= cols:
-                    continue   # invalid / out-of-bounds position — skip
+                if gr < 0 or gc < 0:
+                    continue   # sentinel for patches without spatial metadata
+                if gr >= rows or gc >= cols:
+                    out_of_bounds += 1
+                    continue
                 canvas[gr * H:(gr + 1) * H, gc * W:(gc + 1) * W] = patches[idx]
+            if out_of_bounds:
+                logger.warning(
+                    f"  ⚠ _mosaic_patches: {out_of_bounds} patches had positions "
+                    f"outside the canvas ({rows}r × {cols}c) and were skipped. "
+                    f"This usually means grid_cols is smaller than the true grid width."
+                )
         else:
             # Legacy sequential placement (only correct when no patches were filtered).
             padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
@@ -446,13 +523,14 @@ class InferenceDiagnosticsPlotter:
             N_total = len(ensemble)
             logger.info(f"  Mosaicking {N_total} patches for full-area map …")
 
+            H, W = ensemble.shape[1], ensemble.shape[2]
+
             ens_mosaic = self._mosaic_patches(ensemble, grid_cols=grid_cols,
                                               patch_positions=patch_positions)
             cnn_mosaic = self._mosaic_patches(cnn, grid_cols=grid_cols,
                                               patch_positions=patch_positions)
 
             # GBM: broadcast per-patch scalar or per-patch spatial map
-            H, W = ensemble.shape[1], ensemble.shape[2]
             if gbm.ndim == 1:
                 gbm_tiles = np.stack([np.full((H, W), float(v)) for v in gbm])
             else:
@@ -460,64 +538,261 @@ class InferenceDiagnosticsPlotter:
             gbm_mosaic = self._mosaic_patches(gbm_tiles, grid_cols=grid_cols,
                                               patch_positions=patch_positions)
 
-            has_targets = targets is not None
-            n_cols = 4 if has_targets else 3
-            col_titles = ["CNN", "GBM", "Ensemble", "Error (Ens − Target)"][:n_cols]
+            # ── Detect multi-epoch vertical stacking ──────────────────────────
+            # When the dataset spans multiple temporal epochs, preprocessing
+            # offsets each epoch's grid_row so all epochs stack vertically in
+            # patch_positions.  The tall mosaic (many rows, few cols) is correct
+            # but unreadable as a map.  We detect this case and collapse all
+            # epoch slices into a single spatial grid by taking the pixel-wise
+            # nanmean, then also compute nanstd as an inter-epoch spread map.
+            _actual_patch_rows = ens_mosaic.shape[0] // H
+            _actual_patch_cols = ens_mosaic.shape[1] // W if W > 0 else 1
 
-            fig_w = max(10, 5 * n_cols)
-            fig_h = max(6, int(fig_w * ens_mosaic.shape[0] / (ens_mosaic.shape[1] * n_cols)) + 2)
-            fig, axes = plt.subplots(1, n_cols, figsize=(fig_w, fig_h))
-            if n_cols == 1:
-                axes = [axes]
+            # ── Determine per-epoch rows: prefer authoritative metadata value
+            # over aspect-ratio heuristic.  The heuristic is unreliable when
+            # the per-epoch grid is non-square (e.g. 16 rows × 16 cols gives
+            # aspect=1 and is mistaken for single-epoch, while a rectangular
+            # 8-row × 16-col grid stacked 10 epochs gives aspect=5 but
+            # per_epoch_patch_rows should be 8, not 16//5=3).
+            _rows_per_epoch_meta = getattr(self, "_rows_per_epoch", None)
+            _n_epochs_meta       = getattr(self, "_n_epochs", None)
 
-            vmin = float(np.nanmin(ens_mosaic)); vmax = float(np.nanmax(ens_mosaic))
+            if _rows_per_epoch_meta is not None and _rows_per_epoch_meta > 0:
+                # Use the value saved by preprocessing — most reliable
+                per_epoch_patch_rows = int(_rows_per_epoch_meta)
+                n_epochs_detected    = int(round(_actual_patch_rows / per_epoch_patch_rows))
+                if n_epochs_detected < 1:
+                    n_epochs_detected = 1
+                is_multi_epoch = (n_epochs_detected > 1)
+                logger.info(
+                    f"  Multi-epoch detection (metadata): "
+                    f"rows_per_epoch={per_epoch_patch_rows}, "
+                    f"total_patch_rows={_actual_patch_rows}, "
+                    f"n_epochs={n_epochs_detected}"
+                )
+            else:
+                # Fallback: infer from aspect ratio (only reliable when each
+                # epoch's patch grid is approximately square)
+                _aspect = _actual_patch_rows / max(_actual_patch_cols, 1)
+                is_multi_epoch = _aspect > 4
+                if is_multi_epoch:
+                    n_epochs_detected    = int(round(_aspect))
+                    per_epoch_patch_rows = _actual_patch_rows // max(n_epochs_detected, 1)
+                    logger.warning(
+                        f"  Multi-epoch detection (aspect-ratio fallback): "
+                        f"aspect={_aspect:.2f}, n_epochs={n_epochs_detected}, "
+                        f"rows_per_epoch={per_epoch_patch_rows}.  "
+                        f"Supply patch_grid_rows_per_epoch in metadata for accuracy."
+                    )
+                else:
+                    n_epochs_detected    = 1
+                    per_epoch_patch_rows = _actual_patch_rows
 
-            for ax, data, title in zip(axes[:3], [cnn_mosaic, gbm_mosaic, ens_mosaic],
-                                       col_titles[:3]):
-                im = ax.imshow(data, vmin=vmin, vmax=vmax, cmap="hot",
-                               interpolation="bilinear")
-                ax.set_title(title, fontsize=10, fontweight="bold")
-                ax.axis("off")
-                cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                cb.set_label("LST (°C)", fontsize=8)
-                # Annotate stats
-                ax.text(0.02, 0.02,
-                        f"mean={np.nanmean(data):.1f}°C\nstd={np.nanstd(data):.2f}°C\n"
-                        f"[{np.nanmin(data):.1f}, {np.nanmax(data):.1f}]",
-                        transform=ax.transAxes, fontsize=7,
-                        color="white", va="bottom",
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
+            per_epoch_px_rows = per_epoch_patch_rows * H
+            total_px_rows     = ens_mosaic.shape[0]
+            total_px_cols     = ens_mosaic.shape[1]
 
-            if has_targets:
-                tgt_arr = np.asarray(targets)
-                if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
-                    tgt_arr = tgt_arr[:, 0]
-                tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
-                                                  patch_positions=patch_positions)
-                err_mosaic = ens_mosaic - tgt_mosaic
-                err_abs = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
-                norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
-                im_err = axes[3].imshow(err_mosaic, norm=norm_err, cmap="RdBu_r",
-                                        interpolation="bilinear")
-                axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
-                axes[3].axis("off")
-                cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
-                cb_err.set_label("Error (°C)", fontsize=8)
-                rmse_all = float(np.sqrt(np.nanmean(err_mosaic ** 2)))
-                axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
-                             transform=axes[3].transAxes, fontsize=7,
-                             color="white", va="bottom",
-                             bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5))
+            if is_multi_epoch:
+                logger.info(
+                    f"  Multi-epoch mosaic detected: {n_epochs_detected} epochs × "
+                    f"{per_epoch_patch_rows} patch-rows × {_actual_patch_cols} patch-cols "
+                    f"({per_epoch_px_rows}px tall per epoch).  "
+                    f"Collapsing to a single trend map via nanmean …"
+                )
 
-            actual_cols = grid_cols if grid_cols is not None else int(np.ceil(np.sqrt(N_total)))
-            actual_rows = int(np.ceil(N_total / actual_cols))
-            fig.suptitle(
-                f"Inference – Full Study-Area Mosaic  "
-                f"({N_total} patches → {actual_rows}×{actual_cols} grid, "
-                f"{ens_mosaic.shape[0]}×{ens_mosaic.shape[1]} px)",
-                fontsize=12, fontweight="bold")
-            plt.tight_layout()
-            self._save(fig, "03b_full_mosaic_predictions")
+                def _collapse_epochs(mosaic: np.ndarray) -> tuple:
+                    """
+                    Split a tall multi-epoch mosaic into per-epoch slices and
+                    return (mean_map, std_map, epoch_slices).
+                    Each slice has shape (per_epoch_px_rows, total_px_cols).
+                    """
+                    slices = []
+                    for ep in range(n_epochs_detected):
+                        row_start = ep * per_epoch_px_rows
+                        row_end   = row_start + per_epoch_px_rows
+                        if row_end <= total_px_rows:
+                            slices.append(mosaic[row_start:row_end, :])
+                    if not slices:
+                        return mosaic, np.zeros_like(mosaic), []
+                    stack = np.stack(slices, axis=0)
+                    mean_map = np.nanmean(stack, axis=0)
+                    std_map  = np.nanstd(stack,  axis=0)
+                    return mean_map, std_map, slices
+
+                ens_mean, ens_std, ens_slices = _collapse_epochs(ens_mosaic)
+                cnn_mean, _,       _          = _collapse_epochs(cnn_mosaic)
+                gbm_mean, _,       _          = _collapse_epochs(gbm_mosaic)
+
+                # ── Figure 03b: collapsed temporal mean map ────────────────────
+                has_targets = targets is not None
+                n_fig_cols  = 4 if has_targets else 3   # mean-ens | std | cnn-mean | [err]
+                col_titles  = ["Ensemble – Temporal Mean", "Inter-epoch Spread (σ)",
+                               "CNN – Temporal Mean", "Error (Ens − Target)"][:n_fig_cols]
+
+                fig_w = max(14, 5 * n_fig_cols)
+                fig_h = max(6, int(fig_w * ens_mean.shape[0] /
+                                   (ens_mean.shape[1] * n_fig_cols)) + 3)
+                fig, axes = plt.subplots(1, n_fig_cols, figsize=(fig_w, fig_h))
+                if n_fig_cols == 1:
+                    axes = [axes]
+
+                vmin = float(np.nanpercentile(ens_mean, 2))
+                vmax = float(np.nanpercentile(ens_mean, 98))
+
+                # Panel 0 — ensemble temporal mean
+                im0 = axes[0].imshow(ens_mean, vmin=vmin, vmax=vmax,
+                                     cmap="RdYlBu_r", interpolation="bilinear",
+                                     origin="upper")
+                axes[0].set_title(col_titles[0], fontsize=10, fontweight="bold")
+                axes[0].axis("off")
+                cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+                cb0.set_label("LST (°C)", fontsize=8)
+                axes[0].text(
+                    0.02, 0.02,
+                    f"mean={np.nanmean(ens_mean):.1f}°C\n"
+                    f"std={np.nanstd(ens_mean):.2f}°C\n"
+                    f"[{np.nanmin(ens_mean):.1f}, {np.nanmax(ens_mean):.1f}]\n"
+                    f"n_epochs={n_epochs_detected}",
+                    transform=axes[0].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 1 — inter-epoch spread (std)
+                std_vmax = float(np.nanpercentile(ens_std, 98))
+                im1 = axes[1].imshow(ens_std, vmin=0, vmax=max(std_vmax, 0.1),
+                                     cmap="YlOrRd", interpolation="bilinear",
+                                     origin="upper")
+                axes[1].set_title(col_titles[1], fontsize=10, fontweight="bold")
+                axes[1].axis("off")
+                cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+                cb1.set_label("σ (°C)", fontsize=8)
+                axes[1].text(
+                    0.02, 0.02,
+                    f"mean σ={np.nanmean(ens_std):.2f}°C\n"
+                    f"max σ={np.nanmax(ens_std):.2f}°C",
+                    transform=axes[1].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 2 — CNN temporal mean
+                im2 = axes[2].imshow(cnn_mean, vmin=vmin, vmax=vmax,
+                                     cmap="RdYlBu_r", interpolation="bilinear",
+                                     origin="upper")
+                axes[2].set_title(col_titles[2], fontsize=10, fontweight="bold")
+                axes[2].axis("off")
+                cb2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+                cb2.set_label("LST (°C)", fontsize=8)
+                axes[2].text(
+                    0.02, 0.02,
+                    f"mean={np.nanmean(cnn_mean):.1f}°C\n"
+                    f"std={np.nanstd(cnn_mean):.2f}°C",
+                    transform=axes[2].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 3 — error vs targets (optional)
+                if has_targets:
+                    tgt_arr = np.asarray(targets)
+                    if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
+                        tgt_arr = tgt_arr[:, 0]
+                    tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
+                                                      patch_positions=patch_positions)
+                    tgt_mean, _, _ = _collapse_epochs(tgt_mosaic)
+                    err_mean  = ens_mean - tgt_mean
+                    err_abs   = max(float(np.nanpercentile(np.abs(err_mean), 98)), 1e-6)
+                    norm_err  = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                    im_err = axes[3].imshow(err_mean, norm=norm_err, cmap="RdBu_r",
+                                            interpolation="bilinear", origin="upper")
+                    axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
+                    axes[3].axis("off")
+                    cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
+                    cb_err.set_label("Error (°C)", fontsize=8)
+                    rmse_all = float(np.sqrt(np.nanmean(err_mean ** 2)))
+                    axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
+                                 transform=axes[3].transAxes, fontsize=7,
+                                 color="white", va="bottom",
+                                 bbox=dict(boxstyle="round,pad=0.2",
+                                           facecolor="black", alpha=0.55))
+
+                fig.suptitle(
+                    f"Inference – Temporal Mean Map  "
+                    f"({n_epochs_detected} epochs collapsed, "
+                    f"{_actual_patch_cols} patch-cols, "
+                    f"{ens_mean.shape[0]}×{ens_mean.shape[1]} px)",
+                    fontsize=12, fontweight="bold")
+                plt.tight_layout()
+                self._save(fig, "03b_full_mosaic_predictions")
+                logger.info(
+                    f"  ✅ Saved temporal mean map — collapsed {n_epochs_detected} "
+                    f"epochs into a single {ens_mean.shape[0]}×{ens_mean.shape[1]} px map."
+                )
+
+            else:
+                # ── Single-epoch or non-stacked mosaic: original rendering ─────
+                has_targets = targets is not None
+                n_fig_cols  = 4 if has_targets else 3
+                col_titles  = ["CNN", "GBM", "Ensemble",
+                               "Error (Ens − Target)"][:n_fig_cols]
+
+                fig_w = max(10, 5 * n_fig_cols)
+                fig_h = max(6, int(fig_w * ens_mosaic.shape[0] /
+                                   (ens_mosaic.shape[1] * n_fig_cols)) + 2)
+                fig, axes = plt.subplots(1, n_fig_cols, figsize=(fig_w, fig_h))
+                if n_fig_cols == 1:
+                    axes = [axes]
+
+                vmin = float(np.nanmin(ens_mosaic))
+                vmax = float(np.nanmax(ens_mosaic))
+
+                for ax, data, title in zip(axes[:3],
+                                           [cnn_mosaic, gbm_mosaic, ens_mosaic],
+                                           col_titles[:3]):
+                    im = ax.imshow(data, vmin=vmin, vmax=vmax, cmap="hot",
+                                   interpolation="bilinear", origin="upper")
+                    ax.set_title(title, fontsize=10, fontweight="bold")
+                    ax.axis("off")
+                    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    cb.set_label("LST (°C)", fontsize=8)
+                    ax.text(0.02, 0.02,
+                            f"mean={np.nanmean(data):.1f}°C\n"
+                            f"std={np.nanstd(data):.2f}°C\n"
+                            f"[{np.nanmin(data):.1f}, {np.nanmax(data):.1f}]",
+                            transform=ax.transAxes, fontsize=7,
+                            color="white", va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.2",
+                                      facecolor="black", alpha=0.5))
+
+                if has_targets:
+                    tgt_arr = np.asarray(targets)
+                    if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
+                        tgt_arr = tgt_arr[:, 0]
+                    tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
+                                                      patch_positions=patch_positions)
+                    err_mosaic = ens_mosaic - tgt_mosaic
+                    err_abs    = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
+                    norm_err   = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                    im_err = axes[3].imshow(err_mosaic, norm=norm_err, cmap="RdBu_r",
+                                            interpolation="bilinear", origin="upper")
+                    axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
+                    axes[3].axis("off")
+                    cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
+                    cb_err.set_label("Error (°C)", fontsize=8)
+                    rmse_all = float(np.sqrt(np.nanmean(err_mosaic ** 2)))
+                    axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
+                                 transform=axes[3].transAxes, fontsize=7,
+                                 color="white", va="bottom",
+                                 bbox=dict(boxstyle="round,pad=0.2",
+                                           facecolor="black", alpha=0.5))
+
+                actual_rows = ens_mosaic.shape[0] // H
+                actual_cols = ens_mosaic.shape[1] // W
+                fig.suptitle(
+                    f"Inference – Full Study-Area Mosaic  "
+                    f"({N_total} patches → {actual_rows}×{actual_cols} grid, "
+                    f"{ens_mosaic.shape[0]}×{ens_mosaic.shape[1]} px)",
+                    fontsize=12, fontweight="bold")
+                plt.tight_layout()
+                self._save(fig, "03b_full_mosaic_predictions")
 
         except Exception as e:
             logger.warning(f"_plot_full_mosaic failed: {e}")

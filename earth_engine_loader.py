@@ -2,7 +2,7 @@
 Google Earth Engine data downloader
 Purpose: Download RAW satellite bands from Earth Engine for later processing.
 
-Key improvements over original:
+Key design decisions:
   1. Merges Landsat 8 (LC08) and Landsat 9 (LC09) into a single collection —
      maximises revisit frequency, especially important for 2021-2025.
   2. Uses ee.batch.Export.image.toDrive() instead of getThumbURL() —
@@ -14,16 +14,16 @@ Key improvements over original:
      for longitude degrees (important near the equator).
   5. Resume/skip logic: already-completed months are detected and skipped,
      making interrupted runs safe to restart.
-  6. Seasonal composite strategy: dry-season (Apr–Oct) and wet-season
-     (Nov–Mar) months are composited separately when data permits, giving
-     richer temporal structure for UHI analysis.
+  6. unmask(0) is applied at export time so the GeoTIFF bounding-box is fully
+     populated (no masked-pixel gaps at tile seams or ocean borders). Downstream
+     preprocessing must treat all-zero pixels as fill / no-data.
 """
 
 import sys
 import math
 import time
+import calendar
 import ee
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -143,6 +143,14 @@ class EarthEngineLoader:
             sensors:     Sensors to download. Any of 'landsat', 'sentinel2'.
             gee_project: Your GEE Cloud project ID.
         """
+        _valid_sensors = {"landsat", "sentinel2"}
+        unknown = set(sensors) - _valid_sensors
+        if unknown:
+            raise ValueError(
+                f"Unknown sensor(s): {unknown}. "
+                f"Valid options are: {_valid_sensors}"
+            )
+
         try:
             ee.Initialize(project=gee_project)
             logger.info("Earth Engine initialised successfully")
@@ -173,13 +181,22 @@ class EarthEngineLoader:
         """
         Mask clouds and cloud shadows using QA_PIXEL bit flags.
 
-        Bit 3 = Cloud
-        Bit 4 = Cloud Shadow
-        Both must be 0 (clear) for a pixel to be retained.
+        Bits masked:
+          Bit 1 = Dilated Cloud  (conservative buffer around cloud cores)
+          Bit 3 = Cloud
+          Bit 4 = Cloud Shadow
+          Bit 5 = Snow / Ice     (rare in Jakarta but safe to exclude)
+
+        All four must be 0 (clear) for a pixel to be retained.
+
+        Note: Bit 2 (Cirrus) is intentionally omitted — it is unreliable
+        over tropical urban surfaces and tends to over-mask bright rooftops.
         """
         qa = image.select('QA_PIXEL')
-        clear = (qa.bitwiseAnd(1 << 3).eq(0)   # not cloud
-                   .And(qa.bitwiseAnd(1 << 4).eq(0)))  # not cloud shadow
+        clear = (qa.bitwiseAnd(1 << 1).eq(0)   # not dilated cloud
+                   .And(qa.bitwiseAnd(1 << 3).eq(0))   # not cloud
+                   .And(qa.bitwiseAnd(1 << 4).eq(0))   # not cloud shadow
+                   .And(qa.bitwiseAnd(1 << 5).eq(0)))  # not snow/ice
         return image.updateMask(clear)
 
     def _mask_sentinel2_clouds(self, image: ee.Image) -> ee.Image:
@@ -368,8 +385,28 @@ class EarthEngineLoader:
 
         image_selected = image.select(export_bands)
 
-        # Fill masked/NaN pixels at tile-seam borders with 0 so the exported
-        # GeoTIFF covers the full AOI without diagonal cutoff edges.
+        # ── Reproject THEN unmask — order is critical ──────────────────────
+        #
+        # Root cause of the vertical NaN streaks (cyan lines in patch previews):
+        #   Landsat WRS-2 orbital paths have a small inter-path gap — a strip
+        #   where neither adjacent path has coverage in a given month.  In the
+        #   WRS-2 swath geometry these gaps are oblique, but after reprojection
+        #   to UTM (EPSG:32748) they become perfectly straight *vertical* lines
+        #   of masked pixels in the output grid.
+        #
+        #   When unmask(0) was called BEFORE reproject(), it filled gaps in the
+        #   source (WRS-2) projection.  However, GEE's internal reprojection
+        #   step can introduce fresh masked pixels along the rotated swath edges
+        #   — those new masked pixels were never filled and survived as NaN
+        #   streaks in the exported GeoTIFF.
+        #
+        # Fix: call reproject() first so all swath-edge gaps are committed to
+        # the UTM grid, then call unmask(0) to fill every remaining masked pixel.
+        # This guarantees a spatially complete raster with no NaN streak lines.
+        image_selected = image_selected.reproject(
+            crs=self.EXPORT_CRS,
+            scale=scale,
+        )
         image_selected = image_selected.unmask(0)
 
         task = ee.batch.Export.image.toDrive(
@@ -394,6 +431,11 @@ class EarthEngineLoader:
         """
         Poll a GEE task until it completes or times out.
 
+        Uses exponential back-off starting at 15 s and capping at
+        POLL_INTERVAL_S (30 s).  This reduces API chatter during the
+        initial READY/RUNNING queuing phase without sacrificing responsiveness
+        once a task is actually running.
+
         Args:
             task:        The running ee.batch.Task.
             description: Human-readable label for log messages.
@@ -401,22 +443,32 @@ class EarthEngineLoader:
         Returns:
             True if COMPLETED, False otherwise.
         """
-        elapsed = 0
+        elapsed  = 0
+        interval = 15   # start at 15 s, double up to POLL_INTERVAL_S
+
         while elapsed < self.MAX_WAIT_S:
             status = task.status()
             state  = status["state"]
 
             if state == "COMPLETED":
-                logger.info(f"  ✓ {description} — COMPLETED")
+                logger.info(f"  ✓ {description} — COMPLETED "
+                            f"(elapsed {elapsed}s)")
                 return True
             elif state in ("FAILED", "CANCELLED"):
                 logger.error(f"  ✗ {description} — {state}: "
                              f"{status.get('error_message', 'no message')}")
                 return False
             else:
-                logger.debug(f"  … {description} — {state} ({elapsed}s elapsed)")
-                time.sleep(self.POLL_INTERVAL_S)
-                elapsed += self.POLL_INTERVAL_S
+                # Log at INFO every ~5 min so progress is visible in long runs
+                if elapsed % 300 == 0 and elapsed > 0:
+                    logger.info(f"  … {description} — {state} "
+                                f"({elapsed}s elapsed)")
+                else:
+                    logger.debug(f"  … {description} — {state} "
+                                 f"({elapsed}s elapsed)")
+                time.sleep(interval)
+                elapsed  += interval
+                interval  = min(interval * 2, self.POLL_INTERVAL_S)
 
         logger.error(f"  ✗ {description} — timed out after {self.MAX_WAIT_S}s")
         return False
@@ -623,12 +675,15 @@ class EarthEngineLoader:
 # ---------------------------------------------------------------------------
 
 def _month_date_range(year: int, month: int) -> Tuple[str, str]:
-    """Return ('YYYY-MM-DD', 'YYYY-MM-DD') for the start and end of a month."""
+    """Return ('YYYY-MM-DD', 'YYYY-MM-DD') for the start and exclusive end of a month.
+
+    Uses calendar.monthrange to handle December without a special-case branch.
+    The end date is the first day of the following month (exclusive upper
+    bound), which is the convention expected by GEE filterDate().
+    """
     start = datetime(year, month, 1)
-    if month == 12:
-        end = datetime(year + 1, 1, 1)
-    else:
-        end = datetime(year, month + 1, 1)
+    _, last_day = calendar.monthrange(year, month)
+    end = datetime(year, month, last_day) + timedelta(days=1)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 

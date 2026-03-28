@@ -278,17 +278,26 @@ def stage_inference(args, predictor: EnsemblePredictor,
     # so that any diagnostic mosaic (03b) saved during predict_ensemble[_with_tta]
     # uses the correct spatial layout rather than the jumbling sqrt fallback.
     grid_cols = getattr(args, "patch_grid_cols", None)
+    rows_per_epoch = None
+    n_epochs_meta  = None
     if grid_cols is None:
         _gs = _load_patch_grid_shape(Path(args.test_data))
         if _gs is not None:
             grid_cols = _gs[1]
+            if len(_gs) >= 4:
+                rows_per_epoch = _gs[2]
+                n_epochs_meta  = _gs[3]
     if grid_cols is not None:
         predictor.plotter.set_grid_cols(grid_cols)
         logger.info(f"  Plotter grid_cols set to {grid_cols}")
     else:
         logger.warning(
-            "  ⚠ grid_cols unknown at inference time — diagnostic mosaic 03b will "            "use sqrt fallback.  Pass --patch-grid-cols=<N> to fix."
+            "  ⚠ grid_cols unknown at inference time — diagnostic mosaic 03b will "
+            "use sqrt fallback.  Pass --patch-grid-cols=<N> to fix."
         )
+    if rows_per_epoch is not None:
+        predictor.plotter.set_rows_per_epoch(rows_per_epoch, n_epochs_meta)
+        logger.info(f"  Plotter rows_per_epoch={rows_per_epoch}, n_epochs={n_epochs_meta}")
 
     # ── Load per-patch spatial positions so the mosaic assembler places each
     # patch at its original grid cell (fixes jumbled output when QC filtering
@@ -348,33 +357,43 @@ def stage_inference(args, predictor: EnsemblePredictor,
 
 def _load_patch_grid_shape(test_data_dir: Path) -> tuple:
     """
-    Try to read the patch grid shape (grid_rows, grid_cols) saved by the
-    dataset builder.  Returns None if no metadata file is found.
+    Try to read the patch grid shape saved by the dataset builder.
+    Returns (grid_rows, grid_cols[, rows_per_epoch, n_epochs]) or None.
 
-    The dataset builder is expected to write one of:
-      <test_data_dir>/patch_grid_shape.npy   — np.array([rows, cols])
-      <test_data_dir>/dataset_metadata.json  — {"patch_grid_rows": R, "patch_grid_cols": C}
-      <test_data_dir>/../patch_grid_shape.npy  (parent dir, i.e. cnn_dataset/)
-      <test_data_dir>/../dataset_metadata.json
+    The dataset builder writes one of:
+      <test_data_dir>/patch_grid_shape.npy   — np.array([rows, cols[, rpe, ne]])
+      <test_data_dir>/dataset_metadata.json  — {"patch_grid_rows": R, "patch_grid_cols": C, ...}
+      <test_data_dir>/metadata.json          — same keys
+      (and the same files in the parent cnn_dataset/ directory)
     """
     candidates = [
         test_data_dir / "patch_grid_shape.npy",
         test_data_dir / "dataset_metadata.json",
+        test_data_dir / "metadata.json",
         test_data_dir.parent / "patch_grid_shape.npy",
         test_data_dir.parent / "dataset_metadata.json",
+        test_data_dir.parent / "metadata.json",
     ]
     for path in candidates:
         if not path.exists():
             continue
         try:
             if path.suffix == ".npy":
-                shape = tuple(int(x) for x in np.load(path))
+                arr = np.load(path)
+                if len(arr) >= 4:
+                    shape = tuple(int(x) for x in arr)  # (rows, cols, rpe, ne)
+                else:
+                    shape = tuple(int(x) for x in arr)  # (rows, cols)
                 logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
-                return shape   # (grid_rows, grid_cols)
+                return shape
             else:
                 meta = json.loads(path.read_text())
                 if "patch_grid_rows" in meta and "patch_grid_cols" in meta:
-                    shape = (int(meta["patch_grid_rows"]), int(meta["patch_grid_cols"]))
+                    rows = int(meta["patch_grid_rows"])
+                    cols = int(meta["patch_grid_cols"])
+                    rpe  = int(meta["patch_grid_rows_per_epoch"]) if "patch_grid_rows_per_epoch" in meta else rows
+                    ne   = int(meta["n_epochs"]) if "n_epochs" in meta else 1
+                    shape = (rows, cols, rpe, ne)
                     logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
                     return shape
         except Exception as exc:
@@ -409,10 +428,13 @@ def _mosaic_patches(patches: np.ndarray,
         valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
         rows = int(patch_positions[valid_mask, 0].max()) + 1
         cols = int(patch_positions[valid_mask, 1].max()) + 1
+        # When grid_cols is known from dataset metadata, use it as the
+        # authoritative column count.  This is correct because patch_positions
+        # col indices run 0 … grid_cols-1, so max+1 == grid_cols when all
+        # positions are valid.  Supplying it explicitly guards against test
+        # splits that are missing the rightmost column patches.
         if grid_cols is not None:
-            cols = max(cols, int(grid_cols))
-        if grid_rows is not None:
-            rows = max(rows, int(grid_rows))
+            cols = int(grid_cols)
         canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
         for idx in range(N):
             gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])

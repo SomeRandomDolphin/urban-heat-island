@@ -145,6 +145,13 @@ def load_tif_as_bands(tif_path: Path,
             descriptions = [src.descriptions[i] for i in range(n_bands)]
             has_desc     = any(d is not None and str(d).strip() for d in descriptions)
 
+            # Detect south-up rasters (positive y scale in affine transform).
+            # Standard north-up GeoTIFFs have a negative y scale (affine[4] < 0),
+            # meaning row 0 is the northernmost row.  A positive y scale means row 0
+            # is the SOUTHERNMOST row, which would flip the mosaic north-south.
+            # We normalise to north-up by flipping after reading.
+            _needs_vflip = (src.transform.e > 0)   # transform.e == pixel height (row scale)
+
             if not has_desc:
                 if n_bands == len(_LANDSAT_BAND_ORDER):
                     descriptions = _LANDSAT_BAND_ORDER
@@ -188,9 +195,60 @@ def load_tif_as_bands(tif_path: Path,
                 ).astype(np.float32)
                 if nodata is not None:
                     arr[arr == nodata] = np.nan
+                if _needs_vflip:
+                    arr = np.flipud(arr)
                 bands[name] = arr
 
         actual_rows, actual_cols = next(iter(bands.values())).shape
+        if _needs_vflip:
+            logger.warning(
+                f"  [Orientation] {tif_path.name}: south-up raster detected "
+                f"(affine y-scale > 0) — flipped vertically to north-up. "
+                f"This normalises patch grid_row=0 to the northernmost row."
+            )
+
+        # ── Replace GEE unmask(0) fill pixels with NaN ─────────────────
+        # earth_engine_loader calls image.unmask(0) before exporting so that
+        # the GeoTIFF bounding-box is fully populated (no masked-pixel gaps at
+        # tile seams or ocean borders).  That means large ocean / out-of-scene
+        # regions are stored as exactly 0 in EVERY spectral band.
+        #
+        # Problem: the all-zero pixels are valid float values, so rasterio
+        # reads them as real data.  When the ocean region covers >50 % of the
+        # raster (common for coastal Jakarta tiles), the nanmedian of the red
+        # band is pulled toward 0, causing the DN-detection heuristic in
+        # calculate_spectral_indices() to mis-classify already-scaled
+        # GeoTIFFs as "raw DN" (or vice-versa), and collapsing every index
+        # to a flat, featureless map.
+        #
+        # Fix: identify pixels where ALL spectral bands (excluding QA/SCL
+        # bitmask bands) are exactly 0.0, and replace them with NaN.
+        # This preserves genuine dark-water pixels (which have non-zero
+        # values in at least one band) while eliminating the fill region.
+        spectral_band_names = [
+            k for k in bands
+            if k not in {"QA_PIXEL", "QA60", "SCL"}
+        ]
+        if spectral_band_names:
+            fill_mask = np.ones(
+                bands[spectral_band_names[0]].shape, dtype=bool
+            )
+            for bn in spectral_band_names:
+                fill_mask &= (bands[bn] == 0.0)
+
+            n_fill = int(fill_mask.sum())
+            if n_fill > 0:
+                fill_pct = n_fill / fill_mask.size * 100
+                logger.info(
+                    f"  [Fill pixels] {tif_path.name}: replacing {n_fill:,} "
+                    f"all-zero fill pixels ({fill_pct:.1f}% of image) with NaN. "
+                    f"These are GEE unmask(0) tile-edge / ocean fill values."
+                )
+                for bn in spectral_band_names:
+                    bands[bn][fill_mask] = np.nan
+            del fill_mask
+        # ───────────────────────────────────────────────────────────────
+
         logger.info(
             f"  Loaded {n_bands} bands from {tif_path.name} "
             f"[{actual_rows}×{actual_cols}]: {list(bands.keys())}"
@@ -2265,8 +2323,19 @@ class SatellitePreprocessor:
 
             # Detect DN (legacy export) vs pre-scaled reflectance (GeoTIFF).
             # Pre-scaled values are in [0, 1]; raw DN medians are ~5 000–30 000.
-            _s = red[np.isfinite(red)]
-            if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
+            #
+            # BUG FIX: use the 75th percentile of *positive* pixels, not the
+            # overall median.  When the raster has a large water/fill region
+            # (zeros from unmask(0) in GEE), the overall median is pulled toward
+            # 0 and the DN-detection condition evaluates False — leaving bands in
+            # raw DN values and collapsing all spectral indices (the wide blank
+            # areas seen in 01_raw_bands_landsat.png / 02_spectral_indices_landsat.png).
+            _s = red[np.isfinite(red) & (red > 0)]
+            if _s.size > 0 and float(np.percentile(_s, 75)) > 2.0:
+                logger.info(
+                    "  [LS scale] DN values detected (p75 of positive red pixels = "
+                    f"{float(np.percentile(_s, 75)):.1f}) — applying C2 L2 scale factors."
+                )
                 # Legacy DN — convert to reflectance in-place
                 scale = np.float32(2.75e-5)
                 offset = np.float32(0.2)
@@ -2279,8 +2348,27 @@ class SatellitePreprocessor:
                 np.clip(nir,   -0.5, 1.5, out=nir)
                 np.clip(swir1, -0.5, 1.5, out=swir1)
                 np.clip(swir2, -0.5, 1.5, out=swir2)
+            else:
+                logger.info(
+                    "  [LS scale] Reflectance values already in [0, 1] — no scaling needed."
+                )
             del _s
             # GeoTIFF path: already in [0, 1] — no conversion needed
+
+            # Replace all-zero fill pixels (ocean/tile-edge from GEE unmask(0))
+            # with NaN so they don't bias index statistics or the colour stretch.
+            _fill_mask = (
+                (blue == 0) & (green == 0) & (red == 0) &
+                (nir  == 0) & (swir1 == 0) & (swir2 == 0)
+            )
+            if _fill_mask.any():
+                logger.info(
+                    f"  [LS fill] Replacing {_fill_mask.sum():,} all-zero fill pixels "
+                    f"({_fill_mask.mean()*100:.1f}% of image) with NaN."
+                )
+                for arr in (blue, green, red, nir, swir1, swir2):
+                    arr[_fill_mask] = np.nan
+            del _fill_mask
 
         else:  # Sentinel-2
             blue  = _f32(bands["B2"])
@@ -2290,13 +2378,51 @@ class SatellitePreprocessor:
             swir1 = _f32(bands["B11"])
             swir2 = _f32(bands["B12"])
 
-            # S2_SR_HARMONIZED: reflectance × 10 000 — divide in-place if needed
-            _s = red[np.isfinite(red)]
-            if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
+            # S2_SR_HARMONIZED: reflectance × 10 000 — divide in-place if needed.
+            #
+            # BUG FIX: the original code used np.nanmedian() on ALL finite pixels.
+            # When the AOI contains a large ocean/fill region (zeros from
+            # earth_engine_loader's unmask(0)), the median is dragged to ~0,
+            # so the condition `median > 2.0` evaluates False and the DN-to-
+            # reflectance scaling is SKIPPED.  This leaves bands at raw DN values
+            # (~0–10 000), making every spectral index collapse to a near-constant
+            # value — the wide blank/flat areas visible in s2_01_raw_bands.png and
+            # s2_02_spectral_indices.png.
+            #
+            # FIX: use the 75th percentile of *positive* (land/vegetated) pixels
+            # as the scale-detection probe.  Ocean fill values are exactly 0 and
+            # are excluded; real DN land reflectances are always >> 2.0.
+            _s = red[np.isfinite(red) & (red > 0)]
+            if _s.size > 0 and float(np.percentile(_s, 75)) > 2.0:
+                logger.info(
+                    "  [S2 scale] DN values detected (p75 of positive red pixels = "
+                    f"{float(np.percentile(_s, 75)):.1f}) — dividing by 10 000."
+                )
                 scale = np.float32(1.0 / 10000.0)
                 for arr in (blue, green, red, nir, swir1, swir2):
                     arr *= scale
+            else:
+                logger.info(
+                    "  [S2 scale] Reflectance values already in [0, 1] — no scaling needed."
+                )
             del _s
+
+            # Replace fill zeros (ocean/tile-edge, set by GEE unmask(0)) with NaN
+            # so they do not corrupt index statistics or the colour stretch.
+            # We only null pixels where ALL optical bands are exactly 0 to avoid
+            # masking genuine dark-water pixels that may be near-zero legitimately.
+            _fill_mask = (
+                (blue  == 0) & (green == 0) & (red  == 0) &
+                (nir   == 0) & (swir1 == 0) & (swir2 == 0)
+            )
+            if _fill_mask.any():
+                logger.info(
+                    f"  [S2 fill] Replacing {_fill_mask.sum():,} all-zero fill pixels "
+                    f"({_fill_mask.mean()*100:.1f}% of image) with NaN."
+                )
+                for arr in (blue, green, red, nir, swir1, swir2):
+                    arr[_fill_mask] = np.nan
+            del _fill_mask
 
         # ── Index computation — one at a time, in-place where possible ─────
         # NDVI = (nir - red) / (nir + red + eps)
@@ -3344,17 +3470,20 @@ class DatasetCreator:
             logger.info(f"  ✓ Saved and freed {split_name} split → {split_dir}")
 
         import json
+        metadata_clean = {}
+        for k, v in metadata.items():
+            if isinstance(v, (np.integer, np.floating)):
+                metadata_clean[k] = float(v)
+            elif isinstance(v, np.ndarray):
+                metadata_clean[k] = v.tolist()
+            else:
+                metadata_clean[k] = v
+        # Save as both metadata.json (legacy) AND dataset_metadata.json
+        # (_load_patch_grid_shape in pipeline_manager looks for dataset_metadata.json)
+        for _mname in ["metadata.json", "dataset_metadata.json"]:
+            with open(output_dir / _mname, "w") as f:
+                json.dump(metadata_clean, f, indent=2)
         metadata_file = output_dir / "metadata.json"
-        with open(metadata_file, "w") as f:
-            metadata_clean = {}
-            for k, v in metadata.items():
-                if isinstance(v, (np.integer, np.floating)):
-                    metadata_clean[k] = float(v)
-                elif isinstance(v, np.ndarray):
-                    metadata_clean[k] = v.tolist()
-                else:
-                    metadata_clean[k] = v
-            json.dump(metadata_clean, f, indent=2)
 
         if norm_stats is not None:
             stats_file = output_dir / "normalization_stats.json"
@@ -3371,8 +3500,14 @@ class DatasetCreator:
         # user passes to --test-data.
         grid_rows = metadata.get("patch_grid_rows")
         grid_cols = metadata.get("patch_grid_cols")
+        rows_per_epoch = metadata.get("patch_grid_rows_per_epoch")
+        n_epochs_meta  = metadata.get("n_epochs", 1)
         if grid_rows is not None and grid_cols is not None:
-            grid_arr = np.array([int(grid_rows), int(grid_cols)], dtype=np.int32)
+            # Store [total_rows, cols, rows_per_epoch, n_epochs] so the
+            # inference mosaic can collapse epochs correctly.
+            _rpe = int(rows_per_epoch) if rows_per_epoch is not None else int(grid_rows)
+            _ne  = int(n_epochs_meta) if n_epochs_meta is not None else 1
+            grid_arr = np.array([int(grid_rows), int(grid_cols), _rpe, _ne], dtype=np.int32)
             # Root dataset dir
             np.save(output_dir / "patch_grid_shape.npy", grid_arr)
             # Each split sub-directory
@@ -3381,7 +3516,9 @@ class DatasetCreator:
                 if _sdir.exists():
                     np.save(_sdir / "patch_grid_shape.npy", grid_arr)
             logger.info(
-                f"✅ Saved patch grid shape [{grid_rows}, {grid_cols}] to "                f"{output_dir} (and all split sub-directories)"
+                f"✅ Saved patch grid shape [{grid_rows}rows, {grid_cols}cols, "
+                f"{_rpe}rows/epoch, {_ne}epochs] to "
+                f"{output_dir} (and all split sub-directories)"
             )
         else:
             logger.warning(
@@ -3950,6 +4087,13 @@ def main():
     _all_grid_rows: List[int] = []
     _all_grid_cols: List[int] = []
 
+    # ── Epoch counter — used to give each temporal epoch a unique row-offset
+    # in the combined patch_positions array.  Without this, patches from
+    # different dates share the same (grid_row, grid_col) values and overwrite
+    # each other in the mosaic assembler, creating a checkerboard artefact.
+    # Epoch N's patches are placed at rows [N * grid_rows ... (N+1)*grid_rows - 1].
+    _epoch_index: List[int] = []   # epoch number for each entry in all_rasters
+
     first_fused_diag = True
 
     def _fuse_extract_free(fused_data: Dict, date, label: str) -> None:
@@ -3964,8 +4108,19 @@ def main():
         _all_grid_rows.append(result.grid_rows)
         _all_grid_cols.append(result.grid_cols)
 
+        # ── Offset grid_row by epoch index so patches from different dates
+        # never share the same grid position.  The epoch's row-offset equals
+        # the cumulative row count of all preceding epochs.
+        epoch_idx = len(_epoch_index)
+        _epoch_index.append(epoch_idx)
+        prior_rows = sum(_all_grid_rows[:-1])   # total rows from previous epochs
         for p in patches:
             p["date"] = date
+            # Shift _grid_row by the epoch offset so each epoch occupies its own
+            # row band in the combined grid.  _grid_col stays unchanged.
+            if p.get("_grid_row", -1) >= 0:
+                p["_grid_row"] = p["_grid_row"] + prior_rows
+
         all_patches.extend(patches)
         all_dates.append(date)
         # Keep a reference to the raster alongside its patches so
@@ -3973,6 +4128,7 @@ def main():
         all_rasters.append((fused_data, patches))
         logger.info(f"  {label}: {len(patches)} patches "
                     f"(grid {result.grid_rows}r×{result.grid_cols}c, "
+                    f"epoch row-offset={prior_rows}, "
                     f"running total: {len(all_patches)})")
 
     if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
@@ -4141,17 +4297,22 @@ def main():
 
     # ── Resolve the canonical patch grid shape ───────────────────────────────
     # _all_grid_rows / _all_grid_cols were populated by _fuse_extract_free.
-    # Take the statistical mode: for a uniform study area all rasters produce
-    # the same grid; if a raster was clipped differently we prefer the majority.
+    # grid_cols = mode across rasters (they should all be the same width).
+    # grid_rows = TOTAL stacked rows across all epochs, because _fuse_extract_free
+    # now offsets each epoch's grid_row by the cumulative prior row count.
+    # This means the combined grid is (sum_of_all_epoch_rows) × grid_cols.
     if _all_grid_cols:
         from collections import Counter as _Counter
         _mode_cols = _Counter(_all_grid_cols).most_common(1)[0][0]
-        _mode_rows = _Counter(_all_grid_rows).most_common(1)[0][0]
         patch_grid_cols = int(_mode_cols)
-        patch_grid_rows = int(_mode_rows)
+        # Total rows = sum of per-epoch rows (each epoch stacks below the last)
+        patch_grid_rows = int(sum(_all_grid_rows))
         logger.info(
-            f"  Patch grid shape (mode across rasters): "
-            f"{patch_grid_rows} rows × {patch_grid_cols} cols"
+            f"  Patch grid shape (stacked across {len(_all_grid_rows)} epochs): "
+            f"{patch_grid_rows} total rows × {patch_grid_cols} cols"
+        )
+        logger.info(
+            f"  Per-epoch row counts: {_all_grid_rows}"
         )
         if len(set(_all_grid_cols)) > 1:
             logger.warning(
@@ -4189,6 +4350,11 @@ def main():
         "patch_grid_rows": patch_grid_rows,
         "patch_grid_cols": patch_grid_cols,
         "patch_stride":    24,   # keep in sync with stride used above
+        # ── Per-epoch grid dimensions — required for correct multi-epoch collapse.
+        # patch_grid_rows is the TOTAL stacked rows (n_epochs × rows_per_epoch).
+        # The inference mosaic uses rows_per_epoch to slice each epoch correctly.
+        "patch_grid_rows_per_epoch": int(_all_grid_rows[0]) if _all_grid_rows else None,
+        "n_epochs": int(len(_all_grid_rows)) if _all_grid_rows else 1,
         # ── Per-patch (grid_row, grid_col) positions — shape (N, 2) int32.
         # Stored here so create_stratified_split can propagate them into the
         # splits dict alongside X/y, letting save_dataset write

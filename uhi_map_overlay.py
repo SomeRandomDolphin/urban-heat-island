@@ -355,21 +355,32 @@ class RealMapOverlay:
                  '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
         cmap = LinearSegmentedColormap.from_list('thermal', colors, N=256)
         
-        # Plot LST data
+        # Plot LST data.
+        # FIX: matplotlib imshow(extent=...) expects [left, right, bottom, top] in
+        # the axes CRS (Web Mercator here).  We must also pass origin='upper' so
+        # that array row-0 (northernmost row after the north-up flip in
+        # load_tif_as_bands) maps to the TOP of the geographic extent.  Without
+        # origin='upper' matplotlib flips the raster south-up, producing horizontal
+        # scan-line stripes that do not align with the basemap tiles.
         extent = [west_merc, east_merc, south_merc, north_merc]
-        im = ax.imshow(lst_map, extent=extent, cmap=cmap, 
+        im = ax.imshow(lst_map, extent=extent, origin='upper', cmap=cmap,
                       alpha=alpha, interpolation='bilinear', zorder=2)
         
-        # Add basemap
+        # Add basemap.
+        # FIX: pass crs="EPSG:3857" explicitly so contextily knows the axes are
+        # already in Web Mercator and does not attempt a second reprojection.
         try:
             if basemap_source == 'OpenStreetMap':
-                ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
+                ctx.add_basemap(ax, crs="EPSG:3857",
+                                source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
             elif basemap_source == 'Satellite':
-                ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, zoom=13)
+                ctx.add_basemap(ax, crs="EPSG:3857",
+                                source=ctx.providers.Esri.WorldImagery, zoom=13)
             elif basemap_source == 'CartoDB':
-                ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, zoom=13)
+                ctx.add_basemap(ax, crs="EPSG:3857",
+                                source=ctx.providers.CartoDB.Positron, zoom=13)
             else:
-                ctx.add_basemap(ax, zoom=13)
+                ctx.add_basemap(ax, crs="EPSG:3857", zoom=13)
         except Exception as e:
             logger.warning(f"Failed to add basemap: {e}")
             logger.warning("Continuing without basemap...")
@@ -417,6 +428,9 @@ class RealMapOverlay:
         transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
         west_merc, south_merc = transformer.transform(self.bounds[0], self.bounds[1])
         east_merc, north_merc = transformer.transform(self.bounds[2], self.bounds[3])
+        # FIX: matplotlib imshow(extent=...) expects [left, right, bottom, top].
+        # The previous code had the correct order; the bugs were missing origin='upper'
+        # and missing crs= in ctx.add_basemap (see below).
         extent = [west_merc, east_merc, south_merc, north_merc]
         
         # Left: LST with basemap
@@ -425,13 +439,20 @@ class RealMapOverlay:
                  '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
         cmap = LinearSegmentedColormap.from_list('thermal', colors, N=256)
         
-        im1 = ax.imshow(lst_map, extent=extent, cmap=cmap, 
+        # FIX: origin='upper' ensures array row-0 (northernmost, after the north-up
+        # flip applied in load_tif_as_bands) maps to the TOP of the Web Mercator
+        # extent.  Without this matplotlib renders the raster upside-down relative
+        # to the basemap, producing horizontal scan-line stripes.
+        im1 = ax.imshow(lst_map, extent=extent, origin='upper', cmap=cmap,
                        alpha=0.6, interpolation='bilinear', zorder=2)
         
         try:
-            ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
-        except:
-            pass
+            # FIX: pass crs="EPSG:3857" explicitly so contextily knows the axes
+            # are already in Web Mercator and skips any additional reprojection.
+            ctx.add_basemap(ax, crs="EPSG:3857",
+                            source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
+        except Exception as e:
+            logger.warning(f"Failed to add LST basemap: {e}")
         
         ax.set_title('Land Surface Temperature', fontsize=16, fontweight='bold')
         cbar1 = plt.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
@@ -454,13 +475,17 @@ class RealMapOverlay:
         bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
         norm = BoundaryNorm(bounds, cmap_uhi.N)
         
-        im2 = ax.imshow(classified, extent=extent, cmap=cmap_uhi, norm=norm,
+        # FIX: same origin='upper' fix for the UHI classification raster.
+        im2 = ax.imshow(classified, extent=extent, origin='upper',
+                       cmap=cmap_uhi, norm=norm,
                        alpha=0.7, interpolation='nearest', zorder=2)
         
         try:
-            ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
-        except:
-            pass
+            # FIX: explicit crs= for the UHI panel as well.
+            ctx.add_basemap(ax, crs="EPSG:3857",
+                            source=ctx.providers.OpenStreetMap.Mapnik, zoom=13)
+        except Exception as e:
+            logger.warning(f"Failed to add UHI basemap: {e}")
         
         ax.set_title('UHI Intensity Classification', fontsize=16, fontweight='bold')
         cbar2 = plt.colorbar(im2, ax=ax, fraction=0.046, pad=0.04,
