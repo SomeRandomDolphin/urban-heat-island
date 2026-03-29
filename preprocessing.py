@@ -2181,17 +2181,41 @@ class PreprocessingDiagnostics:
                 f"({H}×{W} px each), grid_cols={patch_grid_cols} …"
             )
 
-            # ── Build the full tall mosaic using overlap-blended placement ─────
-            # Each grid cell maps to a stride-sized step but patches are H×W,
-            # so adjacent cells overlap by (H - stride) pixels (e.g. 64-24=40 px).
-            # Hard writes (last patch wins) create visible seam lines at every
-            # patch boundary.  Instead we accumulate a weighted sum and a weight
-            # map so overlapping patches are feathered together:
-            #   blended[r,c] = Σ(weight[r,c] * patch[r,c]) / Σ(weight[r,c])
-            # The per-patch weight is a 2-D raised-cosine (Hann) window that
-            # falls smoothly to 0 at the patch edges and peaks at the centre.
-            # This eliminates the grid-line artefact with zero extra RAM beyond
-            # two float32 arrays the same size as the canvas.
+            # ── Per-epoch canvas reconstruction ───────────────────────────────
+            #
+            # ROOT CAUSE OF PREVIOUS BUGS:
+            # The old approach built ONE giant stacked canvas where epoch N's
+            # patches were offset by global grid_row = local_row + prior_rows.
+            # canvas_h was sized from max(filtered_global_row) * stride + H,
+            # which only captured epoch 0 (the filtered max was always within
+            # the first epoch's row range).  Epochs 1–N all had r1 > canvas_h
+            # and were silently skipped by the bounds guard — so the canvas
+            # contained only epoch 0's data.  Slicing it into N "epochs" then
+            # produced garbage (the red-stripe / jumbled results).
+            #
+            # CORRECT APPROACH:
+            # Each epoch gets its OWN canvas built from LOCAL grid coordinates
+            # (0 .. ep_grid_rows-1).  The patches' global grid_row encodes
+            # which epoch they belong to and their local position within it:
+            #   global_row = prior_rows + local_row
+            # where prior_rows = sum(all_grid_rows[:epoch_idx]).
+            # We recover local_row = global_row - prior_rows for each patch,
+            # build a per-epoch canvas at the correct size, then nanmean.
+            #
+            # Per-epoch canvas size (same for every epoch if rasters share
+            # the same spatial extent, which is the normal case):
+            #   ep_canvas_h = (ep_grid_rows - 1) * stride + H
+            #   ep_canvas_w = (patch_grid_cols - 1) * stride + W
+            # This correctly includes the tail of the last patch row.
+            #
+            # FIX (east/south cut-off):
+            # ep_canvas_w uses patch_grid_cols - 1 (authoritative from
+            # extract_patches), not max(filtered_gc).  Edge patches that
+            # fail QC (min_valid_ratio=0.95 due to raster boundary overlap)
+            # are absent from filtered positions, so max(filtered_gc) < true
+            # max col.  Using patch_grid_cols guarantees full east coverage.
+            # Same logic for height: use ep_grid_rows from all_grid_rows.
+
             pos = np.asarray(positions_all, dtype=np.int32)
             valid_mask = (pos[:, 0] >= 0) & (pos[:, 1] >= 0)
 
@@ -2204,136 +2228,117 @@ class PreprocessingDiagnostics:
                 )
                 return
 
-            # ── Canvas sizing uses STRIDE-based pixel coordinates ─────────────
-            # Patches were extracted with stride < patch_size (e.g. stride=24,
-            # patch_size=64), meaning adjacent patches OVERLAP by (H - stride)
-            # pixels.  The correct pixel origin for grid cell (gr, gc) is:
-            #   r0 = gr * stride,   c0 = gc * stride
-            # NOT gr * H / gc * W — that placed patches patch_size apart, creating
-            # a gap of (H - stride) = 40 pixels between origins and making the
-            # mosaic look cut-off and misaligned.
-            #
-            # Canvas must be large enough to contain the last patch fully:
-            #   canvas_h = max_grid_row * stride + H
-            #   canvas_w = max_grid_col * stride + W
-            max_grid_row  = int(pos[valid_mask, 0].max())
-            max_grid_col  = int(pos[valid_mask, 1].max())
-            n_cols_canvas = int(patch_grid_cols)   # kept for epoch-slice logic
+            n_epochs      = len(all_grid_rows) if all_grid_rows else 1
+            _grid_cols    = int(patch_grid_cols) if patch_grid_cols and patch_grid_cols > 0 \
+                            else int(pos[valid_mask, 1].max()) + 1
+            n_cols_canvas = _grid_cols  # kept for logging
 
-            canvas_h = max_grid_row * stride + H
-            canvas_w = max_grid_col * stride + W
+            # Pre-compute epoch boundaries in global-row space
+            # epoch_starts[ep] = first global grid_row belonging to epoch ep
+            epoch_starts = np.zeros(n_epochs + 1, dtype=np.int64)
+            for ep, r in enumerate(all_grid_rows):
+                epoch_starts[ep + 1] = epoch_starts[ep] + r
 
-            # Weighted accumulator arrays (no NaN — start at 0)
-            acc_sum = np.zeros((canvas_h, canvas_w), dtype=np.float64)
-            acc_wgt = np.zeros((canvas_h, canvas_w), dtype=np.float64)
-
-            # 2-D Hann (raised cosine) window — smooth taper to 0 at all edges
+            # 2-D Hann window for overlap blending
             _hann_1d_r = np.hanning(H).astype(np.float64)
             _hann_1d_c = np.hanning(W).astype(np.float64)
-            _patch_win = np.outer(_hann_1d_r, _hann_1d_c)   # shape (H, W)
+            _patch_win  = np.outer(_hann_1d_r, _hann_1d_c)  # (H, W)
 
-            for idx in range(N):
-                gr, gc = int(pos[idx, 0]), int(pos[idx, 1])
-                if gr < 0 or gc < 0:
-                    continue
-                # Stride-based pixel origin — KEY FIX: use stride, not H/W
-                r0 = gr * stride;  r1 = r0 + H
-                c0 = gc * stride;  c1 = c0 + W
-                if r1 > canvas_h or c1 > canvas_w:
-                    continue   # safety: skip if out of bounds
-                patch = y_arr[idx].astype(np.float64)
-                # Only blend pixels that have valid data in this patch
-                finite = np.isfinite(patch)
-                w = _patch_win * finite          # zero weight where NaN
-                acc_sum[r0:r1, c0:c1] += np.where(finite, patch * w, 0.0)
-                acc_wgt[r0:r1, c0:c1] += w
+            # Per-epoch canvas dimensions (use authoritative grid sizes)
+            _ep_canvas_h_list = [
+                max(1, (int(r) - 1) * stride + H) for r in all_grid_rows
+            ]
+            _ep_canvas_w = max(1, (_grid_cols - 1) * stride + W)
+            max_ep_h     = max(_ep_canvas_h_list) if _ep_canvas_h_list else H
 
-            # Normalise: pixels with zero total weight remain NaN
-            with np.errstate(invalid="ignore", divide="ignore"):
-                canvas = np.where(acc_wgt > 0,
-                                  (acc_sum / acc_wgt).astype(np.float32),
-                                  np.nan).astype(np.float32)
-            del acc_sum, acc_wgt
+            # Sort patches into epoch buckets using their global grid_row
+            # Build a lookup: patch index → epoch index
+            global_rows = pos[:, 0].astype(np.int64)   # shape (N,)
+            # epoch_starts is monotone → searchsorted gives the epoch index
+            # (subtract 1 because searchsorted returns insertion point to the right)
+            patch_epoch = np.searchsorted(epoch_starts[1:], global_rows,
+                                          side='right').astype(np.int32)
+            # Clamp to valid epoch range
+            patch_epoch = np.clip(patch_epoch, 0, n_epochs - 1)
 
-            # ── Detect multi-epoch stacking ────────────────────────────────────
-            # The canvas is built by placing each patch at pixel origin:
-            #   r0 = grid_row * stride
-            # Epoch N's patches have grid_row values in [prior_rows, prior_rows+ep_grid_rows),
-            # where prior_rows = sum(all_grid_rows[0..N-1]).
-            # Therefore epoch N's first pixel row = prior_rows * stride,
-            # and its slice height in the canvas = ep_grid_rows * stride pixels.
-            # (The last patch's tail — the final H-stride rows — overlaps into the
-            # next epoch's territory in the canvas, but that bleed is feathered to
-            # near-zero by the Hann window so it doesn't corrupt the slice.)
-            # This gives perfectly aligned epoch boundaries for stacking.
-            _ep_px_list = [r * stride for r in all_grid_rows]
-            _patch_rows_total = sum(_ep_px_list) if _ep_px_list else canvas.shape[0]
-            _patch_cols_total = max_grid_col + 1 if max_grid_col >= 0 else 1
-            _aspect = _patch_rows_total / max(_patch_cols_total, 1)
-
-            is_multi_epoch = (_aspect > 4) and (len(all_grid_rows) > 1)
+            logger.info(
+                f"[Diagnostics] Multi-epoch mosaic: {n_epochs} epochs, "
+                f"per-epoch patch-rows={all_grid_rows}, "
+                f"ep_canvas_w={_ep_canvas_w}, "
+                f"max_ep_canvas_h={max_ep_h}. "
+                f"Building per-epoch canvases …"
+            )
 
             slices = []
-            if is_multi_epoch:
-                n_epochs = len(all_grid_rows)
+            for ep in range(n_epochs):
+                ep_grid_rows  = int(all_grid_rows[ep])
+                ep_canvas_h   = _ep_canvas_h_list[ep]
+                prior_rows    = int(epoch_starts[ep])
 
-                logger.info(
-                    f"[Diagnostics] Multi-epoch mosaic: {n_epochs} epochs, "
-                    f"per-epoch patch-rows={all_grid_rows}, "
-                    f"per-epoch pixel-rows={_ep_px_list}, "
-                    f"cols={n_cols_canvas}. Collapsing via nanmean …"
-                )
+                acc_sum = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+                acc_wgt = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
 
-                # Reference shape = largest epoch so np.stack gets uniform arrays
-                max_ep_px = max(_ep_px_list) if _ep_px_list else H
-                ref_cols  = canvas.shape[1]
+                # Select patches belonging to this epoch
+                ep_mask = (patch_epoch == ep) & valid_mask
+                ep_indices = np.where(ep_mask)[0]
 
-                row_cursor = 0  # running pixel-row offset into the canvas
-                for ep, ep_grid_rows in enumerate(all_grid_rows):
-                    ep_px = _ep_px_list[ep]  # = ep_grid_rows * stride
-                    r0    = row_cursor
-                    r1    = r0 + ep_px
-                    if r0 >= canvas.shape[0]:
-                        logger.warning(
-                            f"[Diagnostics] Epoch {ep}: row_cursor={r0} exceeds "
-                            f"canvas height {canvas.shape[0]} — skipping."
-                        )
-                        row_cursor += ep_px
+                for idx in ep_indices:
+                    global_gr = int(pos[idx, 0])
+                    gc        = int(pos[idx, 1])
+                    if gc < 0:
                         continue
-                    r1_clamped = min(r1, canvas.shape[0])
-                    ep_slice   = canvas[r0:r1_clamped, :]
+                    # Convert global grid_row → local grid_row for this epoch
+                    local_gr = global_gr - prior_rows
+                    if local_gr < 0 or local_gr >= ep_grid_rows:
+                        continue  # safety: patch doesn't belong to this epoch
+                    r0 = local_gr * stride;  r1 = r0 + H
+                    c0 = gc       * stride;  c1 = c0 + W
+                    if r1 > ep_canvas_h or c1 > _ep_canvas_w:
+                        continue  # edge patch beyond canvas boundary
+                    patch  = y_arr[idx].astype(np.float64)
+                    finite = np.isfinite(patch)
+                    w      = _patch_win * finite
+                    acc_sum[r0:r1, c0:c1] += np.where(finite, patch * w, 0.0)
+                    acc_wgt[r0:r1, c0:c1] += w
 
-                    # Pad to reference shape so all slices stack uniformly
-                    if ep_slice.shape != (max_ep_px, ref_cols):
-                        padded = np.full((max_ep_px, ref_cols), np.nan,
-                                         dtype=np.float32)
-                        h_copy = min(ep_slice.shape[0], max_ep_px)
-                        w_copy = min(ep_slice.shape[1], ref_cols)
-                        padded[:h_copy, :w_copy] = ep_slice[:h_copy, :w_copy]
-                        slices.append(padded)
-                    else:
-                        slices.append(ep_slice)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ep_canvas = np.where(
+                        acc_wgt > 0,
+                        (acc_sum / acc_wgt).astype(np.float32),
+                        np.nan
+                    ).astype(np.float32)
+                del acc_sum, acc_wgt
 
-                    row_cursor += ep_px
+                # Pad smaller epochs to the reference shape for uniform stacking
+                if ep_canvas.shape != (max_ep_h, _ep_canvas_w):
+                    padded = np.full((max_ep_h, _ep_canvas_w), np.nan, dtype=np.float32)
+                    h_c = min(ep_canvas.shape[0], max_ep_h)
+                    w_c = min(ep_canvas.shape[1], _ep_canvas_w)
+                    padded[:h_c, :w_c] = ep_canvas[:h_c, :w_c]
+                    slices.append(padded)
+                else:
+                    slices.append(ep_canvas)
 
-                if not slices:
-                    logger.warning(
-                        "[Diagnostics] plot_lst_mosaic_reconstruction: "
-                        "epoch slicing produced no slices — rendering raw canvas."
-                    )
-                    is_multi_epoch = False
-
+            # ── Stack and reduce ───────────────────────────────────────────────
+            is_multi_epoch = n_epochs > 1 and len(slices) > 1
             if is_multi_epoch and slices:
                 stack    = np.stack(slices, axis=0)   # (n_ep, H_ep, W)
                 lst_mean = np.nanmean(stack, axis=0)
                 lst_std  = np.nanstd(stack,  axis=0)
                 coverage = np.sum(np.isfinite(stack), axis=0) / n_epochs
-            else:
-                lst_mean = canvas
-                lst_std  = np.zeros_like(canvas)
-                coverage = np.isfinite(canvas).astype(np.float32)
+                del stack
+            elif slices:
+                lst_mean = slices[0]
+                lst_std  = np.zeros_like(lst_mean)
+                coverage = np.isfinite(lst_mean).astype(np.float32)
                 n_epochs = 1
-                slices   = [canvas]
+            else:
+                logger.warning("[Diagnostics] plot_lst_mosaic_reconstruction: no epoch canvases built.")
+                return
+
+            # Use the canonical per-epoch canvas size for geo-extent calculations
+            canvas_h = max_ep_h
+            canvas_w = _ep_canvas_w
 
             # ── Diagnostic gap-fill: propagate valid neighbours into NaN holes ──
             # Pixels that are NaN in lst_mean are positions where no patch passed
@@ -2420,15 +2425,27 @@ class PreprocessingDiagnostics:
             # extent = [left, right, bottom, top] = [min_lon, max_lon, min_lat, max_lat]
             # origin="upper" means row 0 = top of image = max_lat (north), correct
             # for north-up rasters after the vflip normalisation in load_tif_as_bands.
+            #
+            # The per-epoch canvas (canvas_h × canvas_w) may be slightly smaller
+            # than the full study-area bounding box if the raster doesn't tile
+            # perfectly.  We scale the extent proportionally to the per-epoch
+            # canvas pixel dimensions so the coordinate mapping is exact.
             _has_geo = (
                 geo_bounds is not None
                 and all(k in geo_bounds for k in ("min_lon", "max_lon", "min_lat", "max_lat"))
             )
-            _extent = (
-                [geo_bounds["min_lon"], geo_bounds["max_lon"],
-                 geo_bounds["min_lat"], geo_bounds["max_lat"]]
-                if _has_geo else None
-            )
+            if _has_geo:
+                # The full study-area pixel size at working resolution:
+                #   full_h_px = (per_epoch_grid_rows - 1) * stride + H
+                #   full_w_px = (grid_cols - 1) * stride + W
+                # canvas_h and canvas_w are already set to these values above,
+                # so we can use geo_bounds directly for the extent.
+                _extent = [
+                    geo_bounds["min_lon"], geo_bounds["max_lon"],
+                    geo_bounds["min_lat"], geo_bounds["max_lat"],
+                ]
+            else:
+                _extent = None
 
             def _setup_geo_ax(ax):
                 if _has_geo:
