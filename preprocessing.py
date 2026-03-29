@@ -61,8 +61,16 @@ _SENTINEL2_BAND_ORDER = ["B2", "B3", "B4", "B8", "B11", "B12", "SCL"]
 # Raise this if your machine has more headroom; lower it if you still OOM.
 # The value can also be overridden via an environment variable:
 #   export UHI_MAX_PIXELS=8000000
+#
+# FIX: Raised default from 1_921_100 to 12_000_000.
+# The previous budget (~1.9 M px) caused aggressive downsampling that varied
+# epoch-to-epoch depending on each scene's bounding box.  Different downsample
+# factors → different grid_rows/grid_cols per epoch → wrong patch-column mode →
+# patches placed in incorrect canvas columns → blocky/misaligned mosaic.
+# At 12 M px each 1152×1024 scene (~1.18 M px) loads at full native resolution,
+# giving consistent grid dimensions across all epochs.
 import os as _os
-_DEFAULT_MAX_PIXELS = 1_921_100
+_DEFAULT_MAX_PIXELS = 10_000_000
 MAX_PIXELS: int = int(_os.environ.get("UHI_MAX_PIXELS", _DEFAULT_MAX_PIXELS))
 
 
@@ -2098,6 +2106,404 @@ class PreprocessingDiagnostics:
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
+    # P-MOS. Full LST mosaic reconstruction (preprocessing-time)
+    # ------------------------------------------------------------------
+    def plot_lst_mosaic_reconstruction(
+        self,
+        y: np.ndarray,
+        positions_all: np.ndarray,
+        patch_grid_cols: int,
+        all_grid_rows: list,
+        filename: str = "P_mosaic_lst_reconstruction.png",
+    ):
+        """
+        Reconstruct the full spatial LST mosaic from the extracted patches
+        *before* normalisation, and display it in the same multi-panel style
+        used by the inference pipeline (03b).
+
+        This is the preprocessing equivalent of the inference mosaic: it lets
+        you immediately see whether the patch extraction, epoch-row offsets,
+        and spatial grid layout are correct — without having to run the full
+        model training and inference cycle.
+
+        Layout (always produced):
+          Panel 0 — Temporal mean LST  (nanmean across all stacked epochs)
+          Panel 1 — Inter-epoch spread (nanstd across epochs, same shape)
+          Panel 2 — Coverage map       (fraction of epochs that contributed
+                                        a valid (non-NaN) patch to each cell)
+
+        A second row shows one representative epoch slice per preview slot so
+        you can visually check whether individual epochs look spatially coherent.
+
+        Multi-epoch handling mirrors the inference plotter:
+          • epoch aspect ratio > 4 → collapse epochs via nanmean/nanstd
+          • aspect ratio ≤ 4       → single mosaic rendered directly
+
+        Args:
+            y               : (N, H, W, 1) or (N, H, W) raw LST patches
+                              (PRE-normalisation, values in °C).
+            positions_all   : (N, 2) int32 array of (grid_row, grid_col),
+                              as built by main() from patch["_grid_row/_col"].
+            patch_grid_cols : authoritative column count (from _all_grid_cols mode).
+            all_grid_rows   : list of per-epoch row counts from _fuse_extract_free
+                              (used to derive n_epochs and per_epoch_rows).
+            filename        : output filename (saved to self.out).
+        """
+        try:
+            # ── Normalise y to (N, H, W) ──────────────────────────────────────
+            y_arr = np.asarray(y, dtype=np.float32)
+            if y_arr.ndim == 4 and y_arr.shape[-1] == 1:
+                y_arr = y_arr[:, :, :, 0]
+            elif y_arr.ndim == 4 and y_arr.shape[1] == 1:
+                y_arr = y_arr[:, 0]
+            if y_arr.ndim != 3:
+                logger.warning(
+                    f"[Diagnostics] plot_lst_mosaic_reconstruction: "
+                    f"unexpected y shape {y_arr.shape}, skipping."
+                )
+                return
+
+            N, H, W = y_arr.shape
+            logger.info(
+                f"[Diagnostics] Reconstructing LST mosaic from {N} patches "
+                f"({H}×{W} px each), grid_cols={patch_grid_cols} …"
+            )
+
+            # ── Build the full tall mosaic using overlap-blended placement ─────
+            # Each grid cell maps to a stride-sized step but patches are H×W,
+            # so adjacent cells overlap by (H - stride) pixels (e.g. 64-24=40 px).
+            # Hard writes (last patch wins) create visible seam lines at every
+            # patch boundary.  Instead we accumulate a weighted sum and a weight
+            # map so overlapping patches are feathered together:
+            #   blended[r,c] = Σ(weight[r,c] * patch[r,c]) / Σ(weight[r,c])
+            # The per-patch weight is a 2-D raised-cosine (Hann) window that
+            # falls smoothly to 0 at the patch edges and peaks at the centre.
+            # This eliminates the grid-line artefact with zero extra RAM beyond
+            # two float32 arrays the same size as the canvas.
+            pos = np.asarray(positions_all, dtype=np.int32)
+            valid_mask = (pos[:, 0] >= 0) & (pos[:, 1] >= 0)
+
+            if not valid_mask.any():
+                logger.warning(
+                    "[Diagnostics] plot_lst_mosaic_reconstruction: "
+                    "no valid patch positions found (all -1). "
+                    "Cannot reconstruct spatial mosaic — check that _grid_row/"
+                    "_grid_col were set during extract_patches()."
+                )
+                return
+
+            n_rows_canvas = int(pos[valid_mask, 0].max()) + 1
+            n_cols_canvas = int(patch_grid_cols)
+            canvas_h      = n_rows_canvas * H
+            canvas_w      = n_cols_canvas * W
+
+            # Weighted accumulator arrays (no NaN — start at 0)
+            acc_sum = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+            acc_wgt = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+
+            # 2-D Hann (raised cosine) window — smooth taper to 0 at all edges
+            _hann_1d_r = np.hanning(H).astype(np.float64)
+            _hann_1d_c = np.hanning(W).astype(np.float64)
+            _patch_win = np.outer(_hann_1d_r, _hann_1d_c)   # shape (H, W)
+
+            for idx in range(N):
+                gr, gc = int(pos[idx, 0]), int(pos[idx, 1])
+                if gr < 0 or gc < 0 or gr >= n_rows_canvas or gc >= n_cols_canvas:
+                    continue
+                r0 = gr * H;  r1 = r0 + H
+                c0 = gc * W;  c1 = c0 + W
+                patch = y_arr[idx].astype(np.float64)
+                # Only blend pixels that have valid data in this patch
+                finite = np.isfinite(patch)
+                w = _patch_win * finite          # zero weight where NaN
+                acc_sum[r0:r1, c0:c1] += np.where(finite, patch * w, 0.0)
+                acc_wgt[r0:r1, c0:c1] += w
+
+            # Normalise: pixels with zero total weight remain NaN
+            with np.errstate(invalid="ignore", divide="ignore"):
+                canvas = np.where(acc_wgt > 0,
+                                  (acc_sum / acc_wgt).astype(np.float32),
+                                  np.nan).astype(np.float32)
+            del acc_sum, acc_wgt
+
+            # ── Detect multi-epoch stacking ────────────────────────────────────
+            _patch_rows_total = canvas.shape[0] // H
+            _patch_cols_total = canvas.shape[1] // W if W > 0 else 1
+            _aspect = _patch_rows_total / max(_patch_cols_total, 1)
+
+            is_multi_epoch = (_aspect > 4) and (len(all_grid_rows) > 1)
+
+            slices = []
+            if is_multi_epoch:
+                n_epochs = len(all_grid_rows)
+
+                # FIX: Use per-epoch row counts to compute cumulative pixel
+                # boundaries instead of assuming all epochs share the same
+                # patch-row count (all_grid_rows[0]).  When rasters have
+                # different spatial extents or downsample factors the row
+                # counts differ epoch-to-epoch; a fixed stride causes slice
+                # boundaries to drift, mixing pixels from different epochs
+                # and creating the blocky mosaic artefact.
+                logger.info(
+                    f"[Diagnostics] Multi-epoch mosaic: {n_epochs} epochs, "
+                    f"per-epoch patch-rows={all_grid_rows}, "
+                    f"cols={n_cols_canvas}. Collapsing via nanmean …"
+                )
+
+                # Reference shape = largest epoch so np.stack gets uniform arrays
+                max_ep_px = max(r * H for r in all_grid_rows)
+                ref_cols  = n_cols_canvas * W
+
+                row_cursor = 0  # running pixel-row offset into the canvas
+                for ep, ep_grid_rows in enumerate(all_grid_rows):
+                    ep_px = ep_grid_rows * H  # pixel-rows this epoch occupies
+                    r0    = row_cursor
+                    r1    = r0 + ep_px
+                    if r0 >= canvas.shape[0]:
+                        logger.warning(
+                            f"[Diagnostics] Epoch {ep}: row_cursor={r0} exceeds "
+                            f"canvas height {canvas.shape[0]} — skipping."
+                        )
+                        row_cursor += ep_px
+                        continue
+                    r1_clamped = min(r1, canvas.shape[0])
+                    ep_slice   = canvas[r0:r1_clamped, :]
+
+                    # Pad to reference shape so all slices stack uniformly
+                    if ep_slice.shape != (max_ep_px, ref_cols):
+                        padded = np.full((max_ep_px, ref_cols), np.nan,
+                                         dtype=np.float32)
+                        h_copy = min(ep_slice.shape[0], max_ep_px)
+                        w_copy = min(ep_slice.shape[1], ref_cols)
+                        padded[:h_copy, :w_copy] = ep_slice[:h_copy, :w_copy]
+                        slices.append(padded)
+                    else:
+                        slices.append(ep_slice)
+
+                    row_cursor += ep_px
+
+                if not slices:
+                    logger.warning(
+                        "[Diagnostics] plot_lst_mosaic_reconstruction: "
+                        "epoch slicing produced no slices — rendering raw canvas."
+                    )
+                    is_multi_epoch = False
+
+            if is_multi_epoch and slices:
+                stack    = np.stack(slices, axis=0)   # (n_ep, H_ep, W)
+                lst_mean = np.nanmean(stack, axis=0)
+                lst_std  = np.nanstd(stack,  axis=0)
+                coverage = np.sum(np.isfinite(stack), axis=0) / n_epochs
+            else:
+                lst_mean = canvas
+                lst_std  = np.zeros_like(canvas)
+                coverage = np.isfinite(canvas).astype(np.float32)
+                n_epochs = 1
+                slices   = [canvas]
+
+            # ── Diagnostic gap-fill: propagate valid neighbours into NaN holes ──
+            # Pixels that are NaN in lst_mean are positions where no patch passed
+            # QC in any epoch (cloud/water/edge gaps).  For a cleaner diagnostic
+            # image we interpolate them from surrounding valid pixels.
+            # This is ONLY applied to lst_mean for the plot — the training arrays
+            # y/X are not touched.  The coverage map still shows true coverage.
+            #
+            # Implementation: vectorised nan-aware local mean via uniform_filter.
+            # Replace NaN with 0, compute sum-of-values and sum-of-weights
+            # (valid pixel count) separately, then divide.  This is O(N) in C
+            # and runs in milliseconds even on a 2 k×2 k canvas — unlike
+            # generic_filter with a Python callback which would take minutes.
+            # Two passes with increasing kernel sizes fill progressively wider
+            # gaps (e.g. narrow cloud strips then larger coastal voids) without
+            # over-smoothing the filled region.
+            _nan_holes = ~np.isfinite(lst_mean)
+            if _nan_holes.any():
+                try:
+                    from scipy.ndimage import uniform_filter as _uf
+                    _filled = lst_mean.copy()
+                    for _ksize in (max(5, H // 8), max(9, H // 4)):
+                        _still_nan = ~np.isfinite(_filled)
+                        if not _still_nan.any():
+                            break
+                        _vals  = np.where(np.isfinite(_filled), _filled, 0.0).astype(np.float64)
+                        _wgts  = np.isfinite(_filled).astype(np.float64)
+                        _vsum  = _uf(_vals,  size=_ksize, mode="reflect")
+                        _wsum  = _uf(_wgts,  size=_ksize, mode="reflect")
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            _local = np.where(_wsum > 0, _vsum / _wsum, np.nan)
+                        # Only write into originally-NaN positions
+                        _filled = np.where(_still_nan, _local.astype(np.float32), _filled)
+                    lst_mean = _filled
+                    del _filled, _vals, _wgts, _vsum, _wsum, _local
+                    _filled_n = int(_nan_holes.sum()) - int((~np.isfinite(lst_mean)).sum())
+                    logger.info(
+                        f"[Diagnostics] Gap-fill: {_filled_n:,} / {int(_nan_holes.sum()):,} "
+                        f"NaN pixels interpolated from neighbours. "
+                        f"Coverage map unchanged."
+                    )
+                except Exception as _gf_err:
+                    logger.warning(
+                        f"[Diagnostics] Gap-fill skipped: {_gf_err}"
+                    )
+            del _nan_holes
+
+            # ── Shared colour scale (robust to outliers) ───────────────────────
+            finite_mean = lst_mean[np.isfinite(lst_mean)]
+            if finite_mean.size < 2:
+                logger.warning(
+                    "[Diagnostics] plot_lst_mosaic_reconstruction: "
+                    "LST mean map is almost entirely NaN — "
+                    "check that y contains pre-normalisation Celsius values."
+                )
+                return
+            vmin = float(np.nanpercentile(finite_mean, 2))
+            vmax = float(np.nanpercentile(finite_mean, 98))
+
+            # ── Figure layout ──────────────────────────────────────────────────
+            n_preview_epochs = min(4, n_epochs) if is_multi_epoch else 0
+            nrows_fig = 1 + (1 if n_preview_epochs > 0 else 0)
+            ncols_fig = 3
+
+            _ep_h = lst_mean.shape[0]
+            _ep_w = lst_mean.shape[1]
+            _map_aspect = _ep_h / max(_ep_w, 1)
+            _panel_w = 5.5
+            _panel_h = max(3.5, _panel_w * _map_aspect)
+
+            fig = plt.figure(
+                figsize=(ncols_fig * _panel_w, nrows_fig * _panel_h + 1.2),
+                layout="constrained",
+            )
+            gs_outer = gridspec.GridSpec(nrows_fig, 1, figure=fig,
+                                         hspace=0.08 if n_preview_epochs else 0)
+            gs_top = gridspec.GridSpecFromSubplotSpec(
+                1, ncols_fig, subplot_spec=gs_outer[0], wspace=0.08
+            )
+
+            # ── Panel 0: temporal mean LST ─────────────────────────────────────
+            ax0 = fig.add_subplot(gs_top[0, 0])
+            im0 = ax0.imshow(lst_mean, cmap="RdYlBu_r",
+                             vmin=vmin, vmax=vmax,
+                             interpolation="nearest", origin="upper")
+            ax0.set_title("Temporal Mean LST", fontsize=10, fontweight="bold")
+            ax0.axis("off")
+            cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+            cb0.set_label("LST (°C)", fontsize=8)
+            _nan_pct = float(np.isnan(lst_mean).mean()) * 100
+            ax0.text(
+                0.02, 0.02,
+                f"mean={np.nanmean(lst_mean):.1f}°C\n"
+                f"std={np.nanstd(lst_mean):.2f}°C\n"
+                f"range=[{vmin:.1f}, {vmax:.1f}]\n"
+                f"NaN={_nan_pct:.1f}%\n"
+                f"n_epochs={n_epochs}",
+                transform=ax0.transAxes, fontsize=7, color="white", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.55),
+            )
+
+            # ── Panel 1: inter-epoch spread ────────────────────────────────────
+            ax1 = fig.add_subplot(gs_top[0, 1])
+            std_finite = lst_std[np.isfinite(lst_std)]
+            std_vmax = float(np.nanpercentile(std_finite, 98)) if std_finite.size > 0 else 1.0
+            im1 = ax1.imshow(lst_std, cmap="YlOrRd",
+                             vmin=0, vmax=max(std_vmax, 0.1),
+                             interpolation="nearest", origin="upper")
+            ax1.set_title(
+                "Inter-epoch Spread (σ)" if n_epochs > 1 else "Spread (single epoch)",
+                fontsize=10, fontweight="bold",
+            )
+            ax1.axis("off")
+            cb1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+            cb1.set_label("σ (°C)", fontsize=8)
+            ax1.text(
+                0.02, 0.02,
+                f"mean σ={np.nanmean(lst_std):.2f}°C\n"
+                f"max σ={np.nanmax(lst_std):.2f}°C",
+                transform=ax1.transAxes, fontsize=7, color="white", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.55),
+            )
+
+            # ── Panel 2: coverage map ──────────────────────────────────────────
+            ax2 = fig.add_subplot(gs_top[0, 2])
+            im2 = ax2.imshow(coverage, cmap="Blues",
+                             vmin=0, vmax=1,
+                             interpolation="nearest", origin="upper")
+            ax2.set_title("Patch Coverage\n(fraction of epochs with valid data)",
+                          fontsize=10, fontweight="bold")
+            ax2.axis("off")
+            cb2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+            cb2.set_label("Fraction", fontsize=8)
+            _gap_pct  = float((coverage == 0).mean()) * 100
+            _full_pct = float((coverage == 1).mean()) * 100
+            ax2.text(
+                0.02, 0.02,
+                f"zero coverage: {_gap_pct:.1f}%\n"
+                f"full coverage: {_full_pct:.1f}%\n"
+                f"mean coverage: {float(np.nanmean(coverage)):.2f}",
+                transform=ax2.transAxes, fontsize=7, color="white", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.55),
+            )
+
+            # ── Row 1: individual epoch previews (multi-epoch only) ────────────
+            if n_preview_epochs > 0:
+                gs_bot = gridspec.GridSpecFromSubplotSpec(
+                    1, n_preview_epochs,
+                    subplot_spec=gs_outer[1], wspace=0.06,
+                )
+                ep_step = max(1, n_epochs // n_preview_epochs)
+                ep_indices = [i * ep_step for i in range(n_preview_epochs)]
+
+                for col_i, ep_i in enumerate(ep_indices):
+                    ax_ep = fig.add_subplot(gs_bot[0, col_i])
+                    ep_slice = slices[ep_i]
+                    im_ep = ax_ep.imshow(
+                        ep_slice, cmap="RdYlBu_r",
+                        vmin=vmin, vmax=vmax,
+                        interpolation="nearest", origin="upper",
+                    )
+                    ep_nan  = float(np.isnan(ep_slice).mean()) * 100
+                    ep_mean = (float(np.nanmean(ep_slice))
+                               if np.any(np.isfinite(ep_slice)) else float("nan"))
+                    ax_ep.set_title(
+                        f"Epoch {ep_i + 1}/{n_epochs}\n"
+                        f"μ={ep_mean:.1f}°C  NaN={ep_nan:.0f}%",
+                        fontsize=8, fontweight="bold",
+                    )
+                    ax_ep.axis("off")
+                    plt.colorbar(im_ep, ax=ax_ep, fraction=0.046, pad=0.04,
+                                 label="LST (°C)")
+
+            # ── Diagnostic flags ───────────────────────────────────────────────
+            flags = []
+            if _nan_pct > 30:
+                flags.append(f"⚠ HIGH NaN ({_nan_pct:.0f}%)")
+            if _gap_pct > 20:
+                flags.append(f"⚠ GAPS in coverage ({_gap_pct:.0f}%)")
+            if np.nanstd(lst_mean) < 0.5:
+                flags.append("⚠ LOW LST VARIANCE — check scaling")
+            flag_str = "   " + "  |  ".join(flags) if flags else ""
+
+            fig.suptitle(
+                f"Preprocessing – LST Mosaic Reconstruction  "
+                f"({N} patches, {n_epochs} epoch{'s' if n_epochs > 1 else ''}, "
+                f"{n_cols_canvas} patch-cols, "
+                f"{lst_mean.shape[0]}×{lst_mean.shape[1]} px)"
+                f"{flag_str}",
+                fontsize=11, fontweight="bold",
+            )
+            self._save(fig, filename)
+            logger.info(
+                f"[Diagnostics] ✅ LST mosaic reconstruction saved → "
+                f"{self.out / filename}"
+            )
+
+        except Exception as exc:
+            logger.warning(
+                f"[Diagnostics] plot_lst_mosaic_reconstruction failed: {exc}",
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # helper
     # ------------------------------------------------------------------
     def _save(self, fig: plt.Figure, filename: str):
@@ -4101,16 +4507,35 @@ def main():
         result = dataset_creator.extract_patches(
             fused_data,
             patch_size=64, stride=24, min_valid_ratio=0.95,
-            min_variance=0.3, min_temp=20.0, max_temp=58.0,
+            min_variance=0.3, min_temp=10.0, max_temp=65.0,
         )
         # extract_patches now returns a named PatchResult(patches, grid_rows, grid_cols)
-        patches    = result.patches
+        patches = result.patches
+
+        # FIX: Skip entirely-cloud-covered / all-NaN epochs (zero valid patches).
+        # Previously an epoch that passed LST-std/valid-ratio checks at the scene
+        # level but yielded 0 acceptable patches (e.g. Epoch 31 = 100% cloud) was
+        # still appended to _all_grid_rows, inflating the cumulative row offset for
+        # every subsequent epoch and misaligning their mosaic slices.  By returning
+        # early we keep _all_grid_rows in sync with the epochs that actually have
+        # canvas rows, so the slicer boundaries remain correct.
+        if not patches:
+            logger.warning(
+                f"  {label}: 0 patches extracted "
+                f"(grid {result.grid_rows}r×{result.grid_cols}c) — "
+                f"epoch skipped (all-cloud or all-NaN scene)."
+            )
+            # Still record the raster so it can be freed, but mark it as empty.
+            all_rasters.append((fused_data, []))
+            all_dates.append(date)
+            return
+
         _all_grid_rows.append(result.grid_rows)
         _all_grid_cols.append(result.grid_cols)
 
         # ── Offset grid_row by epoch index so patches from different dates
         # never share the same grid position.  The epoch's row-offset equals
-        # the cumulative row count of all preceding epochs.
+        # the cumulative row count of all preceding (non-empty) epochs.
         epoch_idx = len(_epoch_index)
         _epoch_index.append(epoch_idx)
         prior_rows = sum(_all_grid_rows[:-1])   # total rows from previous epochs
@@ -4258,6 +4683,7 @@ def main():
     logger.info("  Freed rasters and patch list from memory")
 
     # QC + NaN fill + safety clip
+    # Temperature bounds aligned with validate_lst (Tier-1 pixel gate: 10–65 °C).
     valid_mask = np.ones(n_total, dtype=bool)
     for s in range(n_total):
         lst_p = y[s, :, :, 0]
@@ -4265,7 +4691,7 @@ def main():
         if fin.mean() < 0.95:
             valid_mask[s] = False; continue
         lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
-        if not (20.0 <= lst_mean <= 58.0):
+        if not (10.0 <= lst_mean <= 65.0):
             valid_mask[s] = False
 
     if not valid_mask.all():
@@ -4286,27 +4712,29 @@ def main():
 
     np.clip(y, 10.0, 65.0, out=y)
 
-    # Sample weights
-    patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
-    n_wb          = 10
-    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
-    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
-    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
-    rw_           = 1.0 / bc_[bids_]
-    sample_weights = rw_ / rw_.mean()
-
     # ── Resolve the canonical patch grid shape ───────────────────────────────
     # _all_grid_rows / _all_grid_cols were populated by _fuse_extract_free.
-    # grid_cols = mode across rasters (they should all be the same width).
-    # grid_rows = TOTAL stacked rows across all epochs, because _fuse_extract_free
-    # now offsets each epoch's grid_row by the cumulative prior row count.
-    # This means the combined grid is (sum_of_all_epoch_rows) × grid_cols.
+    # grid_rows = TOTAL stacked rows across all epochs.
+    # grid_cols = derived from actual patch positions (max col index + 1).
+    #
+    # FIX: Previously grid_cols was taken as the MODE of _all_grid_cols.
+    # When epochs are loaded at different downsample factors their grid widths
+    # differ, so the mode may be wrong for some epochs.  Patch placement in
+    # the canvas uses the actual _grid_col values, so the true canvas width
+    # is always max(_grid_col) + 1 — read directly from positions_all.
+    # This avoids the "16 patch-cols" bug where mode undercount caused patches
+    # to wrap into incorrect canvas columns.
     if _all_grid_cols:
-        from collections import Counter as _Counter
-        _mode_cols = _Counter(_all_grid_cols).most_common(1)[0][0]
-        patch_grid_cols = int(_mode_cols)
-        # Total rows = sum of per-epoch rows (each epoch stacks below the last)
         patch_grid_rows = int(sum(_all_grid_rows))
+
+        # FIX: derive cols from observed positions, not the _all_grid_cols mode
+        if np.any(positions_all[:, 1] >= 0):
+            patch_grid_cols = int(positions_all[positions_all[:, 1] >= 0, 1].max()) + 1
+        else:
+            # Nothing survived QC — fall back to mode of recorded col counts
+            from collections import Counter as _Counter
+            patch_grid_cols = int(_Counter(_all_grid_cols).most_common(1)[0][0])
+
         logger.info(
             f"  Patch grid shape (stacked across {len(_all_grid_rows)} epochs): "
             f"{patch_grid_rows} total rows × {patch_grid_cols} cols"
@@ -4317,22 +4745,55 @@ def main():
         if len(set(_all_grid_cols)) > 1:
             logger.warning(
                 f"  ⚠ Rasters have different grid widths: {sorted(set(_all_grid_cols))}. "
-                f"Using mode={patch_grid_cols}. Check raster extents for consistency."
+                f"patch_grid_cols resolved from positions_all={patch_grid_cols}."
             )
     else:
-        # Fallback: estimate from first raster's LST shape and stride
-        _stride = 24; _ps = 64
-        _first_raster_lst = next(
-            (v for v in all_rasters[0][0].values()
-             if isinstance(v, np.ndarray) and v.ndim == 2), None
-        ) if all_rasters else None
-        if _first_raster_lst is not None:
-            _h, _w = _first_raster_lst.shape
-            patch_grid_cols = len(range(0, _w - _ps + 1, _stride))
-            patch_grid_rows = len(range(0, _h - _ps + 1, _stride))
+        # Fallback: estimate from positions_all when _all_grid_cols is empty.
+        # (all_rasters is already freed at this point, so we cannot re-read it.)
+        if np.any(positions_all >= 0):
+            valid_pos = positions_all[positions_all[:, 1] >= 0]
+            patch_grid_cols = int(valid_pos[:, 1].max()) + 1
+            patch_grid_rows = int(positions_all[positions_all[:, 0] >= 0, 0].max()) + 1
         else:
             patch_grid_cols = patch_grid_rows = None
-        logger.warning("  ⚠ _all_grid_cols is empty — patch grid shape unknown.")
+        logger.warning("  ⚠ _all_grid_cols is empty — patch grid shape estimated from positions_all.")
+
+    # ── DIAGNOSTIC: LST mosaic reconstruction ────────────────────────────────
+    # Reconstruct the full spatial mosaic from the QC-filtered, NaN-filled
+    # patches using the same multi-epoch collapse logic as the inference plotter.
+    # This lets you verify the patch grid, epoch offsets, and spatial coverage
+    # BEFORE running any model training, so layout bugs are caught early.
+    #
+    # NOTE: patch_grid_cols is now derived from the max observed _grid_col in
+    # positions_all (Fix 3) rather than the mode of _all_grid_cols, so it
+    # accurately reflects the true canvas width even when rasters differ in size.
+    _mosaic_cols = patch_grid_cols if patch_grid_cols else int(np.ceil(np.sqrt(n_samples)))
+    try:
+        diag.plot_lst_mosaic_reconstruction(
+            y               = y,
+            positions_all   = positions_all,
+            patch_grid_cols = _mosaic_cols,
+            all_grid_rows   = _all_grid_rows,
+            filename        = "P_mosaic_lst_reconstruction.png",
+        )
+        logger.info(
+            f"[Diagnostics] LST mosaic reconstruction: "
+            f"{len(_all_grid_rows)} non-empty epochs, "
+            f"grid_cols={_mosaic_cols}, "
+            f"n_patches={len(y)}"
+        )
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] LST mosaic reconstruction plot failed: {_e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Sample weights
+    patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+    n_wb          = 10
+    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
+    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
+    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
+    rw_           = 1.0 / bc_[bids_]
+    sample_weights = rw_ / rw_.mean()
 
     metadata = {
         "n_samples":        n_samples,
@@ -4351,9 +4812,16 @@ def main():
         "patch_grid_cols": patch_grid_cols,
         "patch_stride":    24,   # keep in sync with stride used above
         # ── Per-epoch grid dimensions — required for correct multi-epoch collapse.
-        # patch_grid_rows is the TOTAL stacked rows (n_epochs × rows_per_epoch).
-        # The inference mosaic uses rows_per_epoch to slice each epoch correctly.
+        # patch_grid_rows is the TOTAL stacked rows (sum of all per-epoch rows).
+        # The inference mosaic uses the full per-epoch list to slice correctly,
+        # because epochs may have different row counts when raster extents vary.
+        #
+        # FIX: Store the complete list of per-epoch row counts instead of only
+        # _all_grid_rows[0].  The old single-value assumption caused the inference
+        # plotter to use a fixed stride that drifted when epochs had different
+        # heights, producing the same blocky mis-slice seen in preprocessing.
         "patch_grid_rows_per_epoch": int(_all_grid_rows[0]) if _all_grid_rows else None,
+        "patch_grid_rows_per_epoch_list": [int(r) for r in _all_grid_rows] if _all_grid_rows else [],
         "n_epochs": int(len(_all_grid_rows)) if _all_grid_rows else 1,
         # ── Per-patch (grid_row, grid_col) positions — shape (N, 2) int32.
         # Stored here so create_stratified_split can propagate them into the
