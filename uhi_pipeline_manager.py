@@ -280,6 +280,8 @@ def stage_inference(args, predictor: EnsemblePredictor,
     grid_cols = getattr(args, "patch_grid_cols", None)
     rows_per_epoch = None
     n_epochs_meta  = None
+    stride_meta    = None
+    all_grid_rows_meta = None
     if grid_cols is None:
         _gs = _load_patch_grid_shape(Path(args.test_data))
         if _gs is not None:
@@ -287,6 +289,9 @@ def stage_inference(args, predictor: EnsemblePredictor,
             if len(_gs) >= 4:
                 rows_per_epoch = _gs[2]
                 n_epochs_meta  = _gs[3]
+            if len(_gs) >= 6:
+                stride_meta        = _gs[4]
+                all_grid_rows_meta = _gs[5]
     if grid_cols is not None:
         predictor.plotter.set_grid_cols(grid_cols)
         logger.info(f"  Plotter grid_cols set to {grid_cols}")
@@ -298,6 +303,18 @@ def stage_inference(args, predictor: EnsemblePredictor,
     if rows_per_epoch is not None:
         predictor.plotter.set_rows_per_epoch(rows_per_epoch, n_epochs_meta)
         logger.info(f"  Plotter rows_per_epoch={rows_per_epoch}, n_epochs={n_epochs_meta}")
+    if stride_meta is not None:
+        predictor.plotter.set_stride(stride_meta)
+        logger.info(f"  Plotter patch stride set to {stride_meta}")
+    else:
+        logger.warning(
+            "  ⚠ patch_stride not found in dataset metadata — mosaic will use "
+            "H-step placement (correct only if stride==patch_size).  "
+            "Re-run preprocessing to save patch_stride in dataset_metadata.json."
+        )
+    if all_grid_rows_meta is not None:
+        predictor.plotter.set_all_grid_rows(all_grid_rows_meta)
+        logger.info(f"  Plotter all_grid_rows set ({len(all_grid_rows_meta)} epochs)")
 
     # ── Load per-patch spatial positions so the mosaic assembler places each
     # patch at its original grid cell (fixes jumbled output when QC filtering
@@ -358,81 +375,255 @@ def stage_inference(args, predictor: EnsemblePredictor,
 def _load_patch_grid_shape(test_data_dir: Path) -> tuple:
     """
     Try to read the patch grid shape saved by the dataset builder.
-    Returns (grid_rows, grid_cols[, rows_per_epoch, n_epochs]) or None.
+    Returns (grid_rows, grid_cols, rows_per_epoch, n_epochs, stride, all_grid_rows)
+    or None.  stride and all_grid_rows may be None when not present in metadata.
 
-    The dataset builder writes one of:
-      <test_data_dir>/patch_grid_shape.npy   — np.array([rows, cols[, rpe, ne]])
-      <test_data_dir>/dataset_metadata.json  — {"patch_grid_rows": R, "patch_grid_cols": C, ...}
-      <test_data_dir>/metadata.json          — same keys
-      (and the same files in the parent cnn_dataset/ directory)
+    Search order (first match wins for the base 4-tuple, then JSON is also
+    checked in the same directory for the extended stride/all_grid_rows fields):
+      <test_data_dir>/patch_grid_shape.npy   — np.array([rows, cols, rpe, ne])
+      <test_data_dir>/dataset_metadata.json  — full JSON with all fields
+      <test_data_dir>/metadata.json          — same
+      (same files in the parent cnn_dataset/ directory)
+
+    ROOT CAUSE OF THE PREVIOUS BUG
+    ────────────────────────────────
+    patch_grid_shape.npy only stores 4 integers [rows, cols, rpe, ne] — it has
+    no room for patch_stride or patch_grid_rows_per_epoch_list.  The old code
+    returned immediately after loading the .npy, so it never reached the JSON
+    files that do contain those keys.  stage_inference then saw len(_gs) < 6,
+    left stride_meta=None, and the mosaic fell back to H-step placement.
+
+    FIX: when the .npy is found, don't return yet — also search the same
+    directory (and its parent) for a JSON file to pick up the extended fields.
+    The full 6-tuple is always returned so callers can rely on consistent
+    indexing.
     """
-    candidates = [
-        test_data_dir / "patch_grid_shape.npy",
-        test_data_dir / "dataset_metadata.json",
-        test_data_dir / "metadata.json",
-        test_data_dir.parent / "patch_grid_shape.npy",
-        test_data_dir.parent / "dataset_metadata.json",
-        test_data_dir.parent / "metadata.json",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            if path.suffix == ".npy":
-                arr = np.load(path)
-                if len(arr) >= 4:
-                    shape = tuple(int(x) for x in arr)  # (rows, cols, rpe, ne)
-                else:
-                    shape = tuple(int(x) for x in arr)  # (rows, cols)
-                logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
+    # Pairs: (npy_path, [json_paths_to_try_for_extended_fields])
+    # We resolve the search dirs explicitly so the JSON supplement search is
+    # scoped to the same directory as the .npy that was found.
+    search_dirs = [test_data_dir, test_data_dir.parent]
+
+    def _try_json_for_stride(json_candidates):
+        """Return (stride, all_grid_rows) from the first readable JSON, or (None, None)."""
+        for jp in json_candidates:
+            if not jp.exists():
+                continue
+            try:
+                meta = json.loads(jp.read_text())
+                stride = int(meta["patch_stride"]) if "patch_stride" in meta else None
+                agr    = (
+                    [int(r) for r in meta["patch_grid_rows_per_epoch_list"]]
+                    if "patch_grid_rows_per_epoch_list" in meta
+                    and meta["patch_grid_rows_per_epoch_list"]
+                    else None
+                )
+                if stride is not None or agr is not None:
+                    return stride, agr
+            except Exception:
+                pass
+        return None, None
+
+    for sdir in search_dirs:
+        # ── Try .npy first ────────────────────────────────────────────────────
+        npy_path = sdir / "patch_grid_shape.npy"
+        if npy_path.exists():
+            try:
+                arr  = np.load(npy_path)
+                rows = int(arr[0]); cols = int(arr[1])
+                rpe  = int(arr[2]) if len(arr) >= 3 else rows
+                ne   = int(arr[3]) if len(arr) >= 4 else 1
+                # .npy never contains stride/all_grid_rows — supplement from JSON
+                stride, agr = _try_json_for_stride([
+                    sdir  / "dataset_metadata.json",
+                    sdir  / "metadata.json",
+                    sdir.parent / "dataset_metadata.json",
+                    sdir.parent / "metadata.json",
+                ])
+                shape = (rows, cols, rpe, ne, stride, agr)
+                logger.info(
+                    f"  Loaded patch grid shape ({rows}r, {cols}c, rpe={rpe}, "
+                    f"ne={ne}) from {npy_path.name}; "
+                    f"stride={stride}, n_ep_rows={len(agr) if agr else 0} "
+                    f"(from adjacent JSON)"
+                )
                 return shape
-            else:
-                meta = json.loads(path.read_text())
-                if "patch_grid_rows" in meta and "patch_grid_cols" in meta:
-                    rows = int(meta["patch_grid_rows"])
-                    cols = int(meta["patch_grid_cols"])
-                    rpe  = int(meta["patch_grid_rows_per_epoch"]) if "patch_grid_rows_per_epoch" in meta else rows
-                    ne   = int(meta["n_epochs"]) if "n_epochs" in meta else 1
-                    shape = (rows, cols, rpe, ne)
-                    logger.info(f"  Loaded patch grid shape {shape} from {path.name}")
-                    return shape
-        except Exception as exc:
-            logger.warning(f"  Could not parse {path}: {exc}")
+            except Exception as exc:
+                logger.warning(f"  Could not parse {npy_path}: {exc}")
+
+        # ── Try JSON (contains all fields in one file) ────────────────────────
+        for jname in ["dataset_metadata.json", "metadata.json"]:
+            jpath = sdir / jname
+            if not jpath.exists():
+                continue
+            try:
+                meta = json.loads(jpath.read_text())
+                if "patch_grid_rows" not in meta or "patch_grid_cols" not in meta:
+                    continue
+                rows   = int(meta["patch_grid_rows"])
+                cols   = int(meta["patch_grid_cols"])
+                rpe    = int(meta["patch_grid_rows_per_epoch"]) if "patch_grid_rows_per_epoch" in meta else rows
+                ne     = int(meta["n_epochs"]) if "n_epochs" in meta else 1
+                stride = int(meta["patch_stride"]) if "patch_stride" in meta else None
+                agr    = (
+                    [int(r) for r in meta["patch_grid_rows_per_epoch_list"]]
+                    if "patch_grid_rows_per_epoch_list" in meta
+                    and meta["patch_grid_rows_per_epoch_list"]
+                    else None
+                )
+                shape = (rows, cols, rpe, ne, stride, agr)
+                logger.info(
+                    f"  Loaded patch grid shape ({rows}r, {cols}c, rpe={rpe}, "
+                    f"ne={ne}, stride={stride}, "
+                    f"n_ep_rows={len(agr) if agr else 0}) from {jpath.name}"
+                )
+                return shape
+            except Exception as exc:
+                logger.warning(f"  Could not parse {jpath}: {exc}")
+
     return None
 
 
 def _mosaic_patches(patches: np.ndarray,
                     grid_cols: int = None,
                     grid_rows: int = None,
-                    patch_positions: np.ndarray = None) -> np.ndarray:
+                    patch_positions: np.ndarray = None,
+                    stride: int = None,
+                    all_grid_rows: list = None) -> np.ndarray:
     """
-    Assemble an (N, H, W) array of equal-sized patches into a single 2-D mosaic
-    that faithfully reproduces the spatial layout of the study area.
+    Assemble an (N, H, W) array of patches into a single 2-D mosaic,
+    correctly honouring the *stride* used during patch extraction.
+
+    ROOT CAUSE OF JUMBLED MOSAICS
+    ──────────────────────────────
+    The original implementation placed patch i at pixel offset
+    ``grid_row * H`` / ``grid_col * W``.  When stride < H (the normal case,
+    e.g. stride=24, patch_size=64), this puts every patch at completely the
+    wrong position and produces the blocky/scrambled mosaic artefact.
+
+    FIX
+    ───
+    When ``stride`` and ``patch_positions`` are both available:
+      1. Place patch at pixel (local_gr * stride, gc * stride).
+      2. Blend overlapping regions with a 2-D Hann window.
+      3. Recover local_gr from the global (epoch-offset) grid_row using the
+         per-epoch row counts in ``all_grid_rows``.
+      4. Return per-epoch canvases concatenated vertically so that the
+         upstream collapse logic (in stage_postprocess) slices them correctly.
+
+    Falls back to H-step placement when stride is unavailable (legacy mode).
 
     Args:
-        patches:         np.ndarray of shape (N, H, W)
-        grid_cols:       number of patch columns in the original spatial grid.
-        grid_rows:       number of patch rows (alternative to grid_cols).
-        patch_positions: (N, 2) int32 array of (grid_row, grid_col) per patch.
-                         When supplied, patches are placed at their correct spatial
-                         positions (NaN-gaps for QC-filtered patches) rather than
-                         being packed sequentially — which shifts all downstream
-                         patches when any patches were filtered out.
+        patches:         (N, H, W) float array of patch predictions.
+        grid_cols:       Authoritative column count from dataset metadata.
+        grid_rows:       Ignored when patch_positions is available.
+        patch_positions: (N, 2) int32 (global_grid_row, grid_col) per patch.
+        stride:          Pixel stride used during patch extraction (e.g. 24).
+        all_grid_rows:   List of per-epoch row counts; required for correct
+                         per-epoch canvas heights in multi-epoch datasets.
 
     Returns:
-        mosaic: np.ndarray of shape (grid_rows*H, grid_cols*W), NaN-padded.
+        mosaic: 2-D float32 array.  With stride: shape is
+                (sum(ep_canvas_heights), (grid_cols-1)*stride + W).
+                Without stride (legacy): (total_grid_rows*H, grid_cols*W).
     """
     N, H, W = patches.shape
 
+    # ── Stride-aware path ─────────────────────────────────────────────────────
+    _use_stride = (
+        stride is not None
+        and stride > 0
+        and stride != H
+        and patch_positions is not None
+        and np.any(patch_positions >= 0)
+    )
+
+    if _use_stride:
+        pos        = np.asarray(patch_positions, dtype=np.int32)
+        valid_mask = (pos[:, 0] >= 0) & (pos[:, 1] >= 0)
+        if not valid_mask.any():
+            _use_stride = False
+
+    if _use_stride:
+        _grid_cols = (int(grid_cols) if grid_cols is not None
+                      else int(pos[valid_mask, 1].max()) + 1)
+
+        if all_grid_rows and len(all_grid_rows) > 0:
+            _all_grid_rows = [int(r) for r in all_grid_rows]
+        else:
+            total_global_rows = int(pos[valid_mask, 0].max()) + 1
+            _all_grid_rows = [total_global_rows]
+
+        n_epochs     = len(_all_grid_rows)
+        epoch_starts = np.zeros(n_epochs + 1, dtype=np.int64)
+        for ep, r in enumerate(_all_grid_rows):
+            epoch_starts[ep + 1] = epoch_starts[ep] + r
+
+        _hann_r    = np.hanning(H).astype(np.float64)
+        _hann_c    = np.hanning(W).astype(np.float64)
+        _patch_win = np.outer(_hann_r, _hann_c)
+
+        _ep_canvas_h_list = [max(1, (int(r) - 1) * stride + H) for r in _all_grid_rows]
+        _ep_canvas_w      = max(1, (_grid_cols - 1) * stride + W)
+        _max_ep_h         = max(_ep_canvas_h_list)
+
+        global_rows = pos[:, 0].astype(np.int64)
+        patch_epoch = np.searchsorted(epoch_starts[1:], global_rows, side='right').astype(np.int32)
+        patch_epoch = np.clip(patch_epoch, 0, n_epochs - 1)
+
+        slices = []
+        for ep in range(n_epochs):
+            ep_grid_rows = int(_all_grid_rows[ep])
+            ep_canvas_h  = _ep_canvas_h_list[ep]
+            prior_rows   = int(epoch_starts[ep])
+
+            acc_sum = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+            acc_wgt = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+
+            ep_indices = np.where((patch_epoch == ep) & valid_mask)[0]
+            for idx in ep_indices:
+                global_gr = int(pos[idx, 0])
+                gc        = int(pos[idx, 1])
+                if gc < 0:
+                    continue
+                local_gr = global_gr - prior_rows
+                if local_gr < 0 or local_gr >= ep_grid_rows:
+                    continue
+                r0 = local_gr * stride;  r1 = r0 + H
+                c0 = gc       * stride;  c1 = c0 + W
+                if r1 > ep_canvas_h or c1 > _ep_canvas_w:
+                    continue
+                patch_data = patches[idx].astype(np.float64)
+                finite     = np.isfinite(patch_data)
+                w          = _patch_win * finite
+                acc_sum[r0:r1, c0:c1] += np.where(finite, patch_data * w, 0.0)
+                acc_wgt[r0:r1, c0:c1] += w
+
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ep_canvas = np.where(
+                    acc_wgt > 0,
+                    (acc_sum / acc_wgt).astype(np.float32),
+                    np.nan
+                ).astype(np.float32)
+            del acc_sum, acc_wgt
+
+            if ep_canvas.shape != (_max_ep_h, _ep_canvas_w):
+                padded_ep = np.full((_max_ep_h, _ep_canvas_w), np.nan, dtype=np.float32)
+                h_c = min(ep_canvas.shape[0], _max_ep_h)
+                w_c = min(ep_canvas.shape[1], _ep_canvas_w)
+                padded_ep[:h_c, :w_c] = ep_canvas[:h_c, :w_c]
+                slices.append(padded_ep)
+            else:
+                slices.append(ep_canvas)
+
+        if slices:
+            return np.concatenate(slices, axis=0).astype(patches.dtype)
+        logger.warning("  ⚠ _mosaic_patches(stride): no epoch canvases — falling back to H-step.")
+
+    # ── Legacy path: H-step non-overlapping placement ─────────────────────────
     if patch_positions is not None and np.any(patch_positions >= 0):
         valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
         rows = int(patch_positions[valid_mask, 0].max()) + 1
         cols = int(patch_positions[valid_mask, 1].max()) + 1
-        # When grid_cols is known from dataset metadata, use it as the
-        # authoritative column count.  This is correct because patch_positions
-        # col indices run 0 … grid_cols-1, so max+1 == grid_cols when all
-        # positions are valid.  Supplying it explicitly guards against test
-        # splits that are missing the rightmost column patches.
         if grid_cols is not None:
             cols = int(grid_cols)
         canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
@@ -453,11 +644,8 @@ def _mosaic_patches(patches: np.ndarray,
         cols = int(np.ceil(np.sqrt(N)))
         rows = int(np.ceil(N / cols))
 
-    # Pad so we have a full rows×cols grid
     padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
     padded[:N] = patches
-
-    # Reshape: (rows, cols, H, W) → interleave spatial axes → (rows*H, cols*W)
     mosaic = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
     return mosaic
 
@@ -478,7 +666,9 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
 
     # ── Determine grid layout ──────────────────────────────────────────────────
     # Priority: CLI arg  >  saved metadata  >  sqrt fallback (may jumble patches!)
-    grid_cols = getattr(args, "patch_grid_cols", None)
+    grid_cols          = getattr(args, "patch_grid_cols", None)
+    _stride_post       = None
+    _all_grid_rows_post = None
 
     if grid_cols is not None:
         grid_shape = None   # derive rows inside _mosaic_patches
@@ -487,12 +677,20 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
         grid_shape = _load_patch_grid_shape(Path(args.test_data))
         if grid_shape is not None:
             grid_cols = grid_shape[1]
-            logger.info(f"  Grid layout  : {grid_shape[0]}r × {grid_shape[1]}c "                        f"(from dataset metadata)")
+            if len(grid_shape) >= 6:
+                _stride_post       = grid_shape[4]
+                _all_grid_rows_post = grid_shape[5]
+            logger.info(f"  Grid layout  : {grid_shape[0]}r × {grid_shape[1]}c "
+                        f"(from dataset metadata)")
         else:
             # sqrt fallback — warn loudly
             grid_cols = int(np.ceil(np.sqrt(n_total)))
             logger.warning(
-                f"  ⚠ No patch grid metadata found and --patch-grid-cols not set. "                f"Falling back to sqrt grid ({grid_cols} cols for {n_total} patches). "                f"This will JUMBLE the mosaic unless the study area is square in "                f"patch-count terms.  Re-run with --patch-grid-cols=<N> to fix."            )
+                f"  ⚠ No patch grid metadata found and --patch-grid-cols not set. "
+                f"Falling back to sqrt grid ({grid_cols} cols for {n_total} patches). "
+                f"This will JUMBLE the mosaic unless the study area is square in "
+                f"patch-count terms.  Re-run with --patch-grid-cols=<N> to fix."
+            )
 
     # ── Mosaic ALL patches into a single full-area map ─────────────────────────
     # Load per-patch spatial positions for position-aware mosaic assembly.
@@ -505,13 +703,76 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
         except Exception as _pe:
             logger.warning(f"  Could not load patch_positions.npy: {_pe}")
 
-    lst_processed = _mosaic_patches(lst_maps_processed, grid_cols=grid_cols,
-                                    patch_positions=_patch_positions)
+    lst_mosaic_raw = _mosaic_patches(
+        lst_maps_processed,
+        grid_cols=grid_cols,
+        patch_positions=_patch_positions,
+        stride=_stride_post,
+        all_grid_rows=_all_grid_rows_post,
+    )
+
+    # ── Collapse multi-epoch vertical stack into a single temporal-mean map ────
+    # When stride-aware mosaicking is used with multiple temporal epochs,
+    # _mosaic_patches returns a TALL array where each epoch's canvas is stacked
+    # vertically (total height = sum of per-epoch canvas heights).  The inference
+    # plotter (uhi_inference._plot_full_mosaic) collapses this correctly via
+    # nanmean before displaying — but stage_postprocess was returning the raw tall
+    # mosaic, causing lst_processed (and all downstream uhi_map / classified maps)
+    # to have ~130 000 rows instead of ~1 000, producing the jumbled stripe output.
+    #
+    # Fix: replicate the _collapse_epochs logic here so that lst_processed always
+    # has the spatial shape of ONE epoch (H × W of the study area).
+    H_patch = lst_maps_processed.shape[1]
+    _needs_collapse = (
+        _stride_post is not None
+        and _stride_post > 0
+        and _stride_post != H_patch
+        and _all_grid_rows_post is not None
+        and len(_all_grid_rows_post) > 1        # only collapse when multi-epoch
+    )
+
+    if _needs_collapse:
+        _ep_canvas_h_list = [
+            max(1, (int(r) - 1) * _stride_post + H_patch)
+            for r in _all_grid_rows_post
+        ]
+        _max_ep_h   = max(_ep_canvas_h_list)
+        n_epochs    = len(_all_grid_rows_post)
+        ep_slices   = []
+        row_cursor  = 0
+        for ep in range(n_epochs):
+            row_end = row_cursor + _max_ep_h
+            if row_end <= lst_mosaic_raw.shape[0]:
+                ep_slices.append(lst_mosaic_raw[row_cursor:row_end, :])
+            row_cursor += _max_ep_h
+        if ep_slices:
+            stack         = np.stack(ep_slices, axis=0)
+            lst_processed = np.nanmean(stack, axis=0).astype(lst_maps_processed.dtype)
+            logger.info(
+                f"  Epoch collapse : {n_epochs} epochs × {_max_ep_h}px "
+                f"→ temporal mean shape {lst_processed.shape}"
+            )
+        else:
+            logger.warning("  ⚠ Epoch collapse produced no slices — using raw mosaic")
+            lst_processed = lst_mosaic_raw
+    else:
+        lst_processed = lst_mosaic_raw
+        if _all_grid_rows_post is not None and len(_all_grid_rows_post) > 1:
+            logger.info(
+                f"  Multi-epoch dataset but stride={_stride_post} "
+                f"(legacy H-step) — skipping epoch collapse"
+            )
+
     np.save(data_dir / "lst_processed_mosaic.npy", lst_processed)
 
     logger.info(f"  Processed    : {n_total} patches  (analysis cap: {n_analysis})")
-    logger.info(f"  Mosaic shape : {lst_processed.shape}  "                f"(from {n_total} patches of "                f"{lst_maps_processed.shape[1]}×{lst_maps_processed.shape[2]})")
-    logger.info(f"  Mosaic stats : mean={np.nanmean(lst_processed):.2f}°C  "                f"std={np.nanstd(lst_processed):.2f}°C  "                f"range=[{np.nanmin(lst_processed):.1f}, "                f"{np.nanmax(lst_processed):.1f}]°C")
+    logger.info(f"  Mosaic shape : {lst_processed.shape}  "
+                f"(from {n_total} patches of "
+                f"{lst_maps_processed.shape[1]}×{lst_maps_processed.shape[2]})")
+    logger.info(f"  Mosaic stats : mean={np.nanmean(lst_processed):.2f}°C  "
+                f"std={np.nanstd(lst_processed):.2f}°C  "
+                f"range=[{np.nanmin(lst_processed):.1f}, "
+                f"{np.nanmax(lst_processed):.1f}]°C")
 
     return lst_processed, lst_maps_processed
 

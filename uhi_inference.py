@@ -67,6 +67,8 @@ class InferenceDiagnosticsPlotter:
         self._grid_cols = grid_cols   # patch grid columns — set via set_grid_cols() or here
         self._rows_per_epoch = None   # single-epoch patch row count (None = unknown)
         self._n_epochs = None         # number of temporal epochs (None = unknown)
+        self._stride = None           # pixel stride used during patch extraction (None → H fallback)
+        self._all_grid_rows = None    # list of per-epoch row counts for stride-aware mosaic
         logger.info(
             f"📊 InferenceDiagnosticsPlotter initialised — "
             f"style='{self._style}' → {self.save_dir}"
@@ -137,6 +139,43 @@ class InferenceDiagnosticsPlotter:
         logger.info(
             f"  InferenceDiagnosticsPlotter: rows_per_epoch={self._rows_per_epoch}"
             + (f", n_epochs={self._n_epochs}" if self._n_epochs else "")
+        )
+
+    def set_stride(self, stride: int) -> None:
+        """
+        Supply the pixel stride used during patch extraction in preprocessing.
+
+        This MUST match the ``stride`` argument passed to ``extract_patches()``
+        (typically 24 for a 64-px patch with 40-px overlap).  When set, the
+        mosaic assembler places patches at ``grid_row * stride`` / ``grid_col *
+        stride`` pixel offsets and blends overlapping regions with a Hann window
+        — exactly mirroring ``plot_lst_mosaic_reconstruction`` in preprocessing.
+
+        Without this, patches are placed at ``grid_row * H`` / ``grid_col * W``
+        (no overlap), which produces the jumbled block artefact seen in 03b.
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+        """
+        self._stride = int(stride)
+        logger.info(f"  InferenceDiagnosticsPlotter: patch stride set to {self._stride}")
+
+    def set_all_grid_rows(self, all_grid_rows: list) -> None:
+        """
+        Supply the complete per-epoch patch-row counts from dataset metadata.
+
+        This is the ``patch_grid_rows_per_epoch_list`` list saved by preprocessing
+        (one entry per non-empty epoch).  When present, the stride-aware mosaic
+        builder uses these counts to compute per-epoch canvas heights and to
+        recover local grid_row from the global (offset) grid_row stored in
+        patch_positions — exactly mirroring the preprocessing diagnostic.
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+        """
+        self._all_grid_rows = [int(r) for r in all_grid_rows]
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: all_grid_rows set "
+            f"({len(self._all_grid_rows)} epochs, totalling "
+            f"{sum(self._all_grid_rows)} patch-rows)"
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -395,50 +434,196 @@ class InferenceDiagnosticsPlotter:
     def _mosaic_patches(self, patches: np.ndarray,
                         grid_cols: int = None,
                         grid_rows: int = None,
-                        patch_positions: np.ndarray = None) -> np.ndarray:
+                        patch_positions: np.ndarray = None,
+                        stride: int = None,
+                        all_grid_rows: list = None) -> np.ndarray:
         """
-        Tile (N, H, W) patches into a single (grid_rows*H, grid_cols*W) mosaic.
+        Assemble (N, H, W) patches into a single 2-D mosaic, correctly honouring
+        the *stride* used during patch extraction.
+
+        ROOT CAUSE OF THE JUMBLED MOSAIC (03b)
+        ───────────────────────────────────────
+        The old implementation placed patch ``i`` at pixel offset
+        ``grid_row * H`` / ``grid_col * W`` — treating each grid index as a
+        full, non-overlapping block.  But preprocessing extracts patches with
+        ``stride < H`` (default stride=24, patch_size=64), so adjacent patches
+        overlap by ``H - stride = 40 px``.  Using ``H`` as the step puts every
+        patch at the wrong pixel position, producing the characteristic
+        checkerboard / block-scramble seen in figure 03b.
+
+        CORRECT APPROACH (mirrors preprocessing's plot_lst_mosaic_reconstruction)
+        ──────────────────────────────────────────────────────────────────────────
+        1. Place patch at pixel (local_gr * stride, gc * stride).
+        2. Blend overlapping regions with a 2-D Hann window (weighted average).
+        3. For multi-epoch data: recover each patch's LOCAL grid_row by
+           subtracting the cumulative epoch row offset (prior_rows), then build
+           a per-epoch canvas at the correct height.
+        4. Stack per-epoch canvases and take the pixel-wise nanmean so the
+           returned mosaic has the spatial shape of ONE epoch — ready for the
+           _collapse_epochs logic in _plot_full_mosaic.
+
+        When ``stride`` is not supplied (e.g. legacy calls), falls back to the
+        old ``H``-step placement so existing single-epoch tests are unaffected.
 
         Args:
             patches:         (N, H, W) array of predictions.
-            grid_cols:       Patch columns in the original spatial grid.  When given,
-                             rows = ceil(N / grid_cols).  Prefer this over grid_rows.
-            grid_rows:       Alternative: patch rows in the grid.  Ignored when
-                             grid_cols is also supplied.
-            patch_positions: Optional (N, 2) int array of (grid_row, grid_col)
-                             for each patch.  When supplied, patches are placed at
-                             their original spatial positions (NaN-filling gaps left
-                             by QC-filtered patches) instead of being packed
-                             sequentially.  This is required for a correct mosaic
-                             when QC filtering has removed some patches from the grid.
+            grid_cols:       Authoritative column count from dataset metadata.
+            grid_rows:       Ignored when patch_positions is available.
+            patch_positions: (N, 2) int32 (global_grid_row, grid_col) per patch.
+            stride:          Pixel stride used during patch extraction.  MUST
+                             match the value used in preprocessing (default 24).
+                             When None, falls back to H-step (legacy behaviour).
+            all_grid_rows:   List of per-epoch row counts (from metadata key
+                             ``patch_grid_rows_per_epoch_list``).  Required for
+                             correct multi-epoch per-canvas reconstruction.
 
         Multi-epoch note
         ────────────────
-        When the dataset spans multiple temporal epochs, preprocessing offsets each
-        epoch's grid_row so that epochs stack vertically in patch_positions (epoch 0
-        occupies rows 0…R-1, epoch 1 occupies rows R…2R-1, etc.).  The total canvas
-        height is therefore n_epochs × per_epoch_grid_rows.  grid_cols remains the
-        SAME for every epoch, so supplying it from dataset metadata is always correct.
-
-        If neither grid_cols nor patch_positions is given the layout falls back to
-        ceil(sqrt(N)) columns, which is only correct when the study area is square
-        in patch count.
+        Preprocessing offsets each epoch's grid_row by the cumulative row count
+        of all preceding epochs, so epoch 0 occupies global rows 0…R0-1, epoch 1
+        occupies R0…R0+R1-1, etc.  We recover the local row via
+        ``local_gr = global_gr - prior_rows`` and build a per-epoch canvas at
+        height ``(ep_grid_rows - 1) * stride + H``.  Canvases are stacked and
+        nanmean'd so the result has the height of one epoch's spatial extent.
         """
         N, H, W = patches.shape
 
-        # ── Determine grid dimensions ─────────────────────────────────────────
+        # ── Stride-aware path ─────────────────────────────────────────────────
+        # Use when we have both patch_positions and a valid stride value.
+        _use_stride = (
+            stride is not None
+            and stride > 0
+            and stride != H          # stride == H means no overlap → same as legacy
+            and patch_positions is not None
+            and np.any(patch_positions >= 0)
+        )
+
+        if _use_stride:
+            pos = np.asarray(patch_positions, dtype=np.int32)
+            valid_mask = (pos[:, 0] >= 0) & (pos[:, 1] >= 0)
+
+            if not valid_mask.any():
+                _use_stride = False   # fall through to legacy path
+
+        if _use_stride:
+            # ── Resolve grid_cols ─────────────────────────────────────────────
+            _grid_cols = (int(grid_cols) if grid_cols is not None
+                          else int(pos[valid_mask, 1].max()) + 1)
+            if grid_cols is None:
+                logger.warning(
+                    f"  ⚠ _mosaic_patches(stride): grid_cols not supplied — "
+                    f"inferring cols={_grid_cols} from max patch_positions col. "
+                    f"Pass --patch-grid-cols for an authoritative value."
+                )
+
+            # ── Resolve epoch structure ───────────────────────────────────────
+            if all_grid_rows and len(all_grid_rows) > 0:
+                _all_grid_rows = [int(r) for r in all_grid_rows]
+            else:
+                # Infer from rows_per_epoch / n_epochs stored on self, or fall
+                # back to treating everything as one epoch.
+                _rpe = getattr(self, "_rows_per_epoch", None)
+                _ne  = getattr(self, "_n_epochs", None)
+                if _rpe and _ne:
+                    _all_grid_rows = [_rpe] * _ne
+                else:
+                    total_global_rows = int(pos[valid_mask, 0].max()) + 1
+                    _all_grid_rows = [total_global_rows]
+
+            n_epochs = len(_all_grid_rows)
+
+            # Epoch boundary offsets in global-row space
+            epoch_starts = np.zeros(n_epochs + 1, dtype=np.int64)
+            for ep, r in enumerate(_all_grid_rows):
+                epoch_starts[ep + 1] = epoch_starts[ep] + r
+
+            # 2-D Hann window for overlap blending
+            _hann_r = np.hanning(H).astype(np.float64)
+            _hann_c = np.hanning(W).astype(np.float64)
+            _patch_win = np.outer(_hann_r, _hann_c)   # (H, W)
+
+            # Per-epoch canvas sizes
+            _ep_canvas_h_list = [
+                max(1, (int(r) - 1) * stride + H) for r in _all_grid_rows
+            ]
+            _ep_canvas_w = max(1, (_grid_cols - 1) * stride + W)
+            _max_ep_h    = max(_ep_canvas_h_list)
+
+            # Map each patch to its epoch index via searchsorted on epoch_starts
+            global_rows = pos[:, 0].astype(np.int64)
+            patch_epoch = np.searchsorted(epoch_starts[1:], global_rows,
+                                          side='right').astype(np.int32)
+            patch_epoch = np.clip(patch_epoch, 0, n_epochs - 1)
+
+            slices = []
+            for ep in range(n_epochs):
+                ep_grid_rows = int(_all_grid_rows[ep])
+                ep_canvas_h  = _ep_canvas_h_list[ep]
+                prior_rows   = int(epoch_starts[ep])
+
+                acc_sum = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+                acc_wgt = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+
+                ep_mask    = (patch_epoch == ep) & valid_mask
+                ep_indices = np.where(ep_mask)[0]
+
+                for idx in ep_indices:
+                    global_gr = int(pos[idx, 0])
+                    gc        = int(pos[idx, 1])
+                    if gc < 0:
+                        continue
+                    local_gr = global_gr - prior_rows
+                    if local_gr < 0 or local_gr >= ep_grid_rows:
+                        continue
+                    r0 = local_gr * stride;  r1 = r0 + H
+                    c0 = gc       * stride;  c1 = c0 + W
+                    if r1 > ep_canvas_h or c1 > _ep_canvas_w:
+                        continue
+                    patch_data = patches[idx].astype(np.float64)
+                    finite     = np.isfinite(patch_data)
+                    w          = _patch_win * finite
+                    acc_sum[r0:r1, c0:c1] += np.where(finite, patch_data * w, 0.0)
+                    acc_wgt[r0:r1, c0:c1] += w
+
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ep_canvas = np.where(
+                        acc_wgt > 0,
+                        (acc_sum / acc_wgt).astype(np.float32),
+                        np.nan
+                    ).astype(np.float32)
+                del acc_sum, acc_wgt
+
+                # Pad shorter epochs to uniform shape for stacking
+                if ep_canvas.shape != (_max_ep_h, _ep_canvas_w):
+                    padded = np.full((_max_ep_h, _ep_canvas_w), np.nan, dtype=np.float32)
+                    h_c = min(ep_canvas.shape[0], _max_ep_h)
+                    w_c = min(ep_canvas.shape[1], _ep_canvas_w)
+                    padded[:h_c, :w_c] = ep_canvas[:h_c, :w_c]
+                    slices.append(padded)
+                else:
+                    slices.append(ep_canvas)
+
+            if not slices:
+                logger.warning("  ⚠ _mosaic_patches(stride): no epoch canvases built — falling back.")
+                _use_stride = False
+            else:
+                # Stack epochs vertically so _collapse_epochs can slice them
+                # exactly as it does for the legacy mosaic: epoch 0 occupies
+                # pixel rows 0…ep_h-1, epoch 1 occupies ep_h…2*ep_h-1, etc.
+                canvas = np.concatenate(slices, axis=0).astype(patches.dtype)
+                return canvas
+
+        # ── Legacy path: no stride or no patch_positions ──────────────────────
+        # Place patches at grid_row*H / grid_col*W (non-overlapping blocks).
+        # Still correct when stride == H (no overlap), and as a fallback when
+        # stride/positions are unavailable.
+
         if patch_positions is not None and np.any(patch_positions >= 0):
             valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
             if not valid_mask.any():
-                # All positions invalid — fall through to sequential layout below
                 patch_positions = None
             else:
                 rows = int(patch_positions[valid_mask, 0].max()) + 1
-                # ── Column count: always prefer the authoritative grid_cols from
-                # dataset metadata over max(col)+1 from patch_positions.
-                # Reason: the test split may be missing patches from the rightmost
-                # column (QC-filtered), causing max(col)+1 to be one less than the
-                # true grid width and shifting every subsequent patch one cell left.
                 if grid_cols is not None:
                     cols = int(grid_cols)
                 else:
@@ -451,12 +636,8 @@ class InferenceDiagnosticsPlotter:
                         f"Pass --patch-grid-cols=<N> or ensure patch_grid_shape.npy "
                         f"is present in the dataset directory to fix this."
                     )
-                # rows already accounts for multi-epoch vertical stacking
-                # (each epoch offsets its grid_row by per_epoch_grid_rows).
-                # Do NOT recompute rows from grid_cols here.
 
         if patch_positions is None or not np.any(patch_positions >= 0):
-            # No valid spatial metadata — use sequential / dimension-based layout.
             if grid_cols is not None:
                 cols = int(grid_cols)
                 rows = int(np.ceil(N / cols))
@@ -477,12 +658,11 @@ class InferenceDiagnosticsPlotter:
         canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
 
         if patch_positions is not None and np.any(patch_positions >= 0):
-            # Position-aware placement: put each patch at its exact grid cell.
             out_of_bounds = 0
             for idx in range(N):
                 gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])
                 if gr < 0 or gc < 0:
-                    continue   # sentinel for patches without spatial metadata
+                    continue
                 if gr >= rows or gc >= cols:
                     out_of_bounds += 1
                     continue
@@ -494,7 +674,6 @@ class InferenceDiagnosticsPlotter:
                     f"This usually means grid_cols is smaller than the true grid width."
                 )
         else:
-            # Legacy sequential placement (only correct when no patches were filtered).
             padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
             padded[:N] = patches
             canvas = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
@@ -508,7 +687,8 @@ class InferenceDiagnosticsPlotter:
         """
         Figure 03b — full mosaicked inference result covering the entire study area.
 
-        Shows: CNN mosaic · GBM mosaic · Ensemble mosaic · Error mosaic (if targets given).
+        Shows: Ensemble temporal mean · Inter-epoch spread · CNN temporal mean ·
+               Error mosaic (if targets given).
 
         Args:
             grid_cols:       Number of patch columns in the spatial grid.  Pass this
@@ -518,6 +698,12 @@ class InferenceDiagnosticsPlotter:
                              When supplied, QC-filtered gaps are correctly preserved
                              as NaN rather than causing all subsequent patches to
                              shift by one cell.
+
+        The mosaic assembler reads ``self._stride`` and ``self._all_grid_rows``
+        (set via ``set_stride()`` / ``set_all_grid_rows()`` in stage_inference).
+        When these are set, patches are placed at their correct overlapping-stride
+        pixel offsets and blended with a Hann window — fixing the jumbled block
+        artefact that occurs when stride < patch_size (the normal case).
         """
         try:
             N_total = len(ensemble)
@@ -525,77 +711,124 @@ class InferenceDiagnosticsPlotter:
 
             H, W = ensemble.shape[1], ensemble.shape[2]
 
-            ens_mosaic = self._mosaic_patches(ensemble, grid_cols=grid_cols,
-                                              patch_positions=patch_positions)
-            cnn_mosaic = self._mosaic_patches(cnn, grid_cols=grid_cols,
-                                              patch_positions=patch_positions)
+            # Pull stride and per-epoch row list from instance state (set by
+            # stage_inference via set_stride() / set_all_grid_rows()).
+            _stride        = getattr(self, "_stride", None)
+            _all_grid_rows = getattr(self, "_all_grid_rows", None)
+
+            def _mosaic(arr):
+                return self._mosaic_patches(
+                    arr,
+                    grid_cols=grid_cols,
+                    patch_positions=patch_positions,
+                    stride=_stride,
+                    all_grid_rows=_all_grid_rows,
+                )
+
+            ens_mosaic = _mosaic(ensemble)
+            cnn_mosaic = _mosaic(cnn)
 
             # GBM: broadcast per-patch scalar or per-patch spatial map
             if gbm.ndim == 1:
                 gbm_tiles = np.stack([np.full((H, W), float(v)) for v in gbm])
             else:
                 gbm_tiles = gbm
-            gbm_mosaic = self._mosaic_patches(gbm_tiles, grid_cols=grid_cols,
-                                              patch_positions=patch_positions)
+            gbm_mosaic = _mosaic(gbm_tiles)
 
             # ── Detect multi-epoch vertical stacking ──────────────────────────
-            # When the dataset spans multiple temporal epochs, preprocessing
-            # offsets each epoch's grid_row so all epochs stack vertically in
-            # patch_positions.  The tall mosaic (many rows, few cols) is correct
-            # but unreadable as a map.  We detect this case and collapse all
-            # epoch slices into a single spatial grid by taking the pixel-wise
-            # nanmean, then also compute nanstd as an inter-epoch spread map.
-            _actual_patch_rows = ens_mosaic.shape[0] // H
-            _actual_patch_cols = ens_mosaic.shape[1] // W if W > 0 else 1
+            # When the dataset spans multiple temporal epochs, _mosaic_patches
+            # stacks per-epoch canvases vertically.  We detect the number of
+            # epochs and the pixel height of each epoch's slice so that
+            # _collapse_epochs can take the nanmean across epochs.
+            #
+            # Two paths:
+            #   A) Stride-aware (preferred): _stride and _all_grid_rows are set.
+            #      Per-epoch canvas height = (ep_grid_rows - 1)*stride + H.
+            #   B) Legacy (fallback): use metadata rows_per_epoch or aspect ratio.
+            #      Per-epoch canvas height = per_epoch_patch_rows * H.
+            _use_stride_collapse = (
+                _stride is not None and _stride > 0 and _stride != H
+                and _all_grid_rows is not None and len(_all_grid_rows) > 0
+            )
 
-            # ── Determine per-epoch rows: prefer authoritative metadata value
-            # over aspect-ratio heuristic.  The heuristic is unreliable when
-            # the per-epoch grid is non-square (e.g. 16 rows × 16 cols gives
-            # aspect=1 and is mistaken for single-epoch, while a rectangular
-            # 8-row × 16-col grid stacked 10 epochs gives aspect=5 but
-            # per_epoch_patch_rows should be 8, not 16//5=3).
-            _rows_per_epoch_meta = getattr(self, "_rows_per_epoch", None)
-            _n_epochs_meta       = getattr(self, "_n_epochs", None)
-
-            if _rows_per_epoch_meta is not None and _rows_per_epoch_meta > 0:
-                # Use the value saved by preprocessing — most reliable
-                per_epoch_patch_rows = int(_rows_per_epoch_meta)
-                n_epochs_detected    = int(round(_actual_patch_rows / per_epoch_patch_rows))
-                if n_epochs_detected < 1:
-                    n_epochs_detected = 1
-                is_multi_epoch = (n_epochs_detected > 1)
+            if _use_stride_collapse:
+                # Stride-aware: per-epoch canvas heights differ from patch_rows*H
+                _ep_canvas_h_list = [
+                    max(1, (int(r) - 1) * _stride + H) for r in _all_grid_rows
+                ]
+                n_epochs_detected  = len(_all_grid_rows)
+                is_multi_epoch     = n_epochs_detected > 1
+                _actual_patch_rows = sum(_all_grid_rows)
+                _actual_patch_cols = (
+                    (ens_mosaic.shape[1] - W) // _stride + 1
+                    if _stride > 0 else ens_mosaic.shape[1] // W
+                )
                 logger.info(
-                    f"  Multi-epoch detection (metadata): "
-                    f"rows_per_epoch={per_epoch_patch_rows}, "
-                    f"total_patch_rows={_actual_patch_rows}, "
-                    f"n_epochs={n_epochs_detected}"
+                    f"  Multi-epoch detection (stride-aware): "
+                    f"n_epochs={n_epochs_detected}, stride={_stride}, "
+                    f"ep_canvas_heights={_ep_canvas_h_list}"
                 )
             else:
-                # Fallback: infer from aspect ratio (only reliable when each
-                # epoch's patch grid is approximately square)
-                _aspect = _actual_patch_rows / max(_actual_patch_cols, 1)
-                is_multi_epoch = _aspect > 4
-                if is_multi_epoch:
-                    n_epochs_detected    = int(round(_aspect))
-                    per_epoch_patch_rows = _actual_patch_rows // max(n_epochs_detected, 1)
-                    logger.warning(
-                        f"  Multi-epoch detection (aspect-ratio fallback): "
-                        f"aspect={_aspect:.2f}, n_epochs={n_epochs_detected}, "
-                        f"rows_per_epoch={per_epoch_patch_rows}.  "
-                        f"Supply patch_grid_rows_per_epoch in metadata for accuracy."
+                # ── Legacy: no stride info — infer epoch structure from metadata
+                # or aspect ratio.  The heuristic is unreliable when the per-epoch
+                # grid is non-square (e.g. 16r×16c gives aspect=1 and looks like
+                # single-epoch, while 8r×16c stacked 10× gives aspect=5 but
+                # per_epoch_patch_rows should be 8, not 16//5=3).
+                _ep_canvas_h_list  = None
+                _actual_patch_rows = ens_mosaic.shape[0] // H
+                _actual_patch_cols = ens_mosaic.shape[1] // W if W > 0 else 1
+
+                _rows_per_epoch_meta = getattr(self, "_rows_per_epoch", None)
+                _n_epochs_meta       = getattr(self, "_n_epochs", None)
+
+                if _rows_per_epoch_meta is not None and _rows_per_epoch_meta > 0:
+                    per_epoch_patch_rows = int(_rows_per_epoch_meta)
+                    n_epochs_detected    = int(round(_actual_patch_rows / per_epoch_patch_rows))
+                    if n_epochs_detected < 1:
+                        n_epochs_detected = 1
+                    is_multi_epoch = (n_epochs_detected > 1)
+                    logger.info(
+                        f"  Multi-epoch detection (metadata): "
+                        f"rows_per_epoch={per_epoch_patch_rows}, "
+                        f"total_patch_rows={_actual_patch_rows}, "
+                        f"n_epochs={n_epochs_detected}"
                     )
                 else:
-                    n_epochs_detected    = 1
-                    per_epoch_patch_rows = _actual_patch_rows
+                    _aspect = _actual_patch_rows / max(_actual_patch_cols, 1)
+                    is_multi_epoch = _aspect > 4
+                    if is_multi_epoch:
+                        n_epochs_detected    = int(round(_aspect))
+                        per_epoch_patch_rows = _actual_patch_rows // max(n_epochs_detected, 1)
+                        logger.warning(
+                            f"  Multi-epoch detection (aspect-ratio fallback): "
+                            f"aspect={_aspect:.2f}, n_epochs={n_epochs_detected}, "
+                            f"rows_per_epoch={per_epoch_patch_rows}.  "
+                            f"Supply patch_grid_rows_per_epoch in metadata for accuracy."
+                        )
+                    else:
+                        n_epochs_detected    = 1
+                        per_epoch_patch_rows = _actual_patch_rows
 
-            per_epoch_px_rows = per_epoch_patch_rows * H
+            # Compute per-epoch pixel row height used by _collapse_epochs
+            if _use_stride_collapse:
+                # Each epoch may have a different canvas height; the first is
+                # used as the reference for the uniform slice size (they are all
+                # padded to _max_ep_h inside _mosaic_patches).
+                per_epoch_px_rows = max(_ep_canvas_h_list)
+            else:
+                per_epoch_px_rows = per_epoch_patch_rows * H
             total_px_rows     = ens_mosaic.shape[0]
             total_px_cols     = ens_mosaic.shape[1]
 
             if is_multi_epoch:
+                _log_patch_rows = (
+                    f"ep_canvas_heights={_ep_canvas_h_list}"
+                    if _use_stride_collapse
+                    else f"{per_epoch_patch_rows} patch-rows"
+                )
                 logger.info(
                     f"  Multi-epoch mosaic detected: {n_epochs_detected} epochs × "
-                    f"{per_epoch_patch_rows} patch-rows × {_actual_patch_cols} patch-cols "
+                    f"{_log_patch_rows} × {_actual_patch_cols} patch-cols "
                     f"({per_epoch_px_rows}px tall per epoch).  "
                     f"Collapsing to a single trend map via nanmean …"
                 )
@@ -695,8 +928,7 @@ class InferenceDiagnosticsPlotter:
                     tgt_arr = np.asarray(targets)
                     if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
                         tgt_arr = tgt_arr[:, 0]
-                    tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
-                                                      patch_positions=patch_positions)
+                    tgt_mosaic = _mosaic(tgt_arr)
                     tgt_mean, _, _ = _collapse_epochs(tgt_mosaic)
                     err_mean  = ens_mean - tgt_mean
                     err_abs   = max(float(np.nanpercentile(np.abs(err_mean), 98)), 1e-6)
@@ -766,8 +998,7 @@ class InferenceDiagnosticsPlotter:
                     tgt_arr = np.asarray(targets)
                     if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
                         tgt_arr = tgt_arr[:, 0]
-                    tgt_mosaic = self._mosaic_patches(tgt_arr, grid_cols=grid_cols,
-                                                      patch_positions=patch_positions)
+                    tgt_mosaic = _mosaic(tgt_arr)
                     err_mosaic = ens_mosaic - tgt_mosaic
                     err_abs    = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
                     norm_err   = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
@@ -784,8 +1015,13 @@ class InferenceDiagnosticsPlotter:
                                  bbox=dict(boxstyle="round,pad=0.2",
                                            facecolor="black", alpha=0.5))
 
-                actual_rows = ens_mosaic.shape[0] // H
-                actual_cols = ens_mosaic.shape[1] // W
+                # Report meaningful patch counts regardless of stride/H step
+                if _stride is not None and _stride > 0 and _stride != H:
+                    actual_cols = (ens_mosaic.shape[1] - W) // _stride + 1
+                    actual_rows = (ens_mosaic.shape[0] - H) // _stride + 1
+                else:
+                    actual_rows = ens_mosaic.shape[0] // H
+                    actual_cols = ens_mosaic.shape[1] // W
                 fig.suptitle(
                     f"Inference – Full Study-Area Mosaic  "
                     f"({N_total} patches → {actual_rows}×{actual_cols} grid, "
@@ -2339,16 +2575,16 @@ class PostProcessor:
         n_below = (lst_map < self.config["temp_min"]).sum()
         n_above = (lst_map > self.config["temp_max"]).sum()
         
-        if n_below + n_above > 0:
-            logger.info(f"Clipping {n_below + n_above} pixels to "
-                       f"[{self.config['temp_min']}, {self.config['temp_max']}]°C")
+        # if n_below + n_above > 0:
+        #     logger.info(f"Clipping {n_below + n_above} pixels to "
+        #                f"[{self.config['temp_min']}, {self.config['temp_max']}]°C")
         
         return np.clip(lst_map, self.config["temp_min"], self.config["temp_max"])
     
     def process(self, lst_map: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         """Apply full post-processing pipeline"""
-        logger.info("Post-processing LST predictions...")
-        logger.info(f"  Input: mean={lst_map.mean():.2f}°C, std={lst_map.std():.2f}°C")
+        # logger.info("Post-processing LST predictions...")
+        # logger.info(f"  Input: mean={lst_map.mean():.2f}°C, std={lst_map.std():.2f}°C")
         
         processed = self.fill_nodata(lst_map, mask)
         # Bilateral filter deliberately skipped: it reduces spatial variance
@@ -2356,8 +2592,8 @@ class PostProcessor:
         # Call apply_bilateral_filter() explicitly only for visualization output.
         processed = self.clip_values(processed)
         
-        logger.info(f"  Output: mean={processed.mean():.2f}°C, std={processed.std():.2f}°C")
-        logger.info("✓ Post-processing complete")
+        # logger.info(f"  Output: mean={processed.mean():.2f}°C, std={processed.std():.2f}°C")
+        # logger.info("✓ Post-processing complete")
         
         return processed
 
