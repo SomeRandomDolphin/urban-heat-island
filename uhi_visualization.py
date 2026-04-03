@@ -28,6 +28,51 @@ sys.stderr.reconfigure(encoding="utf-8")
 logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
+
+def _safe_kde(data: np.ndarray, x_grid: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Evaluate a Gaussian KDE on x_grid, returning None if the data have
+    near-zero variance (which makes gaussian_kde raise LinAlgError) or
+    contain inf/NaN values that would propagate into the KDE bandwidth matrix.
+    Callers should skip the KDE line when None is returned.
+    """
+    flat = np.asarray(data, dtype=np.float64).ravel()
+    flat = flat[np.isfinite(flat)]
+    if flat.std() < 1e-6 or len(flat) < 2:
+        logger.warning("_safe_kde: data has near-zero variance or too few points — skipping KDE")
+        return None
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    x_grid = x_grid[np.isfinite(x_grid)]
+    if len(x_grid) == 0:
+        return None
+    try:
+        return stats.gaussian_kde(flat)(x_grid)
+    except Exception as _e:
+        logger.warning(f"_safe_kde: gaussian_kde failed ({_e}) — skipping KDE")
+        return None
+
+
+def _safe_kde_2d(x: np.ndarray, y: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Evaluate a 2-D Gaussian KDE for density-coloured scatterplots.
+    Returns None when the data are degenerate (singular covariance) or
+    contain non-finite values.
+    """
+    try:
+        x = np.asarray(x, dtype=np.float64).ravel()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
+        # Guard: both dimensions need variance
+        if x.std() < 1e-6 or y.std() < 1e-6:
+            raise ValueError("Near-zero variance in one dimension")
+        xy = np.vstack([x, y])
+        return stats.gaussian_kde(xy)(xy)
+    except Exception as _e:
+        logger.warning(f"_safe_kde_2d: 2-D KDE failed ({_e}) — falling back to uniform density")
+        return None
+
+
 # ─── Shared style ─────────────────────────────────────────────────────────────
 _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
@@ -425,16 +470,19 @@ class UHIVisualizer:
         # ── [0,1] Histogram with bimodal analysis ─────────────────────────────
         ax = axes[0, 1]
         flat_clip = flat[flat <= p98]
+        if flat_clip.size == 0:
+            flat_clip = flat  # fallback: use all values if filter produced empty array
         ax.hist(flat_clip, bins=80, color="#fc8d59", edgecolor="none",
                 density=True, alpha=0.75)
-        kde = stats.gaussian_kde(flat_clip)
         x_k = np.linspace(flat_clip.min(), flat_clip.max(), 500)
-        kde_vals = kde(x_k)
-        ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(flat_clip, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
 
         # find local maxima (modes) — bimodal indicator
         from scipy.signal import find_peaks
-        peaks, props = find_peaks(kde_vals, prominence=kde_vals.max() * 0.1,
+        peaks, props = find_peaks(kde_vals if kde_vals is not None else np.array([]),
+                                  prominence=(kde_vals.max() * 0.1 if kde_vals is not None else 0),
                                   distance=10)
         for pk in peaks:
             ax.axvline(x_k[pk], color='darkred', lw=1.2, ls=':',
@@ -457,31 +505,43 @@ class UHIVisualizer:
         ax = axes[1, 0]
         pred_flat = predictions.ravel()
         unc_flat  = uncertainty.ravel()
-        # use only non-outlier points for the scatter
-        valid = unc_flat <= anom_thr
+        # use only non-outlier, finite points for the scatter
+        valid = (unc_flat <= anom_thr) & np.isfinite(unc_flat) & np.isfinite(pred_flat)
         pf, uf = pred_flat[valid], unc_flat[valid]
-        idx = np.random.choice(len(pf), min(8000, len(pf)), replace=False)
-        from scipy.stats import gaussian_kde as gkde
-        xy = np.vstack([pf[idx], uf[idx]])
-        density = gkde(xy)(xy)
-        sc = ax.scatter(pf[idx], uf[idx], c=density, cmap="plasma",
-                        s=5, alpha=0.6)
-        fig.colorbar(sc, ax=ax, label="Density")
-        r_p, _  = stats.pearsonr(pf[idx], uf[idx])
-        r_s, _  = stats.spearmanr(pf[idx], uf[idx])
-        ax.set_xlabel("Predicted LST (°C)")
-        ax.set_ylabel("Uncertainty σ (°C)")
-        ax.set_title(f"LST vs Uncertainty\n"
-                     f"Pearson r={r_p:.3f}  Spearman ρ={r_s:.3f}")
-        ax.grid(True, alpha=0.3)
-        # flag high-uncertainty / high-LST regime
-        high_unc = uf > np.percentile(uf, 90)
-        high_lst = pf > np.percentile(pf, 90)
-        n_both   = int((high_unc & high_lst).sum())
-        ax.text(0.02, 0.97,
-                f"High-σ & high-LST pixels: {n_both} ({n_both/len(pf)*100:.1f}%)",
-                transform=ax.transAxes, va='top', fontsize=8,
-                bbox=dict(fc='white', ec='grey', alpha=0.8))
+
+        if len(pf) < 2:
+            # Not enough data after filtering — skip scatter, show a notice
+            ax.text(0.5, 0.5, "Insufficient valid points\nfor scatter plot",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=10,
+                    color='grey')
+            ax.set_title("LST vs Uncertainty\n(insufficient data)")
+            ax.set_xlabel("Predicted LST (°C)")
+            ax.set_ylabel("Uncertainty σ (°C)")
+        else:
+            idx = np.random.choice(len(pf), min(8000, len(pf)), replace=False)
+            density = _safe_kde_2d(pf[idx], uf[idx])
+            sc = ax.scatter(pf[idx], uf[idx],
+                            c=density if density is not None else uf[idx],
+                            cmap="plasma", s=5, alpha=0.6)
+            fig.colorbar(sc, ax=ax, label="Density")
+            if len(pf[idx]) >= 2:
+                r_p, _ = stats.pearsonr(pf[idx], uf[idx])
+                r_s, _ = stats.spearmanr(pf[idx], uf[idx])
+            else:
+                r_p = r_s = float('nan')
+            ax.set_xlabel("Predicted LST (°C)")
+            ax.set_ylabel("Uncertainty σ (°C)")
+            ax.set_title(f"LST vs Uncertainty\n"
+                         f"Pearson r={r_p:.3f}  Spearman ρ={r_s:.3f}")
+            ax.grid(True, alpha=0.3)
+            # flag high-uncertainty / high-LST regime
+            high_unc = uf > np.percentile(uf, 90)
+            high_lst = pf > np.percentile(pf, 90)
+            n_both   = int((high_unc & high_lst).sum())
+            ax.text(0.02, 0.97,
+                    f"High-σ & high-LST pixels: {n_both} ({n_both/len(pf)*100:.1f}%)",
+                    transform=ax.transAxes, va='top', fontsize=8,
+                    bbox=dict(fc='white', ec='grey', alpha=0.8))
 
         # ── [1,1] 95% CI width map — capped ───────────────────────────────────
         ax = axes[1, 1]
@@ -700,8 +760,9 @@ class UHIVisualizer:
         fig.suptitle("Urban vs Rural LST Comparison", fontsize=15, fontweight="bold")
 
         t_stat, p_val = stats.ttest_ind(u_vals, r_vals, equal_var=False)
-        d_cohen = (u_vals.mean() - r_vals.mean()) / np.sqrt(
-            (u_vals.std()**2 + r_vals.std()**2) / 2)
+        _pooled_std = np.sqrt((u_vals.std()**2 + r_vals.std()**2) / 2)
+        d_cohen = ((u_vals.mean() - r_vals.mean()) / _pooled_std
+                   if _pooled_std > 1e-8 else float("nan"))
 
         # ── [0,0] Violin ───────────────────────────────────────────────────────
         ax = fig.add_subplot(gs[0, 0])
@@ -738,9 +799,10 @@ class UHIVisualizer:
                                (u_vals, "#d6604d", "Urban")]:
             ax.hist(vals, bins=60, color=col, density=True,
                     alpha=0.35, edgecolor="none", label=f"{lbl} hist")
-            kde = stats.gaussian_kde(vals)
             x_k = np.linspace(vals.min(), vals.max(), 400)
-            ax.plot(x_k, kde(x_k), color=col, lw=2, label=f"{lbl} KDE")
+            kde_vals = _safe_kde(vals, x_k)
+            if kde_vals is not None:
+                ax.plot(x_k, kde_vals, color=col, lw=2, label=f"{lbl} KDE")
         ax.set_xlabel("LST (°C)")
         ax.set_ylabel("Density")
         ax.set_title("KDE Overlay")
@@ -834,15 +896,25 @@ class UHIVisualizer:
         # ── left: final weights pie ────────────────────────────────────────────
         ax = axes[0]
         if final_weights:
-            keys  = list(final_weights.keys())
-            vals  = [final_weights[k] for k in keys]
+            # Filter to numeric-only entries — 'cnn_residual' mode string causes ValueError
+            numeric_weights = {k: v for k, v in final_weights.items()
+                               if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            keys  = list(numeric_weights.keys())
+            vals  = [numeric_weights[k] for k in keys]
             cols  = ["#4393c3", "#d6604d", "#66c2a5"][:len(keys)]
-            wedges, texts, autos = ax.pie(
-                vals, labels=keys, colors=cols,
-                autopct="%1.2f%%", startangle=90,
-                wedgeprops=dict(edgecolor="white", lw=2))
-            for at in autos:
-                at.set_fontsize(10)
+            if keys and sum(vals) > 0:
+                wedges, texts, autos = ax.pie(
+                    vals, labels=keys, colors=cols,
+                    autopct="%1.2f%%", startangle=90,
+                    wedgeprops=dict(edgecolor="white", lw=2))
+                for at in autos:
+                    at.set_fontsize(10)
+            else:
+                mode_note = final_weights.get("mode", "")
+                ax.text(0.5, 0.5,
+                        f"Non-numeric weights\n({mode_note or 'cnn_residual mode'})",
+                        ha="center", va="center", transform=ax.transAxes, fontsize=10)
+                ax.axis("off")
             ax.set_title("Final Ensemble Weights")
         else:
             ax.text(0.5, 0.5, "No weight data", ha="center", va="center",
@@ -959,9 +1031,10 @@ class UHIVisualizer:
         flat = err.ravel()
         ax.hist(flat, bins=80, color="#92c5de", edgecolor="none",
                 density=True, alpha=0.75, label="Pixel errors")
-        kde = stats.gaussian_kde(flat)
         x_k = np.linspace(flat.min(), flat.max(), 400)
-        ax.plot(x_k, kde(x_k), color="#b2182b", lw=2, label="KDE")
+        kde_vals = _safe_kde(flat, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
         mu, sigma = flat.mean(), flat.std()
         ax.plot(x_k, stats.norm.pdf(x_k, mu, sigma),
                 color="grey", lw=1.5, ls="--", label="Normal fit")
@@ -1145,9 +1218,10 @@ class UHIVisualizer:
         flat = uhi_map.ravel()
         ax.hist(flat, bins=80, color="#4393c3", density=True,
                 alpha=0.7, edgecolor="none")
-        kde = stats.gaussian_kde(flat)
         x_k = np.linspace(flat.min(), flat.max(), 400)
-        ax.plot(x_k, kde(x_k), color="#b2182b", lw=2)
+        kde_vals = _safe_kde(flat, x_k)
+        if kde_vals is not None:
+            ax.plot(x_k, kde_vals, color="#b2182b", lw=2)
         for thr, col in [(0, "#99d594"), (2, "#fc8d59"), (3, "#d53e4f")]:
             ax.axvline(thr, color=col, lw=1.3, ls="--")
         ax.set_xlabel("UHI (°C)"); ax.set_ylabel("Density")

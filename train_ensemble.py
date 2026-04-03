@@ -166,7 +166,8 @@ class DiagnosticsPlotter:
             ax = axes[0, 1]
             if history["cnn_metrics"]:
                 r2_scores = [m["r2"] for m in history["cnn_metrics"]]
-                ax.plot(epochs, r2_scores, label="Val R²", color="#4CAF50")
+                r2_epochs = range(1, len(r2_scores) + 1)  # FIX: use own range (may differ from train_loss length)
+                ax.plot(r2_epochs, r2_scores, label="Val R²", color="#4CAF50")
                 ax.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target (0.85)")
                 ax.set_title("CNN Validation R²"); ax.set_xlabel("Epoch"); ax.set_ylabel("R²")
                 ax.set_ylim([-0.1, 1.05]); ax.legend()
@@ -206,6 +207,10 @@ class DiagnosticsPlotter:
             mask    = np.isfinite(preds) & np.isfinite(targets)
             preds, targets = preds[mask], targets[mask]
 
+            if len(preds) < 2:
+                logger.warning(f"plot_pred_vs_actual: not enough finite samples ({len(preds)}), skipping")
+                plt.close()
+                return
             slope, intercept, r_val, *_ = linregress(targets, preds)
             residuals = preds - targets
 
@@ -438,8 +443,13 @@ class DiagnosticsPlotter:
                     return arr[:, :, :, 0]
                 return arr
 
-            P = _sq(preds_4d)[:n_samples]
-            T = _sq(targets_4d)[:n_samples]
+            P = _sq(preds_4d);  P = P[:min(n_samples, len(P))]
+            T = _sq(targets_4d); T = T[:min(n_samples, len(T))]
+            n_samples = min(len(P), len(T))  # FIX: clamp to available data
+            if n_samples == 0:
+                logger.warning("plot_spatial_error_map: no samples to plot")
+                return
+            P, T = P[:n_samples], T[:n_samples]
             E = P - T
 
             fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
@@ -449,8 +459,14 @@ class DiagnosticsPlotter:
                          fontsize=13, fontweight="bold")
 
             vmin = min(T.min(), P.min()); vmax = max(T.max(), P.max())
+            # FIX: TwoSlopeNorm requires vmin < vcenter < vmax; guard against degenerate range
             err_abs = max(np.abs(E).max(), 1e-6)
-            norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+            e_min, e_max = -err_abs, err_abs
+            if e_min >= 0:
+                e_min = -1e-6
+            if e_max <= 0:
+                e_max = 1e-6
+            norm_err = TwoSlopeNorm(vmin=e_min, vcenter=0, vmax=e_max)
 
             for i in range(n_samples):
                 axes[i, 0].imshow(T[i], vmin=vmin, vmax=vmax, cmap="hot")
@@ -569,7 +585,10 @@ class DiagnosticsPlotter:
             best_r2_row = max([(i, float(rows[i+1][1])) for i in range(3)],
                               key=lambda x: x[1])[0]
             for col in range(6):
-                tbl[best_r2_row + 1, col].set_facecolor("#C8E6C9")
+                try:
+                    tbl[best_r2_row + 1, col].set_facecolor("#C8E6C9")
+                except (KeyError, IndexError):
+                    pass  # FIX: guard against table indexing edge cases
             ax_tbl.set_title("Validation Metrics Comparison", fontsize=10, pad=4)
 
             # Weight pie
@@ -600,7 +619,8 @@ class DiagnosticsPlotter:
             ax_r2c = fig.add_subplot(gs[1, 2:])
             if history["cnn_metrics"]:
                 r2s = [m["r2"] for m in history["cnn_metrics"]]
-                ax_r2c.plot(epochs, r2s, color="#4CAF50", lw=1.5)
+                r2c_epochs = range(1, len(r2s) + 1)  # FIX: use cnn_metrics length, not train_loss length
+                ax_r2c.plot(r2c_epochs, r2s, color="#4CAF50", lw=1.5)
                 ax_r2c.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target")
                 ax_r2c.set_title("CNN Val R²"); ax_r2c.set_xlabel("Epoch")
                 ax_r2c.set_ylabel("R²"); ax_r2c.legend()
@@ -611,13 +631,15 @@ class DiagnosticsPlotter:
                 std_ratios = [m.get("std_ratio",  float("nan")) for m in history["cnn_metrics"]]
                 mbe_vals   = [m.get("mbe",        float("nan")) for m in history["cnn_metrics"]]
                 lrs        = history["lr"]
+                diag_epochs = range(1, len(history["cnn_metrics"]) + 1)  # FIX: use cnn_metrics length
                 for col_idx, (data, title, target, use_log) in enumerate(zip(
                         [slopes, std_ratios, mbe_vals, lrs],
                         ["Slope", "Std Ratio", "MBE (°C)", "Learning Rate"],
                         [1.0, 1.0, 0.0, None],
                         [False, False, False, True])):
                     ax_d = fig.add_subplot(gs[2, col_idx])
-                    ep_d = epochs if col_idx < 3 else range(1, len(lrs) + 1)
+                    # FIX: LR uses train_loss-length range; diagnostics use cnn_metrics range
+                    ep_d = range(1, len(lrs) + 1) if col_idx == 3 else diag_epochs
                     ax_d.plot(ep_d, data, lw=1.2, color="#FF7043")
                     if target is not None:
                         ax_d.axhline(target, color="green", ls="--", lw=0.9)
@@ -1165,20 +1187,20 @@ class EnsembleTrainer:
         if config["optimizer"] == "adamw":
             self.optimizer = optim.AdamW(
                 [
-                    {"params": cnn_model.enc1.parameters(),      "weight_decay": 1e-4},
-                    {"params": cnn_model.enc2.parameters(),      "weight_decay": 2e-4},
-                    {"params": cnn_model.enc3.parameters(),      "weight_decay": 3e-4},
-                    {"params": cnn_model.enc4.parameters(),      "weight_decay": 4e-4},
-                    {"params": cnn_model.bottleneck.parameters(),"weight_decay": 5e-4},
-                    {"params": cnn_model.dec4.parameters(),      "weight_decay": 4e-4},
-                    {"params": cnn_model.dec3.parameters(),      "weight_decay": 3e-4},
-                    {"params": cnn_model.dec2.parameters(),      "weight_decay": 2e-4},
-                    {"params": cnn_model.dec1.parameters(),      "weight_decay": 1e-4},
-                    {"params": cnn_model.output.parameters(),    "weight_decay": 5e-4},
+                    {"params": cnn_model.enc1.parameters(),      "weight_decay": 1e-3},
+                    {"params": cnn_model.enc2.parameters(),      "weight_decay": 2e-3},
+                    {"params": cnn_model.enc3.parameters(),      "weight_decay": 3e-3},
+                    {"params": cnn_model.enc4.parameters(),      "weight_decay": 4e-3},
+                    {"params": cnn_model.bottleneck.parameters(),"weight_decay": 5e-3},
+                    {"params": cnn_model.dec4.parameters(),      "weight_decay": 4e-3},
+                    {"params": cnn_model.dec3.parameters(),      "weight_decay": 3e-3},
+                    {"params": cnn_model.dec2.parameters(),      "weight_decay": 2e-3},
+                    {"params": cnn_model.dec1.parameters(),      "weight_decay": 1e-3},
+                    {"params": cnn_model.output.parameters(),    "weight_decay": 5e-3},
                 ],
                 lr=config["initial_lr"],
             )
-            logger.info("✓ Layer-wise weight decay: 1e-4 (enc1) → 5e-4 (bottleneck/output)")
+            logger.info("✓ Layer-wise weight decay: 1e-3 (enc1) → 5e-3 (bottleneck/output)")
         else:
             self.optimizer = optim.Adam(
                 cnn_model.parameters(),
@@ -1443,6 +1465,17 @@ class EnsembleTrainer:
             explained = pca.explained_variance_ratio_.sum()
             logger.info(f"  PCA variance explained: {explained*100:.1f}%  shape: train={bot_train.shape}, val={bot_val.shape}")
             self._pca = pca   # cache for inference
+
+            # Persist PCA so uhi_inference.py can apply the same projection
+            import joblib
+            _pca_path = getattr(self, '_save_dir', None)
+            if _pca_path is None:
+                _pca_path = MODEL_DIR
+            try:
+                joblib.dump(pca, Path(_pca_path) / "bottleneck_pca.pkl")
+                logger.info(f"  💾 Saved bottleneck PCA → {Path(_pca_path) / 'bottleneck_pca.pkl'}")
+            except Exception as _pe:
+                logger.warning(f"  ⚠️ Could not save bottleneck PCA: {_pe}")
 
         except Exception as _e:
             logger.warning(f"⚠️ CNN bottleneck extraction failed ({_e}); GBM will use hand-crafted features only")
@@ -1771,6 +1804,7 @@ class EnsembleTrainer:
         logger.info(f"CNN parameters: {count_parameters(self.cnn_model):,}")
         
         save_dir.mkdir(parents=True, exist_ok=True)
+        self._save_dir = save_dir  # expose to train_gbm so PCA is saved alongside models
         
         # Train GBM first (independent of CNN)
         gbm_metrics = self.train_gbm(X_train, y_train, X_val, y_val)
@@ -2065,8 +2099,23 @@ class EnsembleTrainer:
             elif key == "ensemble_metrics":
                 if isinstance(values, dict):
                     history_serializable[key] = {k: float(v) for k, v in values.items()}
-            else:
+            elif key == "ensemble_comparison":
+                # Dict[str, dict] — serialize each strategy's metrics as floats
+                if isinstance(values, dict):
+                    history_serializable[key] = {
+                        strategy: {k: float(v) for k, v in m.items()}
+                        for strategy, m in values.items()
+                    }
+            elif key == "weight_norms":
+                # List of floats — already handled correctly
                 history_serializable[key] = [float(v) for v in values]
+            else:
+                try:
+                    history_serializable[key] = [float(v) for v in values]
+                except (TypeError, ValueError):
+                    # Skip keys that can't be trivially serialized
+                    logger.warning(f"_save_history: skipping non-serializable key '{key}'")
+                    continue
         
         with open(save_dir / "training_history.json", "w") as f:
             json.dump(history_serializable, f, indent=2)

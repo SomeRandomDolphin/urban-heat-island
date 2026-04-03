@@ -12,6 +12,13 @@ import logging
 from typing import Dict, Tuple, Optional, List
 import json
 import pickle
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend — safe for headless/Windows runs
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import TwoSlopeNorm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 from config import *
 from models import UNet
@@ -21,6 +28,1597 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INFERENCE DIAGNOSTIC PLOTTING MODULE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class InferenceDiagnosticsPlotter:
+    """
+    Centralised matplotlib diagnostics for the UHI inference pipeline.
+
+    Mirrors the DiagnosticsPlotter style from train_ensemble.py, but is focused
+    on inference-time concerns: prediction distributions, spatial output maps,
+    uncertainty visualisation, calibration analysis, TTA variance, and
+    model agreement between CNN and GBM branches.
+
+    All figures are saved under `save_dir`
+    (default: MODEL_DIR / "inference_diagnostics").
+
+    Usage::
+
+        plotter = InferenceDiagnosticsPlotter()
+        plotter.plot_all(results, X, targets=y_test)   # full suite
+        # — or call individual plot_* methods as needed —
+    """
+
+    _STYLE_CANDIDATES = [
+        "seaborn-v0_8-darkgrid",   # matplotlib ≥ 3.6
+        "seaborn-darkgrid",        # matplotlib < 3.6
+        "ggplot",
+        "default",
+    ]
+
+    def __init__(self, save_dir: Path = None, grid_cols: int = None):
+        self.save_dir = Path(save_dir) if save_dir else MODEL_DIR / "inference_diagnostics"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._style = self._resolve_style()
+        self._grid_cols = grid_cols   # patch grid columns — set via set_grid_cols() or here
+        self._rows_per_epoch = None   # single-epoch patch row count (None = unknown)
+        self._n_epochs = None         # number of temporal epochs (None = unknown)
+        self._stride = None           # pixel stride used during patch extraction (None → H fallback)
+        self._all_grid_rows = None    # list of per-epoch row counts for stride-aware mosaic
+        logger.info(
+            f"📊 InferenceDiagnosticsPlotter initialised — "
+            f"style='{self._style}' → {self.save_dir}"
+        )
+
+    def set_grid_cols(self, grid_cols: int) -> None:
+        """
+        Tell the plotter how many patch columns are in the study-area grid.
+        Must be set BEFORE plot_spatial_predictions / plot_all is called,
+        otherwise the full-area mosaic (03b) will use a sqrt fallback that
+        produces a jumbled checkerboard.
+
+        Typically called from the pipeline manager::
+
+            predictor.plotter.set_grid_cols(args.patch_grid_cols)
+        """
+        self._grid_cols = grid_cols
+        logger.info(f"  InferenceDiagnosticsPlotter: grid_cols set to {grid_cols}")
+
+    def set_patch_positions(self, patch_positions: np.ndarray) -> None:
+        """
+        Supply per-patch spatial grid positions so the mosaic assembler can
+        place each patch at its original (grid_row, grid_col) cell even after
+        QC filtering removed some patches from the full grid.
+
+        Args:
+            patch_positions: (N, 2) int32 array of (grid_row, grid_col).
+                             Loaded from ``patch_positions.npy`` saved by the
+                             preprocessing pipeline alongside ``X.npy``.
+                             Rows with value -1 denote patches without spatial
+                             metadata (legacy mode) and are placed sequentially.
+
+        Typically called from the pipeline manager::
+
+            pos = np.load(test_dir / "patch_positions.npy")
+            predictor.plotter.set_patch_positions(pos)
+        """
+        self._patch_positions = np.asarray(patch_positions, dtype=np.int32)
+        n_valid = int(np.any(self._patch_positions >= 0, axis=1).sum())
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: patch_positions set "
+            f"({n_valid}/{len(self._patch_positions)} patches have valid positions)"
+        )
+
+    def set_rows_per_epoch(self, rows_per_epoch: int, n_epochs: int = None) -> None:
+        """
+        Supply the authoritative per-epoch patch row count from dataset metadata.
+
+        This is the number of patch ROWS in a single temporal epoch's spatial
+        grid.  When the dataset spans multiple epochs, the mosaic's total patch
+        rows = n_epochs × rows_per_epoch.  Providing this value allows
+        _collapse_epochs to slice the tall mosaic correctly rather than
+        inferring the slice height from the aspect ratio (which is fragile
+        when the per-epoch grid is non-square or the aspect ratio is not an
+        integer multiple of rows_per_epoch).
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+
+        Args:
+            rows_per_epoch: Number of patch rows per epoch (from metadata key
+                            ``patch_grid_rows_per_epoch``).
+            n_epochs:       Total number of temporal epochs.  Optional — used
+                            only for logging and as a safety-check on the
+                            slice count.
+        """
+        self._rows_per_epoch = int(rows_per_epoch)
+        self._n_epochs = int(n_epochs) if n_epochs is not None else None
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: rows_per_epoch={self._rows_per_epoch}"
+            + (f", n_epochs={self._n_epochs}" if self._n_epochs else "")
+        )
+
+    def set_stride(self, stride: int) -> None:
+        """
+        Supply the pixel stride used during patch extraction in preprocessing.
+
+        This MUST match the ``stride`` argument passed to ``extract_patches()``
+        (typically 24 for a 64-px patch with 40-px overlap).  When set, the
+        mosaic assembler places patches at ``grid_row * stride`` / ``grid_col *
+        stride`` pixel offsets and blends overlapping regions with a Hann window
+        — exactly mirroring ``plot_lst_mosaic_reconstruction`` in preprocessing.
+
+        Without this, patches are placed at ``grid_row * H`` / ``grid_col * W``
+        (no overlap), which produces the jumbled block artefact seen in 03b.
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+        """
+        self._stride = int(stride)
+        logger.info(f"  InferenceDiagnosticsPlotter: patch stride set to {self._stride}")
+
+    def set_all_grid_rows(self, all_grid_rows: list) -> None:
+        """
+        Supply the complete per-epoch patch-row counts from dataset metadata.
+
+        This is the ``patch_grid_rows_per_epoch_list`` list saved by preprocessing
+        (one entry per non-empty epoch).  When present, the stride-aware mosaic
+        builder uses these counts to compute per-epoch canvas heights and to
+        recover local grid_row from the global (offset) grid_row stored in
+        patch_positions — exactly mirroring the preprocessing diagnostic.
+
+        Must be called BEFORE plot_spatial_predictions / plot_all.
+        """
+        self._all_grid_rows = [int(r) for r in all_grid_rows]
+        logger.info(
+            f"  InferenceDiagnosticsPlotter: all_grid_rows set "
+            f"({len(self._all_grid_rows)} epochs, totalling "
+            f"{sum(self._all_grid_rows)} patch-rows)"
+        )
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @classmethod
+    def _resolve_style(cls) -> str:
+        available = set(plt.style.available)
+        for style in cls._STYLE_CANDIDATES:
+            if style in available:
+                return style
+        return "default"
+
+    def _use_style(self):
+        try:
+            plt.style.use(self._style)
+        except Exception:
+            pass
+
+    def _save(self, fig, name: str):
+        path = self.save_dir / f"{name}.png"
+        try:
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            logger.info(f"  ✅ Saved: {path.name}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not save {path.name}: {e}")
+        finally:
+            plt.close(fig)
+
+    # ── 1. Prediction distribution ────────────────────────────────────────────
+
+    def plot_prediction_distribution(self, results: Dict[str, np.ndarray],
+                                     targets: np.ndarray = None):
+        """
+        Histogram of CNN, GBM and ensemble predictions (°C), optionally
+        overlaid with ground-truth targets.
+
+        Args:
+            results:  Output dict from EnsemblePredictor.predict_ensemble().
+            targets:  Optional ground-truth array for comparison overlay.
+        """
+        try:
+            self._use_style()
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            fig.suptitle("Inference – Prediction Distributions (°C)",
+                         fontsize=14, fontweight="bold")
+
+            series = [
+                ("CNN",      results.get("cnn_patch",      results.get("cnn")),      "#42A5F5"),
+                ("GBM",      results.get("gbm"),                                       "#EF5350"),
+                ("Ensemble", results.get("ensemble_patch", results.get("ensemble")), "#66BB6A"),
+            ]
+
+            for ax, (label, preds, color) in zip(axes, series):
+                if preds is None:
+                    ax.set_title(f"{label} (no data)"); continue
+                flat = np.asarray(preds).flatten()
+                flat = flat[np.isfinite(flat)]
+                ax.hist(flat, bins=60, color=color, alpha=0.75,
+                        density=True, edgecolor="white", linewidth=0.3,
+                        label=label)
+                if targets is not None:
+                    tgt = np.asarray(targets).flatten()
+                    tgt = tgt[np.isfinite(tgt)]
+                    ax.hist(tgt, bins=60, color="gray", alpha=0.45,
+                            density=True, edgecolor="white", linewidth=0.3,
+                            label="Target")
+                ax.axvline(float(np.nanmean(flat)), color=color,
+                           ls="--", lw=1.2, label=f"Mean {np.nanmean(flat):.1f}°C")
+                ax.set_xlabel("LST (°C)"); ax.set_ylabel("Density")
+                ax.set_title(label); ax.legend(fontsize=8)
+                ax.text(0.97, 0.97,
+                        f"mean={np.nanmean(flat):.2f}°C\nstd={np.nanstd(flat):.2f}°C\n"
+                        f"[{flat.min():.1f}, {flat.max():.1f}]",
+                        transform=ax.transAxes, fontsize=8,
+                        ha="right", va="top",
+                        bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            plt.tight_layout()
+            self._save(fig, "01_prediction_distribution")
+        except Exception as e:
+            logger.warning(f"plot_prediction_distribution failed: {e}")
+
+    # ── 2. Predicted vs Actual (when ground truth is available) ──────────────
+
+    def plot_pred_vs_actual(self, preds: np.ndarray, targets: np.ndarray,
+                            label: str = "Ensemble", metrics: dict = None):
+        """
+        Scatter + residual plot — identical contract to DiagnosticsPlotter.plot_pred_vs_actual
+        so the same call-site pattern works for both training and inference evaluation.
+        """
+        try:
+            from scipy.stats import linregress
+            self._use_style()
+
+            preds   = np.asarray(preds).flatten()
+            targets = np.asarray(targets).flatten()
+            mask    = np.isfinite(preds) & np.isfinite(targets)
+            preds, targets = preds[mask], targets[mask]
+
+            if len(preds) < 2:
+                logger.warning(f"plot_pred_vs_actual: only {len(preds)} finite samples, skipping")
+                return
+
+            slope, intercept, r_val, *_ = linregress(targets, preds)
+            residuals = preds - targets
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle(f"Inference – {label}: Predicted vs Actual",
+                         fontsize=14, fontweight="bold")
+
+            ax = axes[0]
+            sc = ax.scatter(targets, preds, alpha=0.35, s=12,
+                            c=np.abs(residuals), cmap="RdYlGn_r", label="Samples")
+            plt.colorbar(sc, ax=ax, label="|Residual| (°C)")
+            lo = min(targets.min(), preds.min()); hi = max(targets.max(), preds.max())
+            ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect (slope=1)")
+            fit_x = np.linspace(lo, hi, 200)
+            ax.plot(fit_x, slope * fit_x + intercept, "r-", lw=1.5,
+                    label=f"Fit slope={slope:.3f}")
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Predicted (°C)")
+            ax.legend(fontsize=8)
+            info = [f"R²={r_val**2:.4f}",
+                    f"RMSE={np.sqrt(np.mean(residuals**2)):.3f}°C",
+                    f"MAE={np.mean(np.abs(residuals)):.3f}°C",
+                    f"slope={slope:.3f}", f"intercept={intercept:.3f}"]
+            if metrics:
+                info += [f"std_ratio={metrics.get('std_ratio', float('nan')):.3f}",
+                         f"MBE={metrics.get('mbe', float('nan')):.3f}°C"]
+            ax.text(0.03, 0.97, "\n".join(info), transform=ax.transAxes,
+                    fontsize=8, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            ax = axes[1]
+            ax.scatter(targets, residuals, alpha=0.35, s=12, color="#5C6BC0")
+            ax.axhline(0, color="black", lw=1.2)
+            ax.axhline(+np.std(residuals), color="orange", ls="--", lw=0.9, label="±1σ")
+            ax.axhline(-np.std(residuals), color="orange", ls="--", lw=0.9)
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Residual (°C)")
+            ax.set_title("Residuals vs Actual"); ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"02_pred_vs_actual_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_pred_vs_actual failed: {e}")
+
+    # ── 3. Spatial output maps ────────────────────────────────────────────────
+
+    def plot_spatial_predictions(self, results: Dict[str, np.ndarray],
+                                 targets: np.ndarray = None,
+                                 n_samples: int = 4,
+                                 grid_cols: int = None,
+                                 patch_positions: np.ndarray = None):
+        """
+        Side-by-side spatial maps: CNN · GBM (broadcast) · Ensemble · Error (if targets given).
+
+        An additional figure (03b) shows the full mosaicked ensemble prediction
+        across all patches, giving a whole-area view of the inference result.
+
+        Args:
+            results:   Output dict from predict_ensemble().
+            targets:   Optional (N, H, W) ground-truth for error column.
+            n_samples: How many patches to display (rows) in the per-patch figure.
+            grid_cols: Number of patch columns in the spatial grid used during
+                       dataset creation.  MUST be supplied for a correct mosaic
+                       layout; omitting it triggers a sqrt fallback that jumbles
+                       patches unless the study area is square in patch count.
+        """
+        try:
+            self._use_style()
+            # Only override the stored grid_cols when the caller passes an explicit
+            # (non-None) value.  If grid_cols is None, preserve whatever was set
+            # earlier via set_grid_cols() — clobbering it with None is the root
+            # cause of the 03b mosaic falling back to the sqrt layout.
+            if grid_cols is not None:
+                self._grid_cols = grid_cols
+
+            ensemble = np.asarray(results.get("ensemble", results.get("ensemble_patch")))
+            cnn      = np.asarray(results.get("cnn"))
+            gbm      = np.asarray(results.get("gbm"))
+
+            # Ensure spatial shape (N, H, W)
+            def _to_spatial(arr):
+                arr = np.asarray(arr)
+                if arr.ndim == 4 and arr.shape[1] == 1:
+                    return arr[:, 0]
+                if arr.ndim == 4 and arr.shape[3] == 1:
+                    return arr[:, :, :, 0]
+                if arr.ndim == 3:
+                    return arr
+                return arr
+
+            ensemble = _to_spatial(ensemble)
+            cnn      = _to_spatial(cnn)
+
+            n = min(n_samples, len(ensemble))
+            if n == 0:
+                logger.warning("plot_spatial_predictions: no samples, skipping"); return
+
+            has_targets = targets is not None
+            n_cols = 4 if has_targets else 3
+            col_titles = ["CNN", "GBM (patch avg)", "Ensemble",
+                          "Error (Ensemble−Target)"][:n_cols]
+
+            fig, axes = plt.subplots(n, n_cols, figsize=(4 * n_cols, 3 * n))
+            if n == 1:
+                axes = axes[np.newaxis, :]
+            fig.suptitle(f"Inference – Spatial Predictions (first {n} patches)",
+                         fontsize=13, fontweight="bold")
+
+            vmin = ensemble[:n].min(); vmax = ensemble[:n].max()
+
+            for i in range(n):
+                # CNN
+                axes[i, 0].imshow(cnn[i], vmin=vmin, vmax=vmax, cmap="hot")
+                axes[i, 0].set_title(f"S{i+1} – {col_titles[0]}", fontsize=8)
+                axes[i, 0].axis("off")
+
+                # GBM broadcast
+                gbm_val = float(gbm[i]) if gbm.ndim == 1 else float(gbm[i].mean())
+                gbm_patch = np.full_like(cnn[i], gbm_val)
+                axes[i, 1].imshow(gbm_patch, vmin=vmin, vmax=vmax, cmap="hot")
+                axes[i, 1].set_title(f"S{i+1} – {col_titles[1]}\n{gbm_val:.1f}°C",
+                                     fontsize=8)
+                axes[i, 1].axis("off")
+
+                # Ensemble
+                axes[i, 2].imshow(ensemble[i], vmin=vmin, vmax=vmax, cmap="hot")
+                axes[i, 2].set_title(f"S{i+1} – {col_titles[2]}", fontsize=8)
+                axes[i, 2].axis("off")
+
+                # Error
+                if has_targets:
+                    tgt = _to_spatial(np.asarray(targets))
+                    err = ensemble[i] - tgt[i]
+                    err_abs = max(float(np.abs(err).max()), 1e-6)
+                    norm_err = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                    im = axes[i, 3].imshow(err, norm=norm_err, cmap="RdBu_r")
+                    axes[i, 3].set_title(
+                        f"S{i+1} – {col_titles[3]}\nRMSE={np.sqrt(np.mean(err**2)):.2f}°C",
+                        fontsize=8)
+                    axes[i, 3].axis("off")
+                    plt.colorbar(im, ax=axes[i, 3], shrink=0.8)
+
+            plt.tight_layout()
+            self._save(fig, "03_spatial_predictions")
+
+            # ── 03b: Full mosaicked map across ALL patches ────────────────────
+            self._plot_full_mosaic(ensemble, cnn, gbm, targets,
+                                       grid_cols=getattr(self, "_grid_cols", None),
+                                       patch_positions=getattr(self, "_patch_positions", None))
+
+        except Exception as e:
+            logger.warning(f"plot_spatial_predictions failed: {e}")
+
+    def _mosaic_patches(self, patches: np.ndarray,
+                        grid_cols: int = None,
+                        grid_rows: int = None,
+                        patch_positions: np.ndarray = None,
+                        stride: int = None,
+                        all_grid_rows: list = None) -> np.ndarray:
+        """
+        Assemble (N, H, W) patches into a single 2-D mosaic, correctly honouring
+        the *stride* used during patch extraction.
+
+        ROOT CAUSE OF THE JUMBLED MOSAIC (03b)
+        ───────────────────────────────────────
+        The old implementation placed patch ``i`` at pixel offset
+        ``grid_row * H`` / ``grid_col * W`` — treating each grid index as a
+        full, non-overlapping block.  But preprocessing extracts patches with
+        ``stride < H`` (default stride=24, patch_size=64), so adjacent patches
+        overlap by ``H - stride = 40 px``.  Using ``H`` as the step puts every
+        patch at the wrong pixel position, producing the characteristic
+        checkerboard / block-scramble seen in figure 03b.
+
+        CORRECT APPROACH (mirrors preprocessing's plot_lst_mosaic_reconstruction)
+        ──────────────────────────────────────────────────────────────────────────
+        1. Place patch at pixel (local_gr * stride, gc * stride).
+        2. Blend overlapping regions with a 2-D Hann window (weighted average).
+        3. For multi-epoch data: recover each patch's LOCAL grid_row by
+           subtracting the cumulative epoch row offset (prior_rows), then build
+           a per-epoch canvas at the correct height.
+        4. Stack per-epoch canvases and take the pixel-wise nanmean so the
+           returned mosaic has the spatial shape of ONE epoch — ready for the
+           _collapse_epochs logic in _plot_full_mosaic.
+
+        When ``stride`` is not supplied (e.g. legacy calls), falls back to the
+        old ``H``-step placement so existing single-epoch tests are unaffected.
+
+        Args:
+            patches:         (N, H, W) array of predictions.
+            grid_cols:       Authoritative column count from dataset metadata.
+            grid_rows:       Ignored when patch_positions is available.
+            patch_positions: (N, 2) int32 (global_grid_row, grid_col) per patch.
+            stride:          Pixel stride used during patch extraction.  MUST
+                             match the value used in preprocessing (default 24).
+                             When None, falls back to H-step (legacy behaviour).
+            all_grid_rows:   List of per-epoch row counts (from metadata key
+                             ``patch_grid_rows_per_epoch_list``).  Required for
+                             correct multi-epoch per-canvas reconstruction.
+
+        Multi-epoch note
+        ────────────────
+        Preprocessing offsets each epoch's grid_row by the cumulative row count
+        of all preceding epochs, so epoch 0 occupies global rows 0…R0-1, epoch 1
+        occupies R0…R0+R1-1, etc.  We recover the local row via
+        ``local_gr = global_gr - prior_rows`` and build a per-epoch canvas at
+        height ``(ep_grid_rows - 1) * stride + H``.  Canvases are stacked and
+        nanmean'd so the result has the height of one epoch's spatial extent.
+        """
+        N, H, W = patches.shape
+
+        # ── Stride-aware path ─────────────────────────────────────────────────
+        # Use when we have both patch_positions and a valid stride value.
+        _use_stride = (
+            stride is not None
+            and stride > 0
+            and stride != H          # stride == H means no overlap → same as legacy
+            and patch_positions is not None
+            and np.any(patch_positions >= 0)
+        )
+
+        if _use_stride:
+            pos = np.asarray(patch_positions, dtype=np.int32)
+            valid_mask = (pos[:, 0] >= 0) & (pos[:, 1] >= 0)
+
+            if not valid_mask.any():
+                _use_stride = False   # fall through to legacy path
+
+        if _use_stride:
+            # ── Resolve grid_cols ─────────────────────────────────────────────
+            _grid_cols = (int(grid_cols) if grid_cols is not None
+                          else int(pos[valid_mask, 1].max()) + 1)
+            if grid_cols is None:
+                logger.warning(
+                    f"  ⚠ _mosaic_patches(stride): grid_cols not supplied — "
+                    f"inferring cols={_grid_cols} from max patch_positions col. "
+                    f"Pass --patch-grid-cols for an authoritative value."
+                )
+
+            # ── Resolve epoch structure ───────────────────────────────────────
+            if all_grid_rows and len(all_grid_rows) > 0:
+                _all_grid_rows = [int(r) for r in all_grid_rows]
+            else:
+                # Infer from rows_per_epoch / n_epochs stored on self, or fall
+                # back to treating everything as one epoch.
+                _rpe = getattr(self, "_rows_per_epoch", None)
+                _ne  = getattr(self, "_n_epochs", None)
+                if _rpe and _ne:
+                    _all_grid_rows = [_rpe] * _ne
+                else:
+                    total_global_rows = int(pos[valid_mask, 0].max()) + 1
+                    _all_grid_rows = [total_global_rows]
+
+            n_epochs = len(_all_grid_rows)
+
+            # Epoch boundary offsets in global-row space
+            epoch_starts = np.zeros(n_epochs + 1, dtype=np.int64)
+            for ep, r in enumerate(_all_grid_rows):
+                epoch_starts[ep + 1] = epoch_starts[ep] + r
+
+            # 2-D Hann window for overlap blending
+            _hann_r = np.hanning(H).astype(np.float64)
+            _hann_c = np.hanning(W).astype(np.float64)
+            _patch_win = np.outer(_hann_r, _hann_c)   # (H, W)
+
+            # Per-epoch canvas sizes
+            _ep_canvas_h_list = [
+                max(1, (int(r) - 1) * stride + H) for r in _all_grid_rows
+            ]
+            _ep_canvas_w = max(1, (_grid_cols - 1) * stride + W)
+            _max_ep_h    = max(_ep_canvas_h_list)
+
+            # Map each patch to its epoch index via searchsorted on epoch_starts
+            global_rows = pos[:, 0].astype(np.int64)
+            patch_epoch = np.searchsorted(epoch_starts[1:], global_rows,
+                                          side='right').astype(np.int32)
+            patch_epoch = np.clip(patch_epoch, 0, n_epochs - 1)
+
+            slices = []
+            for ep in range(n_epochs):
+                ep_grid_rows = int(_all_grid_rows[ep])
+                ep_canvas_h  = _ep_canvas_h_list[ep]
+                prior_rows   = int(epoch_starts[ep])
+
+                acc_sum = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+                acc_wgt = np.zeros((ep_canvas_h, _ep_canvas_w), dtype=np.float64)
+
+                ep_mask    = (patch_epoch == ep) & valid_mask
+                ep_indices = np.where(ep_mask)[0]
+
+                for idx in ep_indices:
+                    global_gr = int(pos[idx, 0])
+                    gc        = int(pos[idx, 1])
+                    if gc < 0:
+                        continue
+                    local_gr = global_gr - prior_rows
+                    if local_gr < 0 or local_gr >= ep_grid_rows:
+                        continue
+                    r0 = local_gr * stride;  r1 = r0 + H
+                    c0 = gc       * stride;  c1 = c0 + W
+                    if r1 > ep_canvas_h or c1 > _ep_canvas_w:
+                        continue
+                    patch_data = patches[idx].astype(np.float64)
+                    finite     = np.isfinite(patch_data)
+                    w          = _patch_win * finite
+                    acc_sum[r0:r1, c0:c1] += np.where(finite, patch_data * w, 0.0)
+                    acc_wgt[r0:r1, c0:c1] += w
+
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ep_canvas = np.where(
+                        acc_wgt > 0,
+                        (acc_sum / acc_wgt).astype(np.float32),
+                        np.nan
+                    ).astype(np.float32)
+                del acc_sum, acc_wgt
+
+                # Pad shorter epochs to uniform shape for stacking
+                if ep_canvas.shape != (_max_ep_h, _ep_canvas_w):
+                    padded = np.full((_max_ep_h, _ep_canvas_w), np.nan, dtype=np.float32)
+                    h_c = min(ep_canvas.shape[0], _max_ep_h)
+                    w_c = min(ep_canvas.shape[1], _ep_canvas_w)
+                    padded[:h_c, :w_c] = ep_canvas[:h_c, :w_c]
+                    slices.append(padded)
+                else:
+                    slices.append(ep_canvas)
+
+            if not slices:
+                logger.warning("  ⚠ _mosaic_patches(stride): no epoch canvases built — falling back.")
+                _use_stride = False
+            else:
+                # Stack epochs vertically so _collapse_epochs can slice them
+                # exactly as it does for the legacy mosaic: epoch 0 occupies
+                # pixel rows 0…ep_h-1, epoch 1 occupies ep_h…2*ep_h-1, etc.
+                canvas = np.concatenate(slices, axis=0).astype(patches.dtype)
+                return canvas
+
+        # ── Legacy path: no stride or no patch_positions ──────────────────────
+        # Place patches at grid_row*H / grid_col*W (non-overlapping blocks).
+        # Still correct when stride == H (no overlap), and as a fallback when
+        # stride/positions are unavailable.
+
+        if patch_positions is not None and np.any(patch_positions >= 0):
+            valid_mask = (patch_positions[:, 0] >= 0) & (patch_positions[:, 1] >= 0)
+            if not valid_mask.any():
+                patch_positions = None
+            else:
+                rows = int(patch_positions[valid_mask, 0].max()) + 1
+                if grid_cols is not None:
+                    cols = int(grid_cols)
+                else:
+                    cols = int(patch_positions[valid_mask, 1].max()) + 1
+                    logger.warning(
+                        f"  ⚠ _mosaic_patches: grid_cols not supplied — inferring "
+                        f"cols={cols} from max patch_positions col index.  "
+                        f"If the test split is missing rightmost-column patches, "
+                        f"the mosaic will be one column too narrow.  "
+                        f"Pass --patch-grid-cols=<N> or ensure patch_grid_shape.npy "
+                        f"is present in the dataset directory to fix this."
+                    )
+
+        if patch_positions is None or not np.any(patch_positions >= 0):
+            if grid_cols is not None:
+                cols = int(grid_cols)
+                rows = int(np.ceil(N / cols))
+            elif grid_rows is not None:
+                rows = int(grid_rows)
+                cols = int(np.ceil(N / rows))
+            else:
+                cols = int(np.ceil(np.sqrt(N)))
+                rows = int(np.ceil(N / cols))
+                logger.warning(
+                    f"  ⚠ _mosaic_patches: no grid_cols or patch_positions supplied. "
+                    f"Falling back to sqrt layout ({rows}r × {cols}c for {N} patches). "
+                    f"This WILL jumble the mosaic unless the study area is square "
+                    f"in patch-count terms.  Provide patch_positions.npy or pass "
+                    f"--patch-grid-cols to avoid this."
+                )
+
+        canvas = np.full((rows * H, cols * W), np.nan, dtype=patches.dtype)
+
+        if patch_positions is not None and np.any(patch_positions >= 0):
+            out_of_bounds = 0
+            for idx in range(N):
+                gr, gc = int(patch_positions[idx, 0]), int(patch_positions[idx, 1])
+                if gr < 0 or gc < 0:
+                    continue
+                if gr >= rows or gc >= cols:
+                    out_of_bounds += 1
+                    continue
+                canvas[gr * H:(gr + 1) * H, gc * W:(gc + 1) * W] = patches[idx]
+            if out_of_bounds:
+                logger.warning(
+                    f"  ⚠ _mosaic_patches: {out_of_bounds} patches had positions "
+                    f"outside the canvas ({rows}r × {cols}c) and were skipped. "
+                    f"This usually means grid_cols is smaller than the true grid width."
+                )
+        else:
+            padded = np.full((rows * cols, H, W), np.nan, dtype=patches.dtype)
+            padded[:N] = patches
+            canvas = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+
+        return canvas
+
+    def _plot_full_mosaic(self, ensemble: np.ndarray, cnn: np.ndarray,
+                          gbm: np.ndarray, targets: np.ndarray = None,
+                          grid_cols: int = None,
+                          patch_positions: np.ndarray = None):
+        """
+        Figure 03b — full mosaicked inference result covering the entire study area.
+
+        Shows: Ensemble temporal mean · Inter-epoch spread · CNN temporal mean ·
+               Error mosaic (if targets given).
+
+        Args:
+            grid_cols:       Number of patch columns in the spatial grid.  Pass this
+                             from the dataset metadata or CLI arg to get a correct
+                             spatial layout.  None → sqrt fallback.
+            patch_positions: (N, 2) int array of (grid_row, grid_col) per patch.
+                             When supplied, QC-filtered gaps are correctly preserved
+                             as NaN rather than causing all subsequent patches to
+                             shift by one cell.
+
+        The mosaic assembler reads ``self._stride`` and ``self._all_grid_rows``
+        (set via ``set_stride()`` / ``set_all_grid_rows()`` in stage_inference).
+        When these are set, patches are placed at their correct overlapping-stride
+        pixel offsets and blended with a Hann window — fixing the jumbled block
+        artefact that occurs when stride < patch_size (the normal case).
+        """
+        try:
+            N_total = len(ensemble)
+            logger.info(f"  Mosaicking {N_total} patches for full-area map …")
+
+            H, W = ensemble.shape[1], ensemble.shape[2]
+
+            # Pull stride and per-epoch row list from instance state (set by
+            # stage_inference via set_stride() / set_all_grid_rows()).
+            _stride        = getattr(self, "_stride", None)
+            _all_grid_rows = getattr(self, "_all_grid_rows", None)
+
+            def _mosaic(arr):
+                return self._mosaic_patches(
+                    arr,
+                    grid_cols=grid_cols,
+                    patch_positions=patch_positions,
+                    stride=_stride,
+                    all_grid_rows=_all_grid_rows,
+                )
+
+            ens_mosaic = _mosaic(ensemble)
+            cnn_mosaic = _mosaic(cnn)
+
+            # GBM: broadcast per-patch scalar or per-patch spatial map
+            if gbm.ndim == 1:
+                gbm_tiles = np.stack([np.full((H, W), float(v)) for v in gbm])
+            else:
+                gbm_tiles = gbm
+            gbm_mosaic = _mosaic(gbm_tiles)
+
+            # ── Detect multi-epoch vertical stacking ──────────────────────────
+            # When the dataset spans multiple temporal epochs, _mosaic_patches
+            # stacks per-epoch canvases vertically.  We detect the number of
+            # epochs and the pixel height of each epoch's slice so that
+            # _collapse_epochs can take the nanmean across epochs.
+            #
+            # Two paths:
+            #   A) Stride-aware (preferred): _stride and _all_grid_rows are set.
+            #      Per-epoch canvas height = (ep_grid_rows - 1)*stride + H.
+            #   B) Legacy (fallback): use metadata rows_per_epoch or aspect ratio.
+            #      Per-epoch canvas height = per_epoch_patch_rows * H.
+            _use_stride_collapse = (
+                _stride is not None and _stride > 0 and _stride != H
+                and _all_grid_rows is not None and len(_all_grid_rows) > 0
+            )
+
+            if _use_stride_collapse:
+                # Stride-aware: per-epoch canvas heights differ from patch_rows*H
+                _ep_canvas_h_list = [
+                    max(1, (int(r) - 1) * _stride + H) for r in _all_grid_rows
+                ]
+                n_epochs_detected  = len(_all_grid_rows)
+                is_multi_epoch     = n_epochs_detected > 1
+                _actual_patch_rows = sum(_all_grid_rows)
+                _actual_patch_cols = (
+                    (ens_mosaic.shape[1] - W) // _stride + 1
+                    if _stride > 0 else ens_mosaic.shape[1] // W
+                )
+                logger.info(
+                    f"  Multi-epoch detection (stride-aware): "
+                    f"n_epochs={n_epochs_detected}, stride={_stride}, "
+                    f"ep_canvas_heights={_ep_canvas_h_list}"
+                )
+            else:
+                # ── Legacy: no stride info — infer epoch structure from metadata
+                # or aspect ratio.  The heuristic is unreliable when the per-epoch
+                # grid is non-square (e.g. 16r×16c gives aspect=1 and looks like
+                # single-epoch, while 8r×16c stacked 10× gives aspect=5 but
+                # per_epoch_patch_rows should be 8, not 16//5=3).
+                _ep_canvas_h_list  = None
+                _actual_patch_rows = ens_mosaic.shape[0] // H
+                _actual_patch_cols = ens_mosaic.shape[1] // W if W > 0 else 1
+
+                _rows_per_epoch_meta = getattr(self, "_rows_per_epoch", None)
+                _n_epochs_meta       = getattr(self, "_n_epochs", None)
+
+                if _rows_per_epoch_meta is not None and _rows_per_epoch_meta > 0:
+                    per_epoch_patch_rows = int(_rows_per_epoch_meta)
+                    n_epochs_detected    = int(round(_actual_patch_rows / per_epoch_patch_rows))
+                    if n_epochs_detected < 1:
+                        n_epochs_detected = 1
+                    is_multi_epoch = (n_epochs_detected > 1)
+                    logger.info(
+                        f"  Multi-epoch detection (metadata): "
+                        f"rows_per_epoch={per_epoch_patch_rows}, "
+                        f"total_patch_rows={_actual_patch_rows}, "
+                        f"n_epochs={n_epochs_detected}"
+                    )
+                else:
+                    _aspect = _actual_patch_rows / max(_actual_patch_cols, 1)
+                    is_multi_epoch = _aspect > 4
+                    if is_multi_epoch:
+                        n_epochs_detected    = int(round(_aspect))
+                        per_epoch_patch_rows = _actual_patch_rows // max(n_epochs_detected, 1)
+                        logger.warning(
+                            f"  Multi-epoch detection (aspect-ratio fallback): "
+                            f"aspect={_aspect:.2f}, n_epochs={n_epochs_detected}, "
+                            f"rows_per_epoch={per_epoch_patch_rows}.  "
+                            f"Supply patch_grid_rows_per_epoch in metadata for accuracy."
+                        )
+                    else:
+                        n_epochs_detected    = 1
+                        per_epoch_patch_rows = _actual_patch_rows
+
+            # Compute per-epoch pixel row height used by _collapse_epochs
+            if _use_stride_collapse:
+                # Each epoch may have a different canvas height; the first is
+                # used as the reference for the uniform slice size (they are all
+                # padded to _max_ep_h inside _mosaic_patches).
+                per_epoch_px_rows = max(_ep_canvas_h_list)
+            else:
+                per_epoch_px_rows = per_epoch_patch_rows * H
+            total_px_rows     = ens_mosaic.shape[0]
+            total_px_cols     = ens_mosaic.shape[1]
+
+            if is_multi_epoch:
+                _log_patch_rows = (
+                    f"ep_canvas_heights={_ep_canvas_h_list}"
+                    if _use_stride_collapse
+                    else f"{per_epoch_patch_rows} patch-rows"
+                )
+                logger.info(
+                    f"  Multi-epoch mosaic detected: {n_epochs_detected} epochs × "
+                    f"{_log_patch_rows} × {_actual_patch_cols} patch-cols "
+                    f"({per_epoch_px_rows}px tall per epoch).  "
+                    f"Collapsing to a single trend map via nanmean …"
+                )
+
+                def _collapse_epochs(mosaic: np.ndarray) -> tuple:
+                    """
+                    Split a tall multi-epoch mosaic into per-epoch slices and
+                    return (mean_map, std_map, epoch_slices).
+                    Each slice has shape (per_epoch_px_rows, total_px_cols).
+                    """
+                    slices = []
+                    for ep in range(n_epochs_detected):
+                        row_start = ep * per_epoch_px_rows
+                        row_end   = row_start + per_epoch_px_rows
+                        if row_end <= total_px_rows:
+                            slices.append(mosaic[row_start:row_end, :])
+                    if not slices:
+                        return mosaic, np.zeros_like(mosaic), []
+                    stack = np.stack(slices, axis=0)
+                    mean_map = np.nanmean(stack, axis=0)
+                    std_map  = np.nanstd(stack,  axis=0)
+                    return mean_map, std_map, slices
+
+                ens_mean, ens_std, ens_slices = _collapse_epochs(ens_mosaic)
+                cnn_mean, _,       _          = _collapse_epochs(cnn_mosaic)
+                gbm_mean, _,       _          = _collapse_epochs(gbm_mosaic)
+
+                # ── Figure 03b: collapsed temporal mean map ────────────────────
+                has_targets = targets is not None
+                n_fig_cols  = 4 if has_targets else 3   # mean-ens | std | cnn-mean | [err]
+                col_titles  = ["Ensemble – Temporal Mean", "Inter-epoch Spread (σ)",
+                               "CNN – Temporal Mean", "Error (Ens − Target)"][:n_fig_cols]
+
+                fig_w = max(14, 5 * n_fig_cols)
+                fig_h = max(6, int(fig_w * ens_mean.shape[0] /
+                                   (ens_mean.shape[1] * n_fig_cols)) + 3)
+                fig, axes = plt.subplots(1, n_fig_cols, figsize=(fig_w, fig_h))
+                if n_fig_cols == 1:
+                    axes = [axes]
+
+                vmin = float(np.nanpercentile(ens_mean, 2))
+                vmax = float(np.nanpercentile(ens_mean, 98))
+
+                # Panel 0 — ensemble temporal mean
+                im0 = axes[0].imshow(ens_mean, vmin=vmin, vmax=vmax,
+                                     cmap="RdYlBu_r", interpolation="bilinear",
+                                     origin="upper")
+                axes[0].set_title(col_titles[0], fontsize=10, fontweight="bold")
+                axes[0].axis("off")
+                cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+                cb0.set_label("LST (°C)", fontsize=8)
+                axes[0].text(
+                    0.02, 0.02,
+                    f"mean={np.nanmean(ens_mean):.1f}°C\n"
+                    f"std={np.nanstd(ens_mean):.2f}°C\n"
+                    f"[{np.nanmin(ens_mean):.1f}, {np.nanmax(ens_mean):.1f}]\n"
+                    f"n_epochs={n_epochs_detected}",
+                    transform=axes[0].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 1 — inter-epoch spread (std)
+                std_vmax = float(np.nanpercentile(ens_std, 98))
+                im1 = axes[1].imshow(ens_std, vmin=0, vmax=max(std_vmax, 0.1),
+                                     cmap="YlOrRd", interpolation="bilinear",
+                                     origin="upper")
+                axes[1].set_title(col_titles[1], fontsize=10, fontweight="bold")
+                axes[1].axis("off")
+                cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+                cb1.set_label("σ (°C)", fontsize=8)
+                axes[1].text(
+                    0.02, 0.02,
+                    f"mean σ={np.nanmean(ens_std):.2f}°C\n"
+                    f"max σ={np.nanmax(ens_std):.2f}°C",
+                    transform=axes[1].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 2 — CNN temporal mean
+                im2 = axes[2].imshow(cnn_mean, vmin=vmin, vmax=vmax,
+                                     cmap="RdYlBu_r", interpolation="bilinear",
+                                     origin="upper")
+                axes[2].set_title(col_titles[2], fontsize=10, fontweight="bold")
+                axes[2].axis("off")
+                cb2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+                cb2.set_label("LST (°C)", fontsize=8)
+                axes[2].text(
+                    0.02, 0.02,
+                    f"mean={np.nanmean(cnn_mean):.1f}°C\n"
+                    f"std={np.nanstd(cnn_mean):.2f}°C",
+                    transform=axes[2].transAxes, fontsize=7,
+                    color="white", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.55))
+
+                # Panel 3 — error vs targets (optional)
+                if has_targets:
+                    tgt_arr = np.asarray(targets)
+                    if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
+                        tgt_arr = tgt_arr[:, 0]
+                    tgt_mosaic = _mosaic(tgt_arr)
+                    tgt_mean, _, _ = _collapse_epochs(tgt_mosaic)
+                    err_mean  = ens_mean - tgt_mean
+                    err_abs   = max(float(np.nanpercentile(np.abs(err_mean), 98)), 1e-6)
+                    norm_err  = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                    im_err = axes[3].imshow(err_mean, norm=norm_err, cmap="RdBu_r",
+                                            interpolation="bilinear", origin="upper")
+                    axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
+                    axes[3].axis("off")
+                    cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
+                    cb_err.set_label("Error (°C)", fontsize=8)
+                    rmse_all = float(np.sqrt(np.nanmean(err_mean ** 2)))
+                    axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
+                                 transform=axes[3].transAxes, fontsize=7,
+                                 color="white", va="bottom",
+                                 bbox=dict(boxstyle="round,pad=0.2",
+                                           facecolor="black", alpha=0.55))
+
+                fig.suptitle(
+                    f"Inference – Temporal Mean Map  "
+                    f"({n_epochs_detected} epochs collapsed, "
+                    f"{_actual_patch_cols} patch-cols, "
+                    f"{ens_mean.shape[0]}×{ens_mean.shape[1]} px)",
+                    fontsize=12, fontweight="bold")
+                plt.tight_layout()
+                self._save(fig, "03b_full_mosaic_predictions")
+                logger.info(
+                    f"  ✅ Saved temporal mean map — collapsed {n_epochs_detected} "
+                    f"epochs into a single {ens_mean.shape[0]}×{ens_mean.shape[1]} px map."
+                )
+
+            else:
+                # ── Single-epoch or non-stacked mosaic: original rendering ─────
+                has_targets = targets is not None
+                n_fig_cols  = 4 if has_targets else 3
+                col_titles  = ["CNN", "GBM", "Ensemble",
+                               "Error (Ens − Target)"][:n_fig_cols]
+
+                fig_w = max(10, 5 * n_fig_cols)
+                fig_h = max(6, int(fig_w * ens_mosaic.shape[0] /
+                                   (ens_mosaic.shape[1] * n_fig_cols)) + 2)
+                fig, axes = plt.subplots(1, n_fig_cols, figsize=(fig_w, fig_h))
+                if n_fig_cols == 1:
+                    axes = [axes]
+
+                vmin = float(np.nanmin(ens_mosaic))
+                vmax = float(np.nanmax(ens_mosaic))
+
+                for ax, data, title in zip(axes[:3],
+                                           [cnn_mosaic, gbm_mosaic, ens_mosaic],
+                                           col_titles[:3]):
+                    im = ax.imshow(data, vmin=vmin, vmax=vmax, cmap="hot",
+                                   interpolation="bilinear", origin="upper")
+                    ax.set_title(title, fontsize=10, fontweight="bold")
+                    ax.axis("off")
+                    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    cb.set_label("LST (°C)", fontsize=8)
+                    ax.text(0.02, 0.02,
+                            f"mean={np.nanmean(data):.1f}°C\n"
+                            f"std={np.nanstd(data):.2f}°C\n"
+                            f"[{np.nanmin(data):.1f}, {np.nanmax(data):.1f}]",
+                            transform=ax.transAxes, fontsize=7,
+                            color="white", va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.2",
+                                      facecolor="black", alpha=0.5))
+
+                if has_targets:
+                    tgt_arr = np.asarray(targets)
+                    if tgt_arr.ndim == 4 and tgt_arr.shape[1] == 1:
+                        tgt_arr = tgt_arr[:, 0]
+                    tgt_mosaic = _mosaic(tgt_arr)
+                    err_mosaic = ens_mosaic - tgt_mosaic
+                    err_abs    = max(float(np.nanmax(np.abs(err_mosaic))), 1e-6)
+                    norm_err   = TwoSlopeNorm(vmin=-err_abs, vcenter=0, vmax=err_abs)
+                    im_err = axes[3].imshow(err_mosaic, norm=norm_err, cmap="RdBu_r",
+                                            interpolation="bilinear", origin="upper")
+                    axes[3].set_title(col_titles[3], fontsize=10, fontweight="bold")
+                    axes[3].axis("off")
+                    cb_err = plt.colorbar(im_err, ax=axes[3], fraction=0.046, pad=0.04)
+                    cb_err.set_label("Error (°C)", fontsize=8)
+                    rmse_all = float(np.sqrt(np.nanmean(err_mosaic ** 2)))
+                    axes[3].text(0.02, 0.02, f"RMSE={rmse_all:.2f}°C",
+                                 transform=axes[3].transAxes, fontsize=7,
+                                 color="white", va="bottom",
+                                 bbox=dict(boxstyle="round,pad=0.2",
+                                           facecolor="black", alpha=0.5))
+
+                # Report meaningful patch counts regardless of stride/H step
+                if _stride is not None and _stride > 0 and _stride != H:
+                    actual_cols = (ens_mosaic.shape[1] - W) // _stride + 1
+                    actual_rows = (ens_mosaic.shape[0] - H) // _stride + 1
+                else:
+                    actual_rows = ens_mosaic.shape[0] // H
+                    actual_cols = ens_mosaic.shape[1] // W
+                fig.suptitle(
+                    f"Inference – Full Study-Area Mosaic  "
+                    f"({N_total} patches → {actual_rows}×{actual_cols} grid, "
+                    f"{ens_mosaic.shape[0]}×{ens_mosaic.shape[1]} px)",
+                    fontsize=12, fontweight="bold")
+                plt.tight_layout()
+                self._save(fig, "03b_full_mosaic_predictions")
+
+        except Exception as e:
+            logger.warning(f"_plot_full_mosaic failed: {e}")
+
+    # ── 4. Uncertainty maps ───────────────────────────────────────────────────
+
+    def plot_uncertainty_maps(self, results: Dict[str, np.ndarray],
+                              n_samples: int = 4):
+        """
+        Visualise MC Dropout and/or TTA uncertainty alongside the ensemble prediction.
+
+        Args:
+            results:   Output dict containing 'ensemble', 'mc_uncertainty',
+                       'tta_uncertainty', or 'combined_uncertainty'.
+            n_samples: Patches to show.
+        """
+        try:
+            unc_keys = [k for k in
+                        ["mc_uncertainty", "tta_uncertainty", "combined_uncertainty"]
+                        if k in results]
+            if not unc_keys:
+                logger.info("plot_uncertainty_maps: no uncertainty arrays found, skipping")
+                return
+
+            self._use_style()
+            # Always prefer the full spatial array (N,H,W); fall back to ensemble_patch only
+            # as a last resort — a 1D patch array produces a solid-colour imshow tile.
+            ensemble_raw = results.get("ensemble")
+            if ensemble_raw is None:
+                ensemble_raw = results.get("ensemble_patch")
+
+            def _to_spatial(arr):
+                arr = np.asarray(arr)
+                if arr.ndim == 4 and arr.shape[1] == 1:
+                    return arr[:, 0]
+                if arr.ndim == 4 and arr.shape[3] == 1:
+                    return arr[:, :, :, 0]
+                if arr.ndim == 3:
+                    return arr
+                # 1-D patch-level array — cannot display spatially
+                return None
+
+            ensemble = _to_spatial(ensemble_raw)
+            if ensemble is None:
+                logger.warning("plot_uncertainty_maps: no spatial ensemble array available; "
+                               "skipping ensemble column")
+                # Still show uncertainty maps without the ensemble column
+                unc_keys_use = unc_keys
+                n_cols = len(unc_keys_use)
+                show_ensemble_col = False
+            else:
+                show_ensemble_col = True
+                n_cols = 1 + len(unc_keys)
+
+            n = min(n_samples, len(ensemble) if ensemble is not None else n_samples)
+            fig, axes = plt.subplots(n, n_cols, figsize=(4 * n_cols, 3 * n))
+            if n == 0:
+                return
+
+            fig, axes = plt.subplots(n, n_cols, figsize=(4 * n_cols, 3 * n))
+            if n == 1:
+                axes = axes[np.newaxis, :]
+            fig.suptitle(f"Inference – Prediction Uncertainty (first {n} patches)",
+                         fontsize=13, fontweight="bold")
+
+            for i in range(n):
+                unc_start_col = 0  # column offset for uncertainty panels
+                if show_ensemble_col:
+                    vmin = ensemble[:n].min(); vmax = ensemble[:n].max()
+                    axes[i, 0].imshow(ensemble[i], vmin=vmin, vmax=vmax, cmap="hot")
+                    axes[i, 0].set_title(f"S{i+1} – Ensemble", fontsize=8)
+                    axes[i, 0].axis("off")
+                    unc_start_col = 1
+
+                for col_idx, key in enumerate(unc_keys, start=unc_start_col):
+                    unc_arr = _to_spatial(np.asarray(results[key]))
+                    if unc_arr is None:
+                        axes[i, col_idx].set_title(f"S{i+1} – {key}\n(no spatial data)", fontsize=8)
+                        axes[i, col_idx].axis("off")
+                        continue
+                    if unc_arr.ndim == 2:   # single-sample flat map; pad
+                        unc_arr = unc_arr[np.newaxis, :]
+                    unc_i = unc_arr[i] if i < len(unc_arr) else unc_arr[0]
+                    im = axes[i, col_idx].imshow(unc_i, cmap="viridis")
+                    plt.colorbar(im, ax=axes[i, col_idx], shrink=0.8, label="σ (°C)")
+                    title = key.replace("_", " ").title()
+                    axes[i, col_idx].set_title(
+                        f"S{i+1} – {title}\nμ={unc_i.mean():.2f}°C", fontsize=8)
+                    axes[i, col_idx].axis("off")
+
+            plt.tight_layout()
+            self._save(fig, "04_uncertainty_maps")
+        except Exception as e:
+            logger.warning(f"plot_uncertainty_maps failed: {e}")
+
+    # ── 5. CNN vs GBM agreement ───────────────────────────────────────────────
+
+    def plot_model_agreement(self, results: Dict[str, np.ndarray]):
+        """
+        Scatter of CNN patch-mean vs GBM predictions, coloured by ensemble output,
+        plus a bias histogram showing (CNN − GBM) disagreement.
+
+        Args:
+            results: Output dict from predict_ensemble().
+        """
+        try:
+            self._use_style()
+
+            cnn_patch = results.get("cnn_patch")
+            gbm       = results.get("gbm")
+            ensemble  = results.get("ensemble_patch", results.get("ensemble"))
+
+            if cnn_patch is None or gbm is None:
+                logger.warning("plot_model_agreement: cnn_patch or gbm missing, skipping")
+                return
+
+            cnn_flat = np.asarray(cnn_patch).flatten()
+            gbm_flat = np.asarray(gbm).flatten()
+            ens_flat = np.asarray(ensemble).flatten() if ensemble is not None else None
+
+            mask = np.isfinite(cnn_flat) & np.isfinite(gbm_flat)
+            cnn_flat = cnn_flat[mask]; gbm_flat = gbm_flat[mask]
+            if ens_flat is not None:
+                ens_flat = ens_flat[mask[:len(ens_flat)]]
+
+            diff = cnn_flat - gbm_flat
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle("Inference – CNN vs GBM Agreement",
+                         fontsize=14, fontweight="bold")
+
+            ax = axes[0]
+            c_vals = ens_flat if ens_flat is not None else diff
+            sc = ax.scatter(gbm_flat, cnn_flat, c=c_vals, cmap="plasma",
+                            alpha=0.45, s=14)
+            plt.colorbar(sc, ax=ax,
+                         label="Ensemble (°C)" if ens_flat is not None else "CNN−GBM (°C)")
+            lo = min(gbm_flat.min(), cnn_flat.min())
+            hi = max(gbm_flat.max(), cnn_flat.max())
+            ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect agreement")
+            ax.set_xlabel("GBM prediction (°C)"); ax.set_ylabel("CNN prediction (°C)")
+            ax.set_title("CNN vs GBM (patch averages)"); ax.legend(fontsize=8)
+            ax.text(0.03, 0.97,
+                    f"mean diff={diff.mean():.3f}°C\nstd diff={diff.std():.3f}°C\n"
+                    f"n={len(cnn_flat):,}",
+                    transform=ax.transAxes, fontsize=8, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            ax = axes[1]
+            ax.hist(diff, bins=60, color="#AB47BC", alpha=0.75,
+                    density=True, edgecolor="white", linewidth=0.3)
+            ax.axvline(0, color="black", lw=1.2, ls="--", label="Zero bias")
+            ax.axvline(diff.mean(), color="#EF5350", lw=1.5,
+                       label=f"Mean={diff.mean():.3f}°C")
+            ax.set_xlabel("CNN − GBM (°C)"); ax.set_ylabel("Density")
+            ax.set_title("Model Disagreement Distribution"); ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            self._save(fig, "05_model_agreement")
+        except Exception as e:
+            logger.warning(f"plot_model_agreement failed: {e}")
+
+    # ── 6. Calibration analysis ───────────────────────────────────────────────
+
+    def plot_calibration_analysis(self, results: Dict[str, np.ndarray],
+                                  targets: np.ndarray,
+                                  cal_slope: float = 1.0,
+                                  cal_intercept: float = 0.0):
+        """
+        Show the effect of post-hoc linear calibration: scatter of raw CNN vs
+        calibrated CNN predictions against targets, plus a bias-vs-temperature plot.
+
+        Args:
+            results:       predict_ensemble() output dict.
+            targets:       Ground-truth LST patches (°C, already denormalised).
+            cal_slope:     Calibration slope applied at inference time.
+            cal_intercept: Calibration intercept applied at inference time.
+        """
+        try:
+            self._use_style()
+
+            cnn = results.get("cnn")
+            ens = results.get("ensemble_patch", results.get("ensemble"))
+            if cnn is None:
+                logger.warning("plot_calibration_analysis: CNN predictions missing, skipping")
+                return
+
+            cnn_flat = np.asarray(cnn).flatten()
+            ens_flat = np.asarray(ens).flatten() if ens is not None else cnn_flat
+            tgt_flat = np.asarray(targets).flatten()
+
+            n = min(len(cnn_flat), len(tgt_flat))
+            cnn_flat = cnn_flat[:n]; ens_flat = ens_flat[:n]; tgt_flat = tgt_flat[:n]
+            mask = np.isfinite(cnn_flat) & np.isfinite(tgt_flat)
+            cnn_flat = cnn_flat[mask]; ens_flat = ens_flat[mask]; tgt_flat = tgt_flat[mask]
+
+            # Reconstruct raw (pre-calibration) CNN values in °C
+            # raw = (calibrated − intercept) / slope  [both in normalised space,
+            # but denorm is linear so the ratio still holds]
+            raw_flat = (cnn_flat - cal_intercept) / (cal_slope + 1e-8)
+
+            from scipy.stats import linregress
+            slope_raw, _, _, *_ = linregress(tgt_flat, raw_flat)
+            slope_cal, _, _, *_ = linregress(tgt_flat, cnn_flat)
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle("Inference – Calibration Effect Analysis",
+                         fontsize=14, fontweight="bold")
+
+            ax = axes[0]
+            lo = min(tgt_flat.min(), cnn_flat.min()); hi = max(tgt_flat.max(), cnn_flat.max())
+            ax.scatter(tgt_flat, raw_flat, alpha=0.3, s=10,
+                       color="#90CAF9", label=f"Pre-cal (slope={slope_raw:.3f})")
+            ax.scatter(tgt_flat, cnn_flat, alpha=0.3, s=10,
+                       color="#EF5350", label=f"Post-cal (slope={slope_cal:.3f})")
+            ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect (slope=1)")
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("CNN Predicted (°C)")
+            ax.set_title("Pre vs Post Calibration Scatter"); ax.legend(fontsize=8)
+
+            ax.text(0.03, 0.97,
+                    f"cal_slope={cal_slope:.4f}\ncal_intercept={cal_intercept:.4f}",
+                    transform=ax.transAxes, fontsize=8, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            ax = axes[1]
+            residuals_raw = raw_flat - tgt_flat
+            residuals_cal = cnn_flat - tgt_flat
+            ax.scatter(tgt_flat, residuals_raw, alpha=0.25, s=10,
+                       color="#90CAF9", label="Pre-cal residual")
+            ax.scatter(tgt_flat, residuals_cal, alpha=0.25, s=10,
+                       color="#EF5350", label="Post-cal residual")
+            ax.axhline(0, color="black", lw=1.2)
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Residual (°C)")
+            ax.set_title("Residuals Before and After Calibration"); ax.legend(fontsize=8)
+
+            plt.tight_layout()
+            self._save(fig, "06_calibration_analysis")
+        except Exception as e:
+            logger.warning(f"plot_calibration_analysis failed: {e}")
+
+    # ── 7. Stratified error (inference) ──────────────────────────────────────
+
+    def plot_stratified_error(self, preds: np.ndarray, targets: np.ndarray,
+                              label: str = "Ensemble", n_bins: int = 10):
+        """
+        RMSE, MAE, MBE bucketed by temperature-percentile bins — identical
+        contract to DiagnosticsPlotter.plot_stratified_error.
+        """
+        try:
+            self._use_style()
+            preds   = np.asarray(preds).flatten()
+            targets = np.asarray(targets).flatten()
+            mask    = np.isfinite(preds) & np.isfinite(targets)
+            preds, targets = preds[mask], targets[mask]
+
+            bins = np.percentile(targets, np.linspace(0, 100, n_bins + 1))
+            centers, rmse_v, mae_v, mbe_v, counts = [], [], [], [], []
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                idx = (targets >= lo) & (targets <= hi)
+                if idx.sum() < 5:
+                    continue
+                p, t = preds[idx], targets[idx]
+                centers.append((lo + hi) / 2)
+                rmse_v.append(np.sqrt(np.mean((p - t) ** 2)))
+                mae_v.append(np.mean(np.abs(p - t)))
+                mbe_v.append(np.mean(p - t))
+                counts.append(idx.sum())
+
+            if not centers:
+                logger.warning("plot_stratified_error: no bins with enough samples, skipping")
+                return
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            fig.suptitle(f"Inference – {label}: Stratified Error by Temperature",
+                         fontsize=13, fontweight="bold")
+
+            def _bar(ax, y, title, ylabel, color):
+                ax.bar(range(len(centers)), y, color=color, edgecolor="white", alpha=0.8)
+                ax.set_xticks(range(len(centers)))
+                ax.set_xticklabels([f"{c:.1f}" for c in centers],
+                                   rotation=45, ha="right", fontsize=7)
+                ax.set_xlabel("Temperature Bin Centre (°C)")
+                ax.set_ylabel(ylabel); ax.set_title(title)
+
+            _bar(axes[0], rmse_v, "RMSE by Temperature Bin", "RMSE (°C)", "#EF5350")
+            _bar(axes[1], mae_v,  "MAE by Temperature Bin",  "MAE (°C)",  "#FFA726")
+            axes[2].bar(range(len(centers)), mbe_v,
+                        color=["#1E88E5" if v >= 0 else "#E53935" for v in mbe_v],
+                        edgecolor="white", alpha=0.8)
+            axes[2].axhline(0, color="black", lw=1)
+            axes[2].set_xticks(range(len(centers)))
+            axes[2].set_xticklabels([f"{c:.1f}" for c in centers],
+                                    rotation=45, ha="right", fontsize=7)
+            axes[2].set_xlabel("Temperature Bin Centre (°C)")
+            axes[2].set_ylabel("MBE (°C)"); axes[2].set_title("MBE by Temperature Bin")
+            for i, cnt in enumerate(counts):
+                axes[0].text(i, rmse_v[i] + 0.01, f"n={cnt}", ha="center", fontsize=6)
+
+            plt.tight_layout()
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "")
+            self._save(fig, f"07_stratified_error_{safe}")
+        except Exception as e:
+            logger.warning(f"plot_stratified_error failed: {e}")
+
+    # ── 8. TTA variance analysis ──────────────────────────────────────────────
+
+    def plot_tta_variance(self, results: Dict[str, np.ndarray]):
+        """
+        Visualise TTA variance: histogram of per-pixel TTA std (°C),
+        scatter of uncertainty vs ensemble prediction, and a simple reliability
+        diagram (uncertainty magnitude vs actual error, if targets available).
+
+        Args:
+            results: Output dict containing at least 'tta_uncertainty' and 'ensemble'.
+        """
+        try:
+            tta_unc = results.get("tta_uncertainty")
+            if tta_unc is None:
+                logger.info("plot_tta_variance: no tta_uncertainty in results, skipping")
+                return
+
+            self._use_style()
+            unc_flat = np.asarray(tta_unc).flatten()
+            unc_flat = unc_flat[np.isfinite(unc_flat)]
+
+            ens_flat = np.asarray(
+                results.get("ensemble", results.get("ensemble_patch"))
+            ).flatten()
+            n = min(len(unc_flat), len(ens_flat))
+            unc_flat = unc_flat[:n]; ens_flat = ens_flat[:n]
+            mask = np.isfinite(unc_flat) & np.isfinite(ens_flat)
+            unc_flat = unc_flat[mask]; ens_flat = ens_flat[mask]
+
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            fig.suptitle("Inference – TTA Variance Analysis",
+                         fontsize=14, fontweight="bold")
+
+            ax = axes[0]
+            ax.hist(unc_flat, bins=60, color="#26C6DA", alpha=0.75,
+                    density=True, edgecolor="white", linewidth=0.3)
+            ax.axvline(unc_flat.mean(), color="#EF5350", lw=1.5, ls="--",
+                       label=f"Mean={unc_flat.mean():.3f}°C")
+            ax.set_xlabel("TTA Std (°C)"); ax.set_ylabel("Density")
+            ax.set_title("TTA Uncertainty Distribution"); ax.legend(fontsize=8)
+            ax.text(0.97, 0.97,
+                    f"median={np.median(unc_flat):.3f}°C\n"
+                    f"p95={np.percentile(unc_flat, 95):.3f}°C",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
+
+            ax = axes[1]
+            ax.hexbin(ens_flat, unc_flat, gridsize=40, cmap="YlOrRd",
+                      mincnt=1, linewidths=0.2)
+            ax.set_xlabel("Ensemble Prediction (°C)")
+            ax.set_ylabel("TTA Uncertainty (°C)")
+            ax.set_title("Uncertainty vs Prediction Temperature")
+
+            plt.tight_layout()
+            self._save(fig, "08_tta_variance")
+        except Exception as e:
+            logger.warning(f"plot_tta_variance failed: {e}")
+
+    # ── 9. Summary dashboard ──────────────────────────────────────────────────
+
+    def plot_summary_dashboard(self, results: Dict[str, np.ndarray],
+                               targets: np.ndarray = None,
+                               cal_slope: float = 1.0,
+                               cal_intercept: float = 0.0,
+                               weights: Dict = None):
+        """
+        One-page overview: prediction stats table · ensemble weight pie ·
+        CNN/GBM/Ensemble distribution · agreement scatter · uncertainty overview.
+
+        Args:
+            results:       predict_ensemble() output dict (Celsius).
+            targets:       Optional ground-truth patches (°C).
+            cal_slope:     Calibration slope loaded by EnsemblePredictor.
+            cal_intercept: Calibration intercept loaded by EnsemblePredictor.
+            weights:       {"cnn": float, "gbm": float} ensemble weights.
+        """
+        try:
+            self._use_style()
+            fig = plt.figure(figsize=(18, 12))
+            gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.48, wspace=0.38)
+            fig.suptitle("Inference – Summary Dashboard",
+                         fontsize=16, fontweight="bold")
+
+            # ── Row 0: metrics table + weights pie + calibration info ─────────
+            ax_tbl = fig.add_subplot(gs[0, :2]); ax_tbl.axis("off")
+
+            def _stats(arr):
+                a = np.asarray(arr).flatten()
+                a = a[np.isfinite(a)]
+                return (f"{a.mean():.2f}", f"{a.std():.2f}",
+                        f"{a.min():.2f}", f"{a.max():.2f}") if len(a) else ("—",)*4
+
+            series_names = ["CNN (patch)", "GBM", "Ensemble (patch)"]
+            series_data  = [
+                results.get("cnn_patch", results.get("cnn")),
+                results.get("gbm"),
+                results.get("ensemble_patch", results.get("ensemble")),
+            ]
+            rows = [["Model", "Mean (°C)", "Std (°C)", "Min (°C)", "Max (°C)"]]
+            for name, data in zip(series_names, series_data):
+                if data is not None:
+                    rows.append([name] + list(_stats(data)))
+                else:
+                    rows.append([name, "—", "—", "—", "—"])
+
+            # Optional: add accuracy row if targets available
+            if targets is not None:
+                ens = results.get("ensemble_patch", results.get("ensemble"))
+                if ens is not None:
+                    e = np.asarray(ens).flatten()
+                    t = np.asarray(targets).flatten()
+                    n = min(len(e), len(t))
+                    e, t = e[:n], t[:n]
+                    mask = np.isfinite(e) & np.isfinite(t)
+                    if mask.sum() >= 2:
+                        from sklearn.metrics import r2_score as _r2
+                        rmse = float(np.sqrt(np.mean((e[mask] - t[mask])**2)))
+                        r2   = float(_r2(t[mask], e[mask]))
+                        rows.append(["Ensemble Accuracy",
+                                     f"R²={r2:.4f}", f"RMSE={rmse:.3f}°C",
+                                     "—", "—"])
+
+            tbl = ax_tbl.table(cellText=rows[1:], colLabels=rows[0],
+                               cellLoc="center", loc="center")
+            tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1, 1.6)
+            ax_tbl.set_title("Inference Prediction Statistics", fontsize=10, pad=4)
+
+            # Weights pie
+            ax_pie = fig.add_subplot(gs[0, 2])
+            if weights:
+                wts = [weights.get("cnn", 0), weights.get("gbm", 0)]
+                if sum(wts) > 0:
+                    ax_pie.pie(wts, labels=["CNN", "GBM"], autopct="%1.1f%%",
+                               colors=["#42A5F5", "#EF5350"], startangle=90)
+            ax_pie.set_title("Ensemble Weights", fontsize=10)
+
+            # Calibration info box
+            ax_cal = fig.add_subplot(gs[0, 3]); ax_cal.axis("off")
+            cal_text = (
+                "Post-hoc Calibration\n"
+                "─────────────────\n"
+                f"slope      = {cal_slope:.4f}\n"
+                f"intercept = {cal_intercept:.4f}\n\n"
+                f"{'✅ Applied' if (cal_slope != 1.0 or cal_intercept != 0.0) else '⚠️ Identity (not applied)'}"
+            )
+            ax_cal.text(0.5, 0.5, cal_text, transform=ax_cal.transAxes,
+                        fontsize=9, va="center", ha="center",
+                        fontfamily="monospace",
+                        bbox=dict(boxstyle="round,pad=0.5", alpha=0.12))
+            ax_cal.set_title("Calibration", fontsize=10)
+
+            # ── Row 1: overlaid distribution + CNN vs GBM scatter ─────────────
+            ax_dist = fig.add_subplot(gs[1, :2])
+            colours = {"CNN (patch)": "#42A5F5", "GBM": "#EF5350",
+                       "Ensemble": "#66BB6A", "Target": "gray"}
+            plot_pairs = [
+                ("CNN (patch)",  results.get("cnn_patch", results.get("cnn")),  "#42A5F5"),
+                ("GBM",          results.get("gbm"),                             "#EF5350"),
+                ("Ensemble",     results.get("ensemble_patch",
+                                             results.get("ensemble")),           "#66BB6A"),
+            ]
+            if targets is not None:
+                plot_pairs.append(("Target", targets, "gray"))
+            for (lbl, arr, col) in plot_pairs:
+                if arr is None: continue
+                flat = np.asarray(arr).flatten()
+                flat = flat[np.isfinite(flat)]
+                ax_dist.hist(flat, bins=60, color=col, alpha=0.45,
+                             density=True, label=lbl, edgecolor="white", linewidth=0.2)
+            ax_dist.set_xlabel("LST (°C)"); ax_dist.set_ylabel("Density")
+            ax_dist.set_title("Overlaid Prediction Distributions")
+            ax_dist.legend(fontsize=8)
+
+            # CNN vs GBM agreement scatter
+            ax_ag = fig.add_subplot(gs[1, 2:])
+            cnn_p = results.get("cnn_patch", results.get("cnn"))
+            gbm_p = results.get("gbm")
+            if cnn_p is not None and gbm_p is not None:
+                cf = np.asarray(cnn_p).flatten()
+                gf = np.asarray(gbm_p).flatten()
+                n  = min(len(cf), len(gf))
+                cf, gf = cf[:n], gf[:n]
+                mask = np.isfinite(cf) & np.isfinite(gf)
+                cf, gf = cf[mask], gf[mask]
+                diff = cf - gf
+                ax_ag.scatter(gf, cf, c=diff, cmap="RdBu_r", alpha=0.35, s=10)
+                lo = min(gf.min(), cf.min()); hi = max(gf.max(), cf.max())
+                ax_ag.plot([lo, hi], [lo, hi], "k--", lw=1)
+                ax_ag.set_xlabel("GBM (°C)"); ax_ag.set_ylabel("CNN (°C)")
+                ax_ag.set_title(f"CNN vs GBM  (mean diff={diff.mean():.3f}°C)")
+
+            # ── Row 2: uncertainty overview + spatial sample ──────────────────
+            unc_keys = [k for k in ["mc_uncertainty", "tta_uncertainty",
+                                    "combined_uncertainty"] if k in results]
+            if unc_keys:
+                ax_unc = fig.add_subplot(gs[2, :2])
+                for key in unc_keys:
+                    uf = np.asarray(results[key]).flatten()
+                    uf = uf[np.isfinite(uf)]
+                    ax_unc.hist(uf, bins=60, alpha=0.55, density=True,
+                                label=key.replace("_", " ").title(),
+                                edgecolor="white", linewidth=0.2)
+                ax_unc.set_xlabel("Uncertainty (°C)"); ax_unc.set_ylabel("Density")
+                ax_unc.set_title("Uncertainty Distribution"); ax_unc.legend(fontsize=8)
+
+            # Spatial sample of first patch
+            ens_arr = results.get("ensemble")
+            if ens_arr is not None:
+                ens_arr = np.asarray(ens_arr)
+                if ens_arr.ndim == 4 and ens_arr.shape[1] == 1:
+                    ens_arr = ens_arr[:, 0]
+                if ens_arr.ndim >= 3:
+                    ax_sp = fig.add_subplot(gs[2, 2])
+                    im = ax_sp.imshow(ens_arr[0], cmap="hot")
+                    plt.colorbar(im, ax=ax_sp, label="°C", shrink=0.8)
+                    ax_sp.set_title("Patch 0 – Ensemble LST", fontsize=9)
+                    ax_sp.axis("off")
+
+            if unc_keys:
+                first_unc = np.asarray(results[unc_keys[0]])
+                if first_unc.ndim == 4 and first_unc.shape[1] == 1:
+                    first_unc = first_unc[:, 0]
+                if first_unc.ndim >= 3:
+                    ax_up = fig.add_subplot(gs[2, 3])
+                    im2 = ax_up.imshow(first_unc[0], cmap="viridis")
+                    plt.colorbar(im2, ax=ax_up, label="σ (°C)", shrink=0.8)
+                    title = unc_keys[0].replace("_", " ").title()
+                    ax_up.set_title(f"Patch 0 – {title}", fontsize=9)
+                    ax_up.axis("off")
+
+            self._save(fig, "09_summary_dashboard")
+        except Exception as e:
+            logger.warning(f"plot_summary_dashboard failed: {e}")
+
+    # ── convenience: full suite ───────────────────────────────────────────────
+
+    def plot_all(self, results: Dict[str, np.ndarray],
+                 X: np.ndarray = None,
+                 targets: np.ndarray = None,
+                 cal_slope: float = 1.0,
+                 cal_intercept: float = 0.0,
+                 weights: Dict = None,
+                 label: str = "Ensemble",
+                 grid_cols: int = None,
+                 patch_positions: np.ndarray = None):
+        """
+        Convenience wrapper — calls every available plot method.
+
+        Args:
+            results:         Output from EnsemblePredictor.predict_ensemble() or
+                             predict_ensemble_with_tta() — values in Celsius.
+            X:               Raw input patches (N, H, W, C) — used only for
+                             context; not strictly required.
+            targets:         Optional ground-truth LST patches (°C, denormalised).
+            cal_slope:       Calibration slope (from EnsemblePredictor.cal_slope).
+            cal_intercept:   Calibration intercept.
+            weights:         {"cnn": float, "gbm": float} from EnsemblePredictor.weights.
+            label:           Label for scatter / residual plot titles.
+            patch_positions: (N, 2) int32 (grid_row, grid_col) per patch — loaded
+                             from patch_positions.npy.  Used by the mosaic assembler
+                             to place QC-filtered patches at their correct grid cells.
+        """
+        logger.info("\n📊 Generating all inference diagnostic plots...")
+
+        self.plot_prediction_distribution(results, targets=targets)
+        self.plot_spatial_predictions(results, targets=targets, grid_cols=grid_cols,
+                                      patch_positions=patch_positions)
+        self.plot_model_agreement(results)
+        self.plot_uncertainty_maps(results)
+        self.plot_tta_variance(results)
+        self.plot_summary_dashboard(results, targets=targets,
+                                    cal_slope=cal_slope,
+                                    cal_intercept=cal_intercept,
+                                    weights=weights)
+
+        if targets is not None:
+            ens = results.get("ensemble_patch", results.get("ensemble"))
+            if ens is not None:
+                self.plot_pred_vs_actual(ens, targets, label=label)
+                self.plot_stratified_error(ens, targets, label=label)
+            if cal_slope != 1.0 or cal_intercept != 0.0:
+                self.plot_calibration_analysis(results, targets,
+                                               cal_slope=cal_slope,
+                                               cal_intercept=cal_intercept)
+
+        logger.info(f"✅ All inference plots saved to: {self.save_dir}")
 
 
 class MCDropoutUNet(nn.Module):
@@ -198,6 +1796,38 @@ class EnsemblePredictor:
             logger.warning(f"calibration_params.json not found (searched: "
                            f"{[str(p) for p in _cal_candidates]}). "
                            "Predictions will NOT be calibrated — re-run training to generate it.")
+
+        # Load bottleneck PCA (fitted during training to compress 3*C_bot dims → 32).
+        # Without this, _extract_cnn_bottleneck_features returns 3*256=768 columns,
+        # which causes the "inference=890, training=154" feature-mismatch warning.
+        _model_root = Path(cnn_model_path).parent
+        _pca_candidates = [
+            _model_root / "bottleneck_pca.pkl",
+            _model_root.parent / "bottleneck_pca.pkl",
+        ]
+        _pca_path = next((p for p in _pca_candidates if p.exists()), None)
+        if _pca_path is not None:
+            try:
+                import joblib
+                self._bottleneck_pca = joblib.load(_pca_path)
+                logger.info(f"✅ Loaded bottleneck PCA ({self._bottleneck_pca.n_components_} "
+                            f"components) from {_pca_path}")
+            except Exception as _pe:
+                self._bottleneck_pca = None
+                logger.warning(f"⚠️ Could not load bottleneck PCA ({_pe}); "
+                               "bottleneck features will be passed raw and may cause a feature mismatch")
+        else:
+            self._bottleneck_pca = None
+            logger.warning(
+                "⚠️ bottleneck_pca.pkl not found — GBM feature count may not match training. "
+                "To fix: re-run train_ensemble.py (the updated version now saves the PCA). "
+                f"Searched: {[str(p) for p in _pca_candidates]}"
+            )
+
+        # Diagnostics plotter — saves all inference figures to MODEL_DIR/inference_diagnostics/
+        self.plotter = InferenceDiagnosticsPlotter(
+            save_dir=Path(cnn_model_path).parent.parent / "inference_diagnostics"
+        )
     
     def validate_input(self, X: np.ndarray) -> bool:
         """Validate that input data is properly normalized"""
@@ -330,6 +1960,7 @@ class EnsemblePredictor:
         # ── FIX 6: Append CNN bottleneck features ──────────────────────────────
         try:
             bot_feats = self._extract_cnn_bottleneck_features(X)
+            bot_feats = self._apply_bottleneck_pca(bot_feats)   # compress to training dims
             bot_cols  = [f"cnn_bot_{i}" for i in range(bot_feats.shape[1])]
             bot_df    = pd.DataFrame(bot_feats, columns=bot_cols)
             features_df = pd.concat([features_df, bot_df], axis=1)
@@ -406,11 +2037,28 @@ class EnsemblePredictor:
             all_stats.append(stats)
 
         return np.vstack(all_stats)
+
+    def _apply_bottleneck_pca(self, bot_feats: np.ndarray) -> np.ndarray:
+        """
+        Apply the PCA that was fitted during training to compress raw bottleneck
+        statistics.  If no PCA was loaded (e.g. old checkpoint), returns raw feats
+        and emits a warning so the caller can fall back to column-alignment padding.
+        """
+        if self._bottleneck_pca is not None:
+            try:
+                compressed = self._bottleneck_pca.transform(bot_feats)
+                logger.info(f"  PCA: {bot_feats.shape[1]} → {compressed.shape[1]} bottleneck dims")
+                return compressed
+            except Exception as _e:
+                logger.warning(f"  ⚠️ PCA transform failed ({_e}); using raw bottleneck features")
+        return bot_feats
     
     def predict_ensemble(self, X: np.ndarray, batch_size: int = 8, 
                         return_uncertainty: bool = False,
                         use_spatial_ensemble: bool = True,
-                        skip_validation: bool = False) -> Dict[str, np.ndarray]:
+                        skip_validation: bool = False,
+                        targets: np.ndarray = None,
+                        save_diagnostics: bool = True) -> Dict[str, np.ndarray]:
         """
         Make ensemble predictions
         
@@ -420,6 +2068,11 @@ class EnsemblePredictor:
             return_uncertainty: Whether to compute MC Dropout uncertainty
             use_spatial_ensemble: Use spatial-level ensemble vs patch-level
             skip_validation: Skip input validation
+            targets: Optional ground-truth LST patches (°C, denormalised) for
+                     diagnostic plots.  If provided and save_diagnostics=True,
+                     accuracy metrics will be included in the dashboard.
+            save_diagnostics: Generate and save diagnostic plots via
+                              InferenceDiagnosticsPlotter.  Default True.
             
         Returns:
             Dictionary with ensemble predictions in CELSIUS
@@ -448,35 +2101,42 @@ class EnsemblePredictor:
         # Ensemble combination in NORMALIZED space
         if use_spatial_ensemble and self.weights["cnn"] > 0:
             logger.info("\n🔧 Using SPATIAL ensemble (normalized space)")
-            
-            # Broadcast GBM to spatial dimensions
+
+            # Broadcast GBM patch predictions to spatial dimensions
             gbm_spatial_norm = np.zeros_like(cnn_preds_norm)
             for i in range(len(gbm_preds_norm)):
                 gbm_spatial_norm[i] = gbm_preds_norm[i]
-            
-            # Weighted combination
+
+            # Weighted combination — preserves CNN spatial texture
             ensemble_preds_norm = (
                 self.weights["cnn"] * cnn_preds_norm +
                 self.weights["gbm"] * gbm_spatial_norm
             )
-            
+
             ensemble_preds_patch_norm = ensemble_preds_norm.reshape(
                 ensemble_preds_norm.shape[0], -1
             ).mean(axis=1)
-            
+
         else:
-            logger.info("\n🔧 Using PATCH-LEVEL ensemble (normalized space)")
-            
-            # Weighted combination at patch level
+            # CNN weight is 0 (GBM-only mode) — but broadcasting GBM scalar to every
+            # pixel produces a solid-colour spatial map.  Instead, use CNN-as-residual:
+            # shift CNN's spatial pattern so its patch mean matches the GBM prediction,
+            # preserving all spatial detail while trusting GBM for the absolute level.
+            logger.info("\n🔧 Using CNN-as-residual spatial mode (GBM mean + CNN spatial deviation)")
+
+            # Patch-level ensemble prediction comes entirely from GBM
             ensemble_preds_patch_norm = (
                 self.weights["cnn"] * cnn_preds_patch_norm +
                 self.weights["gbm"] * gbm_preds_norm
             )
-            
-            # Broadcast to spatial
-            ensemble_preds_norm = np.zeros_like(cnn_preds_norm)
-            for i in range(len(ensemble_preds_patch_norm)):
-                ensemble_preds_norm[i] = ensemble_preds_patch_norm[i]
+
+            # Spatial map: GBM patch mean + CNN spatial deviation from its own patch mean
+            # This gives full spatial resolution without a solid-colour artefact.
+            cnn_deviation = cnn_preds_norm - cnn_preds_patch_norm[:, np.newaxis, np.newaxis]
+            ensemble_preds_norm = (
+                gbm_preds_norm[:, np.newaxis, np.newaxis] + cnn_deviation
+            )
+            logger.info(f"  Spatial std (CNN deviation): {cnn_deviation.std():.4f}")
         
         logger.info(f"\n📊 Ensemble (NORMALIZED): mean={ensemble_preds_norm.mean():.4f}, "
                    f"std={ensemble_preds_norm.std():.4f}")
@@ -511,7 +2171,22 @@ class EnsemblePredictor:
         
         logger.info(f"\n✅ Ensemble predictions complete")
         logger.info("="*70 + "\n")
-        
+
+        # ── Diagnostic plots ──────────────────────────────────────────────────
+        if save_diagnostics:
+            try:
+                self.plotter.plot_all(
+                    results,
+                    X=X,
+                    targets=targets,
+                    cal_slope=self.cal_slope,
+                    cal_intercept=self.cal_intercept,
+                    weights=self.weights,
+                )
+            except Exception as _pe:
+                logger.warning(f"Inference diagnostic plots failed: {_pe}")
+        # ─────────────────────────────────────────────────────────────────────
+
         return results
     
     def _compute_mc_dropout_uncertainty(self, X: np.ndarray, n_samples: int = 50, 
@@ -649,7 +2324,9 @@ class EnsemblePredictor:
                                   batch_size: int = 8,
                                   n_augmentations: int = 8,
                                   return_uncertainty: bool = True,
-                                  use_spatial_ensemble: bool = True) -> Dict[str, np.ndarray]:
+                                  use_spatial_ensemble: bool = True,
+                                  targets: np.ndarray = None,
+                                  save_diagnostics: bool = True) -> Dict[str, np.ndarray]:
         """
         Make ensemble predictions with Test-Time Augmentation
         
@@ -730,16 +2407,19 @@ class EnsemblePredictor:
             ).mean(axis=1)
             
         else:
-            logger.info("\n🔧 Using PATCH-LEVEL ensemble with TTA")
-            
+            logger.info("\n🔧 Using CNN-as-residual spatial mode with TTA (GBM mean + CNN spatial deviation)")
+
             ensemble_preds_patch_norm = (
                 self.weights["cnn"] * cnn_preds_patch_norm +
                 self.weights["gbm"] * gbm_preds_norm
             )
-            
-            ensemble_preds_norm = np.zeros_like(cnn_preds_spatial_norm)
-            for i in range(len(ensemble_preds_patch_norm)):
-                ensemble_preds_norm[i] = ensemble_preds_patch_norm[i]
+
+            # Preserve spatial texture: GBM sets the patch-level mean,
+            # CNN contributes the within-patch deviation
+            cnn_deviation = cnn_preds_spatial_norm - cnn_preds_patch_norm[:, np.newaxis, np.newaxis]
+            ensemble_preds_norm = (
+                gbm_preds_norm[:, np.newaxis, np.newaxis] + cnn_deviation
+            )
         
         # DENORMALIZE to Celsius
         logger.info("\n🔄 Denormalizing predictions to Celsius...")
@@ -800,6 +2480,24 @@ class EnsemblePredictor:
         
         logger.info(f"\n✅ TTA ensemble predictions complete")
         logger.info("="*70 + "\n")
+
+        # ── Diagnostic plots ──────────────────────────────────────────────────
+        if save_diagnostics:
+            try:
+                self.plotter.plot_all(
+                    results,
+                    X=X,
+                    targets=targets,
+                    cal_slope=self.cal_slope,
+                    cal_intercept=self.cal_intercept,
+                    weights=self.weights,
+                    label="Ensemble+TTA",
+                    grid_cols=getattr(self.plotter, "_grid_cols", None),
+                    patch_positions=getattr(self.plotter, "_patch_positions", None),
+                )
+            except Exception as _pe:
+                logger.warning(f"Inference TTA diagnostic plots failed: {_pe}")
+        # ─────────────────────────────────────────────────────────────────────
         
         return results
 
@@ -877,16 +2575,16 @@ class PostProcessor:
         n_below = (lst_map < self.config["temp_min"]).sum()
         n_above = (lst_map > self.config["temp_max"]).sum()
         
-        if n_below + n_above > 0:
-            logger.info(f"Clipping {n_below + n_above} pixels to "
-                       f"[{self.config['temp_min']}, {self.config['temp_max']}]°C")
+        # if n_below + n_above > 0:
+        #     logger.info(f"Clipping {n_below + n_above} pixels to "
+        #                f"[{self.config['temp_min']}, {self.config['temp_max']}]°C")
         
         return np.clip(lst_map, self.config["temp_min"], self.config["temp_max"])
     
     def process(self, lst_map: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         """Apply full post-processing pipeline"""
-        logger.info("Post-processing LST predictions...")
-        logger.info(f"  Input: mean={lst_map.mean():.2f}°C, std={lst_map.std():.2f}°C")
+        # logger.info("Post-processing LST predictions...")
+        # logger.info(f"  Input: mean={lst_map.mean():.2f}°C, std={lst_map.std():.2f}°C")
         
         processed = self.fill_nodata(lst_map, mask)
         # Bilateral filter deliberately skipped: it reduces spatial variance
@@ -894,8 +2592,8 @@ class PostProcessor:
         # Call apply_bilateral_filter() explicitly only for visualization output.
         processed = self.clip_values(processed)
         
-        logger.info(f"  Output: mean={processed.mean():.2f}°C, std={processed.std():.2f}°C")
-        logger.info("✓ Post-processing complete")
+        # logger.info(f"  Output: mean={processed.mean():.2f}°C, std={processed.std():.2f}°C")
+        # logger.info("✓ Post-processing complete")
         
         return processed
 
