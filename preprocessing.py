@@ -1,6 +1,6 @@
 """
 Data preprocessing pipeline for Urban Heat Island detection
-Purpose: Process Landsat 8 and 9 data
+Purpose: Process BOTH Landsat and Sentinel-2 data and fuse them
 Does NOT download data - only transforms existing raw data files
 """
 import sys
@@ -46,7 +46,7 @@ _LANDSAT_BAND_ORDER = [
     "SR_B1", "SR_B2", "SR_B3", "SR_B4",
     "SR_B5", "SR_B6", "SR_B7", "ST_B10", "QA_PIXEL",
 ]
-
+_SENTINEL2_BAND_ORDER = ["B2", "B3", "B4", "B8", "B11", "B12", "SCL"]
 
 # ---------------------------------------------------------------------------
 # Memory-budget configuration
@@ -122,6 +122,7 @@ def load_tif_as_bands(tif_path: Path,
     exporting, so TIF values are already physically meaningful:
       - SR bands  : surface reflectance [0.0 – 1.0]
       - ST_B10    : brightness temperature in Kelvin (~280–330 K)
+      - S2 bands  : surface reflectance × 10 000
     QA_PIXEL is kept as integer-valued float for bitmask operations.
 
     Adaptive downsampling
@@ -143,7 +144,8 @@ def load_tif_as_bands(tif_path: Path,
             if not has_desc:
                 if n_bands == len(_LANDSAT_BAND_ORDER):
                     descriptions = _LANDSAT_BAND_ORDER
-
+                elif n_bands == len(_SENTINEL2_BAND_ORDER):
+                    descriptions = _SENTINEL2_BAND_ORDER
                 else:
                     descriptions = [f"band_{i+1}" for i in range(n_bands)]
 
@@ -492,62 +494,50 @@ class PreprocessingDiagnostics:
     # ------------------------------------------------------------------
     def plot_patch_diagnostics(self, patches: list,
                                 filename: str = "05_patch_diagnostics.png"):
-        """Distributions of per-patch LST statistics.
-
-        Patches in this pipeline are position-only — pixel data is held in the
-        raster dict, not in the patch object.  We therefore use the lightweight
-        metadata (_lst_mean, _lst_std) that extract_patches stores on every patch
-        instead of trying to access p["data"]["LST"].
-        """
+        """Distributions of per-patch LST statistics + example patches."""
         if not patches:
             logger.warning("[Diagnostics] plot_patch_diagnostics: no patches.")
             return
 
-        # Use pre-computed per-patch metadata (always present)
-        means = np.array([p["_lst_mean"] for p in patches], dtype=np.float32)
-        stds  = np.array([p["_lst_std"]  for p in patches], dtype=np.float32)
+        means = [np.nanmean(p["data"]["LST"]) for p in patches]
+        stds  = [np.nanstd(p["data"]["LST"])  for p in patches]
+        mins  = [np.nanmin(p["data"]["LST"])   for p in patches]
+        maxs  = [np.nanmax(p["data"]["LST"])   for p in patches]
 
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig = plt.figure(figsize=(16, 10))
+        gs = gridspec.GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.35)
 
-        # 1. LST mean distribution
-        ax = axes[0]
-        ax.hist(means, bins=50, color="steelblue", edgecolor="white", alpha=0.85)
-        ax.axvline(float(means.mean()), color="black", linestyle="--", lw=1.5,
-                   label=f"μ={means.mean():.1f}°C")
-        ax.axvline(20.0, color="red",  linestyle=":", lw=1.2, label="QC min 20°C")
-        ax.axvline(58.0, color="red",  linestyle=":", lw=1.2, label="QC max 58°C")
-        ax.set_xlabel("Patch LST Mean (°C)", fontsize=9)
-        ax.set_ylabel("Count")
-        ax.set_title("Patch LST Mean Distribution")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        # Distributions
+        for col, (vals, label, color) in enumerate(zip(
+                [means, stds, mins, maxs],
+                ["Patch LST Mean (°C)", "Patch LST Std (°C)",
+                 "Patch LST Min (°C)", "Patch LST Max (°C)"],
+                ["steelblue", "darkorange", "seagreen", "crimson"])):
+            ax = fig.add_subplot(gs[0, col])
+            ax.hist(vals, bins=40, color=color, edgecolor="white", alpha=0.85)
+            ax.axvline(np.mean(vals), color="black", linestyle="--", lw=1.5,
+                       label=f"μ={np.mean(vals):.1f}")
+            ax.set_xlabel(label, fontsize=8)
+            ax.set_ylabel("Count")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
 
-        # 2. LST std distribution
-        ax = axes[1]
-        ax.hist(stds, bins=50, color="darkorange", edgecolor="white", alpha=0.85)
-        ax.axvline(float(stds.mean()), color="black", linestyle="--", lw=1.5,
-                   label=f"μ={stds.mean():.2f}°C")
-        ax.axvline(0.3, color="red", linestyle=":", lw=1.2, label="QC min σ=0.3")
-        ax.set_xlabel("Patch LST Std (°C)", fontsize=9)
-        ax.set_ylabel("Count")
-        ax.set_title("Patch LST Std Distribution")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-        # 3. Mean vs Std scatter (quality overview)
-        ax = axes[2]
-        ax.hexbin(means, stds, gridsize=40, cmap="YlOrRd", mincnt=1)
-        ax.axvline(20.0, color="red",  linestyle=":", lw=1.0, label="QC temp bounds")
-        ax.axvline(58.0, color="red",  linestyle=":", lw=1.0)
-        ax.axhline(0.3,  color="blue", linestyle=":", lw=1.0, label="QC min σ")
-        ax.set_xlabel("Patch LST Mean (°C)", fontsize=9)
-        ax.set_ylabel("Patch LST Std (°C)", fontsize=9)
-        ax.set_title("LST Mean vs Std per Patch")
-        ax.legend(fontsize=8)
+        # Example patches (up to 4)
+        n_ex = min(4, len(patches))
+        ex_indices = np.linspace(0, len(patches) - 1, n_ex, dtype=int)
+        for col, idx in enumerate(ex_indices):
+            ax = fig.add_subplot(gs[1, col])
+            lst_patch = patches[idx]["data"]["LST"]
+            im = ax.imshow(lst_patch, cmap="inferno",
+                           vmin=np.nanpercentile(lst_patch, 2),
+                           vmax=np.nanpercentile(lst_patch, 98))
+            ax.set_title(f"Patch #{idx}\nμ={means[idx]:.1f}°C σ={stds[idx]:.1f}°C",
+                         fontsize=8)
+            ax.axis("off")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         fig.suptitle(f"Patch Quality Diagnostics  (n={len(patches):,} patches)",
                      fontsize=13, fontweight="bold")
-        plt.tight_layout()
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
@@ -590,9 +580,7 @@ class PreprocessingDiagnostics:
         bars = ax.bar(split_labels, split_means, yerr=split_stds,
                       color=colors[:len(split_labels)], capsize=6, alpha=0.8)
         for bar, n in zip(bars, split_ns):
-            bar_h = bar.get_height()
-            txt_y = bar_h * 0.5 if bar_h != 0 else 0.01
-            ax.text(bar.get_x() + bar.get_width() / 2, txt_y,
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 0.5,
                     f"n={n:,}", ha="center", va="center", color="white",
                     fontsize=9, fontweight="bold")
         ax.set_ylabel("Mean LST ± Std")
@@ -697,122 +685,1241 @@ class PreprocessingDiagnostics:
         self._save(fig, filename)
 
     # ------------------------------------------------------------------
+    # 9. Fusion quality (Landsat vs Sentinel-2 vs fused)
+    # ------------------------------------------------------------------
+    def plot_fusion_comparison(self, landsat_data: dict, sentinel2_data: dict,
+                                fused_data: dict, index: str = "NDVI",
+                                filename: str = "09_fusion_comparison.png"):
+        """Three-panel spatial comparison: Landsat | Sentinel-2 | Fused."""
+        datasets = [
+            (landsat_data,  "Landsat"),
+            (sentinel2_data,"Sentinel-2"),
+            (fused_data,    "Fused"),
+        ]
+        available = [(d, n) for d, n in datasets if index in d]
+        if len(available) < 2:
+            logger.warning(f"[Diagnostics] plot_fusion_comparison: need ≥2 sources for {index}.")
+            return
+
+        fig, axes = plt.subplots(1, len(available), figsize=(5 * len(available), 5))
+        if len(available) == 1:
+            axes = [axes]
+
+        all_vals = np.concatenate([d[index][np.isfinite(d[index])].ravel()
+                                   for d, _ in available])
+        vmin, vmax = np.nanpercentile(all_vals, [2, 98])
+
+        for ax, (data, name) in zip(axes, available):
+            im = ax.imshow(data[index], cmap="RdYlGn", vmin=vmin, vmax=vmax)
+            ax.set_title(f"{name}\n{index}", fontweight="bold")
+            ax.axis("off")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        fig.suptitle(f"Sensor Fusion Comparison – {index}",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
     # 10. Full pipeline summary dashboard
     # ------------------------------------------------------------------
     def plot_pipeline_summary(self, splits: dict, metadata: dict,
                                filename: str = "10_pipeline_summary.png"):
-        """One-page summary dashboard of the entire preprocessing run.
-
-        Args:
-            splits:   dict with keys "y_train", "y_val", "y_test" (4D arrays,
-                      N×H×W×1, normalised) and "split_counts" (dict of ints).
-            metadata: the metadata dict written by preprocessing (patch_size,
-                      n_channels, channel_order, temperature_range, qc_info, …).
-        """
-        fig = plt.figure(figsize=(16, 10))
-        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.5, wspace=0.4)
+        """One-page summary dashboard of the entire preprocessing run."""
+        fig = plt.figure(figsize=(18, 12))
+        gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.5, wspace=0.4)
 
         colors = ["#2196F3", "#FF9800", "#4CAF50"]
-        split_keys = [("y_train", "Train"), ("y_val", "Val"), ("y_test", "Test")]
 
-        # ── 1. Sample count bar ───────────────────────────────────────
+        # ── Sample counts ─────────────────────────────────────────────
         ax0 = fig.add_subplot(gs[0, 0])
-        sc = splits.get("split_counts", metadata.get("split_counts", {}))
         labels = ["Train", "Val", "Test"]
-        counts = [sc.get("train", 0), sc.get("val", 0), sc.get("test", 0)]
-        bars = ax0.bar(labels, counts, color=colors, alpha=0.85)
-        for bar, cnt in zip(bars, counts):
-            ax0.text(bar.get_x() + bar.get_width() / 2,
-                     bar.get_height() + max(counts) * 0.01,
+        counts = [len(splits.get("X_train", [])), len(splits.get("X_val", [])),
+                  len(splits.get("X_test", []))]
+        ax0.bar(labels, counts, color=colors, alpha=0.85)
+        for bar, cnt in zip(ax0.patches, counts):
+            ax0.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                      f"{cnt:,}", ha="center", va="bottom", fontsize=9)
-        ax0.set_title("Sample Counts per Split")
-        ax0.set_ylabel("# Patches")
+        ax0.set_title("Sample Counts")
+        ax0.set_ylabel("# Samples")
         ax0.grid(True, alpha=0.3, axis="y")
 
-        # ── 2. LST distributions ──────────────────────────────────────
-        ax1 = fig.add_subplot(gs[0, 1])
-        for (yk, label), col in zip(split_keys, colors):
+        # ── Target LST distributions ───────────────────────────────────
+        ax1 = fig.add_subplot(gs[0, 1:3])
+        for (yk, label), col in zip(
+                [("y_train", "Train"), ("y_val", "Val"), ("y_test", "Test")],
+                colors):
             if yk in splits:
-                vals = np.asarray(splits[yk]).ravel()
+                vals = splits[yk].ravel()
                 ax1.hist(vals, bins=60, alpha=0.55, color=col, label=label, density=True)
         ax1.set_xlabel("LST (normalised)")
         ax1.set_ylabel("Density")
-        ax1.set_title("LST Distribution per Split")
+        ax1.set_title("Target (LST) Distribution per Split")
         ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
 
-        # ── 3. QC info ────────────────────────────────────────────────
-        ax2 = fig.add_subplot(gs[0, 2])
+        # ── Metadata text block ────────────────────────────────────────
+        ax2 = fig.add_subplot(gs[0, 3])
         ax2.axis("off")
-        qc = metadata.get("qc_info", {})
         tr = metadata.get("temperature_range", {})
         fi = metadata.get("fusion_info", {})
-        info_lines = [
-            "Pipeline Summary",
-            "─" * 26,
-            f"Strategy:   {fi.get('fusion_strategy','N/A')}",
-            f"Scanned:    {qc.get('scanned', 'N/A'):,}" if isinstance(qc.get('scanned'), int) else f"Scanned:    {qc.get('scanned','N/A')}",
-            f"Rejected:   {qc.get('rejected', 'N/A'):,}" if isinstance(qc.get('rejected'), int) else f"Rejected:   {qc.get('rejected','N/A')}",
-            f"Accepted:   {qc.get('accepted', 'N/A'):,}" if isinstance(qc.get('accepted'), int) else f"Accepted:   {qc.get('accepted','N/A')}",
-            "─" * 26,
-            f"LST mean:   {tr.get('mean', float('nan')):.2f}°C",
-            f"LST std:    {tr.get('std',  float('nan')):.2f}°C",
-            f"LST range:  [{tr.get('min', float('nan')):.1f}, {tr.get('max', float('nan')):.1f}]°C",
-            "─" * 26,
-            f"Patches:    {metadata.get('n_samples','N/A'):,}" if isinstance(metadata.get('n_samples'), int) else f"Patches:    {metadata.get('n_samples','N/A')}",
-            f"Channels:   {metadata.get('n_channels','N/A')}",
-            f"Patch size: {metadata.get('patch_size','N/A')} px",
-        ]
-        ax2.text(0.05, 0.95, "\n".join(info_lines), transform=ax2.transAxes,
+        info = (
+            f"Pipeline Summary\n"
+            f"{'─'*28}\n"
+            f"Fusion:  {fi.get('fusion_strategy','N/A')}\n"
+            f"Landsat files:  {fi.get('landsat_files', 'N/A')}\n"
+            f"Sentinel-2 files: {fi.get('sentinel2_files', 'N/A')}\n"
+            f"Fused datasets: {fi.get('fused_datasets', 'N/A')}\n"
+            f"{'─'*28}\n"
+            f"LST mean:  {tr.get('mean', float('nan')):.4f}\n"
+            f"LST std:   {tr.get('std',  float('nan')):.4f}\n"
+            f"LST min:   {tr.get('min',  float('nan')):.4f}\n"
+            f"LST max:   {tr.get('max',  float('nan')):.4f}\n"
+            f"{'─'*28}\n"
+            f"Patches: {metadata.get('n_samples','N/A'):,}\n"
+            f"Channels: {metadata.get('n_channels','N/A')}\n"
+            f"Patch size: {metadata.get('patch_size','N/A')} px"
+        )
+        ax2.text(0.05, 0.95, info, transform=ax2.transAxes,
                  fontsize=8, va="top", fontfamily="monospace",
                  bbox=dict(boxstyle="round,pad=0.5", facecolor="#f0f4ff", alpha=0.8))
-        ax2.set_title("Run Info", fontweight="bold")
 
-        # ── 4. Per-split mean ± std bar ───────────────────────────────
-        ax3 = fig.add_subplot(gs[1, 0])
-        s_labels, s_means, s_stds = [], [], []
-        for yk, label in split_keys:
-            if yk in splits:
-                v = np.asarray(splits[yk]).ravel()
-                s_labels.append(label)
-                s_means.append(float(v.mean()))
-                s_stds.append(float(v.std()))
-        if s_labels:
-            errbars = ax3.bar(s_labels, s_means, yerr=s_stds,
-                              color=colors[:len(s_labels)], capsize=6, alpha=0.8)
-            ax3.set_ylabel("Mean LST ± Std (normalised)")
-            ax3.set_title("Split LST Statistics")
-            ax3.grid(True, alpha=0.3, axis="y")
+        # ── Per-channel mean across splits ─────────────────────────────
+        ax3 = fig.add_subplot(gs[1, :2])
+        n_ch = splits["X_train"].shape[-1] if "X_train" in splits else 0
+        ch_names = metadata.get("channel_order", [f"Ch{i}" for i in range(n_ch)])
+        x_pos = np.arange(n_ch)
+        width = 0.27
+        for offset, (xk, label), col in zip(
+                [-width, 0, width],
+                [("X_train","Train"),("X_val","Val"),("X_test","Test")],
+                colors):
+            if xk in splits:
+                means = splits[xk].mean(axis=(0, 1, 2))
+                ax3.bar(x_pos + offset, means, width=width, color=col, alpha=0.8, label=label)
+        ax3.set_xticks(x_pos)
+        ax3.set_xticklabels(ch_names[:n_ch], rotation=45, ha="right", fontsize=7)
+        ax3.set_title("Per-Channel Mean (normalised) across Splits")
+        ax3.set_ylabel("Mean value")
+        ax3.legend(fontsize=8)
+        ax3.grid(True, alpha=0.3, axis="y")
 
-        # ── 5. Patch LST variance per split ──────────────────────────
-        ax4 = fig.add_subplot(gs[1, 1])
-        for (yk, label), col in zip(split_keys, colors):
-            if yk in splits:
-                arr = np.asarray(splits[yk])    # (N, H, W, 1)
-                patch_stds = arr.reshape(arr.shape[0], -1).std(axis=1)
-                ax4.hist(patch_stds, bins=50, alpha=0.55, color=col,
-                         label=f"{label} μ={patch_stds.mean():.3f}", density=True)
-        ax4.set_xlabel("Per-patch LST Std (normalised)")
-        ax4.set_ylabel("Density")
-        ax4.set_title("Patch LST Variance per Split")
+        # ── Per-channel std across splits ──────────────────────────────
+        ax4 = fig.add_subplot(gs[1, 2:])
+        for offset, (xk, label), col in zip(
+                [-width, 0, width],
+                [("X_train","Train"),("X_val","Val"),("X_test","Test")],
+                colors):
+            if xk in splits:
+                stds = splits[xk].std(axis=(0, 1, 2))
+                ax4.bar(x_pos + offset, stds, width=width, color=col, alpha=0.8, label=label)
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(ch_names[:n_ch], rotation=45, ha="right", fontsize=7)
+        ax4.set_title("Per-Channel Std (normalised) across Splits")
+        ax4.set_ylabel("Std value")
         ax4.legend(fontsize=8)
-        ax4.grid(True, alpha=0.3)
+        ax4.grid(True, alpha=0.3, axis="y")
 
-        # ── 6. Channel order ─────────────────────────────────────────
-        ax5 = fig.add_subplot(gs[1, 2])
-        ax5.axis("off")
-        ch = metadata.get("channel_order", [])
-        ch_text = "Input channels:\n" + "\n".join(f"  {i}: {c}" for i, c in enumerate(ch))
-        ax5.text(0.05, 0.95, ch_text, transform=ax5.transAxes,
-                 fontsize=9, va="top", fontfamily="monospace",
-                 bbox=dict(boxstyle="round,pad=0.4", facecolor="#fff8e1", alpha=0.9))
-        ax5.set_title("Channel Order", fontweight="bold")
+        # ── Patch LST variance distribution ───────────────────────────
+        ax5 = fig.add_subplot(gs[2, :2])
+        for (yk, label), col in zip(
+                [("y_train","Train"),("y_val","Val"),("y_test","Test")],
+                colors):
+            if yk in splits:
+                patch_stds = splits[yk].std(axis=(1, 2, 3))
+                ax5.hist(patch_stds, bins=50, alpha=0.55, color=col,
+                         label=f"{label} μ={patch_stds.mean():.3f}", density=True)
+        ax5.set_xlabel("Per-patch LST Std")
+        ax5.set_ylabel("Density")
+        ax5.set_title("Patch LST Variance Distribution per Split")
+        ax5.legend(fontsize=8)
+        ax5.grid(True, alpha=0.3)
+
+        # ── Normalisation check ────────────────────────────────────────
+        ax6 = fig.add_subplot(gs[2, 2:])
+        split_info = []
+        for xk, yk, label in [("X_train","y_train","Train"),
+                                ("X_val","y_val","Val"),
+                                ("X_test","y_test","Test")]:
+            if xk in splits and yk in splits:
+                split_info.append({
+                    "Split": label,
+                    "X mean": f"{splits[xk].mean():.4f}",
+                    "X std":  f"{splits[xk].std():.4f}",
+                    "y mean": f"{splits[yk].mean():.4f}",
+                    "y std":  f"{splits[yk].std():.4f}",
+                })
+        ax6.axis("off")
+        if split_info:
+            col_labels = list(split_info[0].keys())
+            cell_text  = [[row[c] for c in col_labels] for row in split_info]
+            tbl = ax6.table(cellText=cell_text, colLabels=col_labels,
+                            loc="center", cellLoc="center")
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(9)
+            tbl.scale(1.1, 2.0)
+        ax6.set_title("Normalisation Verification", fontweight="bold")
 
         fig.suptitle("Preprocessing Pipeline – Summary Dashboard",
                      fontsize=15, fontweight="bold")
-        plt.tight_layout()
         self._save(fig, filename)
         logger.info(f"[Diagnostics] ✅ Pipeline summary saved → {self.out / filename}")
+
+    # ==================================================================
+    # SENTINEL-2 SPECIFIC DIAGNOSTICS
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # S2-1. Sentinel-2 raw band overview (10 m + 20 m bands side-by-side)
+    # ------------------------------------------------------------------
+
+    # Canonical S2 band aliases: maps logical name → list of possible npz keys
+    _S2_BAND_ALIASES: dict = {
+        "B2":  ["B2",  "B02", "blue",  "BLUE",  "b2",  "band2",  "band02"],
+        "B3":  ["B3",  "B03", "green", "GREEN", "b3",  "band3",  "band03"],
+        "B4":  ["B4",  "B04", "red",   "RED",   "b4",  "band4",  "band04"],
+        "B8":  ["B8",  "B08", "nir",   "NIR",   "b8",  "band8",  "band08"],
+        "B11": ["B11", "swir1","SWIR1", "b11", "band11"],
+        "B12": ["B12", "swir2","SWIR2", "b12", "band12"],
+    }
+
+    _S2_BAND_META: dict = {
+        "B2":  ("Blue – 490 nm",   "Blues_r",  "10 m"),
+        "B3":  ("Green – 560 nm",  "Greens_r", "10 m"),
+        "B4":  ("Red – 665 nm",    "Reds_r",   "10 m"),
+        "B8":  ("NIR – 842 nm",    "YlGn",     "10 m"),
+        "B11": ("SWIR1 – 1610 nm", "YlOrBr",   "20 m"),
+        "B12": ("SWIR2 – 2190 nm", "copper",   "20 m"),
+    }
+
+    def _resolve_s2_bands(self, raw_data: dict) -> dict:
+        """
+        Resolve actual npz keys to canonical S2 band names.
+        Handles key variants like B2/B02/blue/BLUE etc.
+        Also auto-detects any 2-D array that looks like a spectral band
+        (i.e. not an index we computed).
+        Returns {canonical_name: array}.
+        """
+        resolved = {}
+        available_keys = set(raw_data.keys())
+
+        # Step 1: try known aliases
+        for canonical, aliases in self._S2_BAND_ALIASES.items():
+            for alias in aliases:
+                if alias in available_keys:
+                    arr = np.asarray(raw_data[alias], dtype=float)
+                    if arr.ndim == 2:
+                        resolved[canonical] = arr
+                        break
+
+        # Step 2: log all keys and what we found / missed
+        logger.info(f"[Diagnostics] S2 npz keys found: {sorted(available_keys)}")
+        logger.info(f"[Diagnostics] S2 bands resolved: {list(resolved.keys())}")
+
+        # Step 3: if we resolved nothing, fall back to ALL 2-D arrays
+        if not resolved:
+            logger.warning(
+                "[Diagnostics] No canonical S2 bands matched — "
+                "falling back to all 2-D arrays in npz."
+            )
+            for k, v in raw_data.items():
+                arr = np.asarray(v, dtype=float)
+                if arr.ndim == 2:
+                    resolved[k] = arr
+
+        return resolved
+
+    @staticmethod
+    def _safe_stretch(arr: np.ndarray,
+                      lo_pct: float = 2.0,
+                      hi_pct: float = 98.0,
+                      min_spread: float = 1e-4) -> tuple:
+        """
+        Compute vmin/vmax for imshow with a guaranteed minimum spread.
+        Falls back to absolute min/max when percentile range collapses.
+        Also warns if the array looks like it contains only fill values.
+        """
+        valid = arr[np.isfinite(arr)]
+        if valid.size == 0:
+            return 0.0, 1.0
+
+        lo, hi = np.nanpercentile(valid, [lo_pct, hi_pct])
+        spread = hi - lo
+
+        if spread < min_spread:
+            # Percentile stretch collapsed → use full range
+            lo_full, hi_full = valid.min(), valid.max()
+            spread_full = hi_full - lo_full
+            logger.warning(
+                f"[Diagnostics] Band has near-zero contrast "
+                f"(p{lo_pct:.0f}={lo:.6f}, p{hi_pct:.0f}={hi:.6f}). "
+                f"Full range: [{lo_full:.6f}, {hi_full:.6f}]."
+            )
+            if spread_full < min_spread:
+                # Truly uniform — centre around the constant value
+                centre = valid.mean()
+                return centre - 0.05, centre + 0.05
+            return lo_full, hi_full
+
+        return lo, hi
+
+    @staticmethod
+    def _normalise_band(arr: np.ndarray,
+                        lo: float, hi: float) -> np.ndarray:
+        """Linearly stretch arr to [0, 1] given lo/hi, clip to [0, 1]."""
+        spread = hi - lo
+        if spread < 1e-10:
+            return np.zeros_like(arr, dtype=np.float32)
+        return np.clip((arr.astype(np.float32) - np.float32(lo)) / np.float32(spread), 0.0, 1.0)
+
+    def plot_s2_raw_bands(self, raw_data: dict,
+                          filename: str = "s2_01_raw_bands.png"):
+        """
+        Display all Sentinel-2 spectral bands grouped by native resolution.
+        10 m bands: B2 (Blue), B3 (Green), B4 (Red), B8 (NIR)
+        20 m bands: B11 (SWIR1), B12 (SWIR2)
+        Also renders a false-colour NIR/Red/Green composite.
+
+        Robust against:
+        - Different npz key naming conventions (B2/B02/blue/BLUE…)
+        - Near-zero variance (uniform fill tiles)
+        - Different band value scales (DN, reflectance 0-1, reflectance ×10000)
+        """
+        bands = self._resolve_s2_bands(raw_data)
+
+        if not bands:
+            logger.warning("[Diagnostics] plot_s2_raw_bands: no 2-D bands found in raw_data.")
+            return
+
+        # ── Data-level diagnostic: print per-band statistics ───────────
+        logger.info("[Diagnostics] S2 band statistics:")
+        for name, arr in bands.items():
+            valid = arr[np.isfinite(arr)]
+            if valid.size:
+                logger.info(
+                    f"  {name:5s}: shape={arr.shape}  "
+                    f"min={valid.min():.4f}  max={valid.max():.4f}  "
+                    f"mean={valid.mean():.4f}  std={valid.std():.6f}  "
+                    f"nonzero={np.count_nonzero(valid):,}/{valid.size:,}"
+                )
+            else:
+                logger.warning(f"  {name:5s}: all NaN/Inf!")
+        # ───────────────────────────────────────────────────────────────
+
+        ordered = [b for b in ["B2", "B3", "B4", "B8", "B11", "B12"] if b in bands]
+        extras  = [b for b in bands if b not in ordered]  # fallback unnamed bands
+        ordered += extras
+
+        n_panels = len(ordered) + 1  # +1 for composite
+        ncols = min(4, n_panels)
+        nrows = (n_panels + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(ncols * 4.5, nrows * 4.2))
+        axes = np.array(axes).flatten()
+        panel = 0
+
+        # ── False-colour composite (NIR/Red/Green) ─────────────────────
+        rgb_canonical = ["B8", "B4", "B3"]
+        rgb_available = [b for b in rgb_canonical if b in bands]
+
+        ax = axes[panel]; panel += 1
+        if len(rgb_available) == 3:
+            channels = []
+            for b in rgb_available:
+                arr = bands[b]
+                lo, hi = self._safe_stretch(arr)
+                channels.append(self._normalise_band(arr, lo, hi))
+
+            h = min(c.shape[0] for c in channels)
+            w = min(c.shape[1] for c in channels)
+            composite = np.dstack([c[:h, :w] for c in channels])
+            ax.imshow(composite, interpolation="bilinear")
+            ax.set_title("False-Colour Composite\n(NIR / Red / Green)", fontweight="bold")
+        else:
+            ax.text(0.5, 0.5,
+                    f"NIR/Red/Green unavailable\n(found: {list(bands.keys())})",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=8, color="gray")
+            ax.set_title("False-Colour Composite\n(unavailable)", fontweight="bold")
+        ax.axis("off")
+
+        # ── Individual band panels ─────────────────────────────────────
+        for b in ordered:
+            ax = axes[panel]; panel += 1
+            arr = bands[b]
+            lo, hi = self._safe_stretch(arr)
+            meta = self._S2_BAND_META.get(b, (b, "viridis", "?"))
+            label, cmap, res = meta
+
+            # Annotate if the stretch had to fall back to full range
+            stretch_note = ""
+            p2, p98 = np.nanpercentile(arr[np.isfinite(arr)], [2, 98]) \
+                if arr[np.isfinite(arr)].size else (0, 0)
+            if (p98 - p2) < 1e-4:
+                stretch_note = "\n⚠ near-uniform (full range shown)"
+
+            im = ax.imshow(arr, cmap=cmap, vmin=lo, vmax=hi, interpolation="bilinear")
+            ax.set_title(f"{b} – {label}\n({res}){stretch_note}", fontsize=8)
+            ax.axis("off")
+            cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cb.ax.tick_params(labelsize=7)
+
+        for ax in axes[panel:]:
+            ax.set_visible(False)
+
+        # ── Figure-level stats annotation ──────────────────────────────
+        n_bands_found = len(bands)
+        n_bands_canonical = sum(1 for b in ["B2","B3","B4","B8","B11","B12"] if b in bands)
+        fig.suptitle(
+            f"Sentinel-2 Raw Bands  "
+            f"({n_bands_canonical}/6 canonical bands resolved, "
+            f"{n_bands_found} total arrays)",
+            fontsize=13, fontweight="bold"
+        )
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-2. Sentinel-2 spectral indices with UHI-relevant interpretation
+    # ------------------------------------------------------------------
+    def plot_s2_spectral_indices(self, indices: dict,
+                                  filename: str = "s2_02_spectral_indices.png"):
+        """
+        Spatial maps of all S2-derived indices with colourbar annotations
+        and UHI-relevant class boundaries overlaid as contour lines.
+        """
+        index_cfg = {
+            "NDVI":   ("Vegetation",        "RdYlGn",  [0.2, 0.5]),
+            "NDBI":   ("Built-up",          "RdBu_r",  [0.0]),
+            "MNDWI":  ("Water",             "Blues",   [0.0]),
+            "BSI":    ("Bare Soil",         "YlOrBr",  [0.0]),
+            "UI":     ("Urban Index",       "hot_r",   [0.0]),
+            "albedo": ("Surface Albedo",    "gray",    [0.15, 0.25]),
+        }
+
+        keys = [k for k in index_cfg if k in indices]
+        if not keys:
+            logger.warning("[Diagnostics] plot_s2_spectral_indices: no indices found.")
+            return
+
+        ncols = 3
+        nrows = (len(keys) + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(15, nrows * 4.5))
+        axes = np.array(axes).flatten()
+
+        for ax, key in zip(axes, keys):
+            arr = indices[key]
+            valid = arr[np.isfinite(arr)]
+            vmin, vmax = np.nanpercentile(valid, [2, 98])
+            label, cmap, contour_levels = index_cfg[key]
+            im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+            # Overlay threshold contours
+            try:
+                ax.contour(arr, levels=contour_levels, colors="white",
+                           linewidths=0.8, alpha=0.7)
+            except Exception:
+                pass
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f"{key} – {label}\nrange [{vmin:.2f}, {vmax:.2f}]",
+                         fontsize=8, fontweight="bold")
+            ax.axis("off")
+
+        for ax in axes[len(keys):]:
+            ax.set_visible(False)
+
+        fig.suptitle("Sentinel-2 Spectral Indices with Class Boundaries",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-3. Sentinel-2 band statistics & value distributions
+    # ------------------------------------------------------------------
+    def plot_s2_band_statistics(self, raw_data: dict,
+                                 filename: str = "s2_03_band_statistics.png"):
+        """
+        Box-and-whisker + histogram for each S2 band. Highlights outlier
+        pixels that may indicate cloud/shadow contamination.
+        """
+        bands = self._resolve_s2_bands(raw_data)
+        band_order = [b for b in ["B2", "B3", "B4", "B8", "B11", "B12"] if b in bands]
+        if not band_order:
+            # Fall back to whatever was resolved
+            band_order = list(bands.keys())
+        if not band_order:
+            logger.warning("[Diagnostics] plot_s2_band_statistics: no bands found.")
+            return
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 9))
+
+        # --- Top: box plots ---
+        ax = axes[0]
+        data_lists = []
+        for b in band_order:
+            arr = bands[b].ravel()
+            arr = arr[np.isfinite(arr)]
+            # Subsample for speed
+            if len(arr) > 100_000:
+                arr = np.random.default_rng(42).choice(arr, 100_000, replace=False)
+            data_lists.append(arr)
+
+        bp = ax.boxplot(data_lists, tick_labels=band_order, patch_artist=True,
+                        showfliers=False, notch=False)
+        band_colors = ["#1565C0","#388E3C","#C62828","#7B1FA2","#E65100","#4E342E"]
+        for patch, col in zip(bp["boxes"], band_colors[:len(band_order)]):
+            patch.set_facecolor(col)
+            patch.set_alpha(0.6)
+        ax.set_title("Band Value Distributions (box = IQR, whiskers = 1.5×IQR)")
+        ax.set_ylabel("Digital Number / Reflectance")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        # --- Bottom: overlaid KDE-style histograms ---
+        ax2 = axes[1]
+        for b, col in zip(band_order, band_colors):
+            arr = bands[b].ravel()
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                continue
+            lo, hi = np.nanpercentile(arr, [0.5, 99.5])
+            spread = hi - lo
+            if spread < 1e-6:
+                lo, hi = arr.min(), arr.max()
+            arr_clip = arr[(arr >= lo) & (arr <= hi)]
+            if len(arr_clip) > 0:
+                ax2.hist(arr_clip, bins=100, alpha=0.45, color=col,
+                         label=b, density=True)
+        ax2.set_xlabel("Pixel Value")
+        ax2.set_ylabel("Density")
+        ax2.set_title("Band Pixel-Value Histograms (0.5–99.5 percentile range)")
+        ax2.legend(ncol=3, fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        fig.suptitle("Sentinel-2 Band-Level Statistics", fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-4. Cloud / shadow quality-flag heatmap
+    # ------------------------------------------------------------------
+    def plot_s2_data_quality(self, raw_data: dict,
+                              filename: str = "s2_04_data_quality.png"):
+        """
+        Derive a simple pixel-level quality score from reflectance values:
+          - Saturated (>1.0 reflectance after scaling) → likely cloud top
+          - Very dark (<0.01) in Blue → likely cloud shadow
+          - NDVI < -0.1 AND Blue > 0.3 → possible cloud
+        Also shows NaN/fill-value masks per band.
+        """
+        bands = self._resolve_s2_bands(raw_data)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Panel 1: NaN coverage per band
+        ax = axes[0]
+        band_names = [b for b in ["B2","B3","B4","B8","B11","B12"] if b in bands]
+        if not band_names:
+            band_names = list(bands.keys())
+        nan_pcts   = [np.sum(~np.isfinite(bands[b])) / bands[b].size * 100
+                      for b in band_names]
+        colors_q   = ["#EF5350" if p > 5 else "#66BB6A" for p in nan_pcts]
+        bars = ax.barh(band_names, nan_pcts, color=colors_q, alpha=0.85)
+        ax.set_xlabel("NaN / Fill pixels (%)")
+        ax.set_title("Missing Data per Band")
+        ax.axvline(5, color="red", linestyle="--", lw=1.2, label="5% threshold")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, axis="x")
+
+        # Panel 2: Derived cloud probability proxy
+        ax2 = axes[1]
+        b2 = bands.get("B2"); b4 = bands.get("B4"); b8 = bands.get("B8")
+        if b2 is not None and b4 is not None and b8 is not None:
+            blue = b2.astype(np.float32)
+            red  = b4.astype(np.float32)
+            nir  = b8.astype(np.float32)
+            eps  = np.float32(1e-8)
+            ndvi = (nir - red) / (nir + red + eps)
+
+            blue_norm = np.clip(blue / (np.nanmax(blue) + eps), 0, 1)
+            cloud_score = blue_norm * np.clip(1 - ndvi, 0, 1)
+            im2 = ax2.imshow(cloud_score, cmap="RdYlGn_r", vmin=0, vmax=1)
+            ax2.set_title("Cloud Probability Proxy\n(high blue × low NDVI)")
+            ax2.axis("off")
+            plt.colorbar(im2, ax=ax2, label="Score [0–1]")
+
+            # Panel 3: Shadow proxy
+            ax3 = axes[2]
+            nir_norm = np.clip(nir / (np.nanmax(nir) + eps), 0, 1)
+            shadow_score = np.clip(1 - nir_norm, 0, 1) * np.clip(1 - cloud_score, 0, 1)
+            im3 = ax3.imshow(shadow_score, cmap="Purples", vmin=0, vmax=1)
+            ax3.set_title("Shadow Probability Proxy\n(dark NIR, low cloud score)")
+            ax3.axis("off")
+            plt.colorbar(im3, ax=ax3, label="Score [0–1]")
+        else:
+            axes[1].text(0.5, 0.5,
+                         f"B2/B4/B8 required\nAvailable: {list(bands.keys())}",
+                         ha="center", va="center", transform=axes[1].transAxes,
+                         fontsize=9, color="gray")
+            axes[2].set_visible(False)
+
+        fig.suptitle("Sentinel-2 Pixel Quality Assessment",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-5. Sentinel-2 band-ratio analysis (UHI-relevant ratios)
+    # ------------------------------------------------------------------
+    def plot_s2_band_ratios(self, raw_data: dict,
+                             filename: str = "s2_05_band_ratios.png"):
+        """
+        Compute and display five band-ratio images commonly used in
+        urban / vegetation / water studies.
+        """
+        bands = self._resolve_s2_bands(raw_data)
+        eps = 1e-8
+        ratios = {}
+        labels = {}
+
+        b2 = bands.get("B2"); b3 = bands.get("B3"); b4 = bands.get("B4")
+        b8 = bands.get("B8"); b11 = bands.get("B11"); b12 = bands.get("B12")
+
+        if b8 is not None and b4 is not None:
+            ratios["NIR/Red"]   = b8.astype(np.float32) / (b4.astype(np.float32) + eps)
+            labels["NIR/Red"]   = "Vegetation Vigour"
+        if b11 is not None and b8 is not None:
+            ratios["SWIR1/NIR"] = b11.astype(np.float32) / (b8.astype(np.float32) + eps)
+            labels["SWIR1/NIR"] = "Urban Heat / Soil Moisture Proxy"
+        if b4 is not None and b2 is not None:
+            ratios["Red/Blue"]  = b4.astype(np.float32) / (b2.astype(np.float32) + eps)
+            labels["Red/Blue"]  = "Aerosol / Dust Proxy"
+        if b8 is not None and b11 is not None:
+            ratios["NIR/SWIR1"] = b8.astype(np.float32) / (b11.astype(np.float32) + eps)
+            labels["NIR/SWIR1"] = "Soil Moisture Index"
+        if b2 is not None and b3 is not None and b4 is not None and b8 is not None:
+            num = b2.astype(np.float32) + b3.astype(np.float32)
+            den = b4.astype(np.float32) + b8.astype(np.float32)
+            ratios["(B+G)/(R+NIR)"] = num / (den + eps)
+            labels["(B+G)/(R+NIR)"] = "Simple Urban Index"
+
+        if not ratios:
+            logger.warning(
+                f"[Diagnostics] plot_s2_band_ratios: insufficient bands. "
+                f"Available: {list(bands.keys())}"
+            )
+            return
+
+        n = len(ratios)
+        ncols = min(3, n)
+        nrows = (n + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4.5))
+        axes = np.array(axes).flatten()
+
+        cmaps = ["YlGn", "hot_r", "RdBu", "Blues", "RdYlBu"]
+        for ax, (key, arr), cmap in zip(axes, ratios.items(), cmaps):
+            arr = arr.astype(np.float32)
+            vmin, vmax = self._safe_stretch(arr)
+            im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="bilinear")
+            ax.set_title(f"{key}\n{labels[key]}", fontsize=8, fontweight="bold")
+            ax.axis("off")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        for ax in axes[n:]:
+            ax.set_visible(False)
+
+        fig.suptitle("Sentinel-2 Band Ratio Analysis", fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-6. Land cover classification proxy from S2 indices
+    # ------------------------------------------------------------------
+    def plot_s2_landcover_proxy(self, indices: dict,
+                                 filename: str = "s2_06_landcover_proxy.png"):
+        """
+        Assign each pixel to one of five UHI-relevant land cover classes
+        using threshold rules on NDVI, NDBI, and MNDWI, then show:
+          - Spatial map of classified pixels
+          - Class area statistics (bar chart)
+          - Class-wise LST distribution (if LST available)
+        """
+        required = ["NDVI", "NDBI", "MNDWI"]
+        if not all(k in indices for k in required):
+            logger.warning("[Diagnostics] plot_s2_landcover_proxy: need NDVI/NDBI/MNDWI.")
+            return
+
+        ndvi  = indices["NDVI"]
+        ndbi  = indices["NDBI"]
+        mndwi = indices["MNDWI"]
+
+        # Classification rules (Jakarta tropical urban context)
+        # 0=Water, 1=Vegetation, 2=Bare Soil, 3=Impervious/Urban, 4=Mixed/Other
+        h, w = ndvi.shape
+        lc = np.full((h, w), 4, dtype=np.int8)
+        lc[mndwi > 0.0]  = 0          # Water
+        lc[(ndvi > 0.4) & (mndwi <= 0.0)]  = 1    # Dense vegetation
+        lc[(ndvi < 0.2) & (ndbi < 0.0) & (mndwi <= 0.0)] = 2  # Bare soil
+        lc[(ndbi > 0.0) & (mndwi <= 0.0)]  = 3    # Impervious / built-up
+
+        class_names  = ["Water", "Vegetation", "Bare Soil", "Urban/Impervious", "Mixed"]
+        class_colors = ["#2196F3","#4CAF50","#FFC107","#F44336","#9E9E9E"]
+        cmap_lc = mcolors.ListedColormap(class_colors)
+
+        fig = plt.figure(figsize=(16, 10))
+        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+
+        # Spatial map
+        ax0 = fig.add_subplot(gs[:, :2])
+        im  = ax0.imshow(lc, cmap=cmap_lc, vmin=-0.5, vmax=4.5,
+                         interpolation="nearest")
+        legend_patches = [Patch(color=c, label=n)
+                          for c, n in zip(class_colors, class_names)]
+        ax0.legend(handles=legend_patches, loc="lower right",
+                   fontsize=8, framealpha=0.8)
+        ax0.set_title("Land Cover Classification Proxy\n(NDVI / NDBI / MNDWI rules)",
+                      fontweight="bold")
+        ax0.axis("off")
+
+        # Area bar chart
+        ax1 = fig.add_subplot(gs[0, 2])
+        counts = [(lc == i).sum() for i in range(5)]
+        pcts   = [c / lc.size * 100 for c in counts]
+        bars   = ax1.bar(range(5), pcts, color=class_colors, alpha=0.85)
+        ax1.set_xticks(range(5))
+        ax1.set_xticklabels(class_names, rotation=30, ha="right", fontsize=7)
+        ax1.set_ylabel("Area (%)")
+        ax1.set_title("Class Area Distribution")
+        ax1.grid(True, alpha=0.3, axis="y")
+        for bar, pct in zip(bars, pcts):
+            if pct > 1:
+                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                         f"{pct:.1f}%", ha="center", va="bottom", fontsize=7)
+
+        # Class-wise LST violin (if available)
+        ax2 = fig.add_subplot(gs[1, 2])
+        if "LST" in indices:
+            lst = indices["LST"]
+            lst_data = []
+            valid_labels = []
+            for i, name in enumerate(class_names):
+                mask = (lc == i) & np.isfinite(lst)
+                vals = lst[mask].ravel()
+                if len(vals) >= 10:
+                    lst_data.append(vals[:10_000] if len(vals) > 10_000 else vals)
+                    valid_labels.append(name)
+
+            if lst_data:
+                vp = ax2.violinplot(lst_data, showmedians=True, showextrema=True)
+                for body, col in zip(vp["bodies"],
+                                     [class_colors[class_names.index(l)]
+                                      for l in valid_labels]):
+                    body.set_facecolor(col)
+                    body.set_alpha(0.7)
+                ax2.set_xticks(range(1, len(valid_labels) + 1))
+                ax2.set_xticklabels(valid_labels, rotation=30, ha="right", fontsize=7)
+                ax2.set_ylabel("LST (°C)")
+                ax2.set_title("LST Distribution by Land Cover")
+                ax2.grid(True, alpha=0.3, axis="y")
+        else:
+            ax2.text(0.5, 0.5, "LST not available\nfor this dataset",
+                     ha="center", va="center", transform=ax2.transAxes,
+                     fontsize=10, color="gray")
+            ax2.set_title("LST by Land Cover")
+            ax2.axis("off")
+
+        fig.suptitle("Sentinel-2 Land Cover Proxy & UHI Class Analysis",
+                     fontsize=13, fontweight="bold")
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-7. Temporal trend of S2 indices across all processed scenes
+    # ------------------------------------------------------------------
+    def plot_s2_temporal_trends(self,
+                                 processed_scenes: list,
+                                 filename: str = "s2_07_temporal_trends.png"):
+        """
+        Plot how scene-level statistics (mean/std) of each index evolve
+        over time across all Sentinel-2 acquisitions.
+
+        Args:
+            processed_scenes: list of (pd.Timestamp, processed_dict) tuples
+        """
+        if len(processed_scenes) < 2:
+            logger.warning("[Diagnostics] plot_s2_temporal_trends: need ≥2 scenes.")
+            return
+
+        indices_to_track = ["NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo"]
+        timestamps = [ts for ts, _ in processed_scenes]
+        scene_dicts = [d for _, d in processed_scenes]
+
+        present = [k for k in indices_to_track
+                   if any(k in d for d in scene_dicts)]
+        if not present:
+            return
+
+        ncols = 2
+        nrows = (len(present) + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(14, nrows * 3.5), sharex=True)
+        axes = np.array(axes).flatten()
+
+        date_strs = [ts.strftime("%Y-%m") for ts in timestamps]
+        x = np.arange(len(timestamps))
+
+        for ax, key in zip(axes, present):
+            means, stds, medians = [], [], []
+            for d in scene_dicts:
+                if key in d:
+                    vals = d[key][np.isfinite(d[key])].ravel()
+                    means.append(vals.mean() if len(vals) else np.nan)
+                    stds.append(vals.std()  if len(vals) else np.nan)
+                    medians.append(np.median(vals) if len(vals) else np.nan)
+                else:
+                    means.append(np.nan); stds.append(np.nan); medians.append(np.nan)
+
+            means   = np.array(means,   dtype=float)
+            stds    = np.array(stds,    dtype=float)
+            medians = np.array(medians, dtype=float)
+
+            ax.fill_between(x, means - stds, means + stds,
+                            alpha=0.2, color="#2196F3", label="±1 σ")
+            ax.plot(x, means,   "o-", color="#2196F3", lw=1.8, ms=4, label="mean")
+            ax.plot(x, medians, "s--", color="#FF9800", lw=1.2, ms=3, label="median")
+            ax.set_xticks(x)
+            ax.set_xticklabels(date_strs, rotation=45, ha="right", fontsize=7)
+            ax.set_title(key, fontsize=9, fontweight="bold")
+            ax.set_ylabel("Value")
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        for ax in axes[len(present):]:
+            ax.set_visible(False)
+
+        fig.suptitle("Sentinel-2 Index Temporal Trends (all scenes)",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-8. Landsat vs Sentinel-2 index agreement (pre-fusion)
+    # ------------------------------------------------------------------
+    def plot_sensor_agreement(self,
+                               landsat_data: dict,
+                               sentinel2_data: dict,
+                               filename: str = "s2_08_sensor_agreement.png"):
+        """
+        For each common index, overlay histograms and compute a simple
+        agreement score (1 – Wasserstein-normalised distance) between
+        the Landsat and Sentinel-2 distributions before fusion.
+        """
+        common = [k for k in ["NDVI","NDBI","MNDWI","BSI","UI","albedo"]
+                  if k in landsat_data and k in sentinel2_data]
+        if not common:
+            logger.warning("[Diagnostics] plot_sensor_agreement: no common indices.")
+            return
+
+        ncols = 3
+        nrows = (len(common) + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(14, nrows * 4))
+        axes = np.array(axes).flatten()
+
+        for ax, key in zip(axes, common):
+            ls_vals = landsat_data[key][np.isfinite(landsat_data[key])].ravel()
+            s2_vals = sentinel2_data[key][np.isfinite(sentinel2_data[key])].ravel()
+
+            # Subsample
+            if len(ls_vals) > 50_000:
+                ls_vals = np.random.default_rng(0).choice(ls_vals, 50_000, replace=False)
+            if len(s2_vals) > 50_000:
+                s2_vals = np.random.default_rng(0).choice(s2_vals, 50_000, replace=False)
+
+            lo = min(ls_vals.min(), s2_vals.min())
+            hi = max(ls_vals.max(), s2_vals.max())
+            bins = np.linspace(lo, hi, 80)
+
+            ax.hist(ls_vals, bins=bins, alpha=0.55, color="#1565C0",
+                    density=True, label="Landsat")
+            ax.hist(s2_vals, bins=bins, alpha=0.55, color="#E65100",
+                    density=True, label="Sentinel-2")
+
+            # Simple agreement: correlation of binned counts
+            ls_h, _ = np.histogram(ls_vals, bins=bins, density=True)
+            s2_h, _ = np.histogram(s2_vals, bins=bins, density=True)
+            if ls_h.std() > 0 and s2_h.std() > 0:
+                agreement = np.corrcoef(ls_h, s2_h)[0, 1]
+                ax.set_title(f"{key}  agreement r={agreement:.3f}", fontsize=9,
+                             fontweight="bold")
+            else:
+                ax.set_title(key, fontsize=9)
+
+            # Mean lines
+            ax.axvline(ls_vals.mean(), color="#1565C0", linestyle="--", lw=1.5,
+                       label=f"LS μ={ls_vals.mean():.3f}")
+            ax.axvline(s2_vals.mean(), color="#E65100", linestyle="--", lw=1.5,
+                       label=f"S2 μ={s2_vals.mean():.3f}")
+            ax.set_xlabel(key, fontsize=8)
+            ax.set_ylabel("Density")
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        for ax in axes[len(common):]:
+            ax.set_visible(False)
+
+        fig.suptitle("Landsat vs Sentinel-2 Index Distribution Agreement (pre-fusion)",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-9. Spatial resolution comparison (10 m vs 30 m)
+    # ------------------------------------------------------------------
+    def plot_resolution_comparison(self,
+                                    s2_data: dict,
+                                    ls_data: dict,
+                                    index: str = "NDVI",
+                                    filename: str = "s2_09_resolution_comparison.png"):
+        """
+        Show the same index at Sentinel-2 native 10 m resolution versus
+        the Landsat 30 m equivalent.  Includes a profile transect along
+        the central row to illustrate spatial detail loss.
+        """
+        if index not in s2_data or index not in ls_data:
+            logger.warning(f"[Diagnostics] plot_resolution_comparison: {index} not in both sensors.")
+            return
+
+        s2_arr = s2_data[index].astype(np.float32)
+        ls_arr = ls_data[index].astype(np.float32)
+
+        fig = plt.figure(figsize=(16, 10))
+        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+
+        # Determine shared colour range
+        all_vals = np.concatenate([s2_arr[np.isfinite(s2_arr)].ravel(),
+                                   ls_arr[np.isfinite(ls_arr)].ravel()])
+        vmin, vmax = np.nanpercentile(all_vals, [2, 98])
+
+        ax0 = fig.add_subplot(gs[0, 0])
+        im0 = ax0.imshow(s2_arr, cmap="RdYlGn", vmin=vmin, vmax=vmax)
+        ax0.set_title(f"Sentinel-2  {index}\n(10 m native)", fontweight="bold")
+        ax0.axis("off")
+        plt.colorbar(im0, ax=ax0)
+
+        ax1 = fig.add_subplot(gs[0, 1])
+        im1 = ax1.imshow(ls_arr, cmap="RdYlGn", vmin=vmin, vmax=vmax)
+        ax1.set_title(f"Landsat  {index}\n(30 m native)", fontweight="bold")
+        ax1.axis("off")
+        plt.colorbar(im1, ax=ax1)
+
+        # Difference map (resample S2 to LS shape)
+        ax2 = fig.add_subplot(gs[0, 2])
+        try:
+            s2_resampled = zoom(s2_arr,
+                                (ls_arr.shape[0]/s2_arr.shape[0],
+                                 ls_arr.shape[1]/s2_arr.shape[1]),
+                                order=1)
+            h = min(s2_resampled.shape[0], ls_arr.shape[0])
+            w = min(s2_resampled.shape[1], ls_arr.shape[1])
+            diff = s2_resampled[:h, :w] - ls_arr[:h, :w]
+            lim  = np.nanpercentile(np.abs(diff[np.isfinite(diff)]), 98)
+            imd  = ax2.imshow(diff, cmap="RdBu_r", vmin=-lim, vmax=lim)
+            ax2.set_title(f"Difference\n(S2 resampled − Landsat)", fontweight="bold")
+            ax2.axis("off")
+            plt.colorbar(imd, ax=ax2, label="Δ value")
+        except Exception as e:
+            ax2.text(0.5, 0.5, f"Diff failed:\n{e}", ha="center", va="center",
+                     transform=ax2.transAxes, fontsize=8)
+            ax2.axis("off")
+
+        # Transect profiles
+        ax3 = fig.add_subplot(gs[1, :])
+        row_s2 = s2_arr.shape[0] // 2
+        row_ls = ls_arr.shape[0] // 2
+        profile_s2 = s2_arr[row_s2, :]
+        profile_ls = ls_arr[row_ls, :]
+
+        x_s2 = np.linspace(0, 1, len(profile_s2))
+        x_ls = np.linspace(0, 1, len(profile_ls))
+
+        ax3.plot(x_s2, profile_s2, color="#E65100", lw=1.2, alpha=0.8,
+                 label=f"Sentinel-2 (10 m, {len(profile_s2)} px)")
+        ax3.plot(x_ls, profile_ls, color="#1565C0", lw=2.0, alpha=0.9,
+                 label=f"Landsat (30 m, {len(profile_ls)} px)")
+        ax3.set_xlabel("Relative position along central row")
+        ax3.set_ylabel(index)
+        ax3.set_title("Central Row Profile – Spatial Detail Comparison")
+        ax3.legend(fontsize=9)
+        ax3.grid(True, alpha=0.3)
+
+        fig.suptitle(f"Resolution Comparison – {index}  (10 m vs 30 m)",
+                     fontsize=13, fontweight="bold")
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-10. Multi-scene Sentinel-2 index variability heatmap
+    # ------------------------------------------------------------------
+    def plot_s2_scene_variability(self,
+                                   processed_scenes: list,
+                                   filename: str = "s2_10_scene_variability.png"):
+        """
+        Compute per-pixel coefficient of variation (CV = std/mean) across
+        all Sentinel-2 scenes.  High CV areas are most temporally variable
+        (e.g. seasonal vegetation, flooding, construction).
+        Also shows the pixel-wise mean map.
+        """
+        indices_show = ["NDVI", "NDBI", "MNDWI"]
+        scene_dicts  = [d for _, d in processed_scenes]
+
+        available = [k for k in indices_show
+                     if all(k in d for d in scene_dicts)]
+        if not available:
+            logger.warning("[Diagnostics] plot_s2_scene_variability: no common indices across scenes.")
+            return
+
+        ncols = 2
+        nrows = len(available)
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(10, nrows * 4.5))
+        if nrows == 1:
+            axes = axes[np.newaxis, :]
+
+        for row, key in enumerate(available):
+            # Use Welford's online algorithm to compute mean and variance
+            # incrementally — one scene at a time — so we never allocate a
+            # stack of all scenes simultaneously (avoids the ~132 MiB spike).
+            shapes = [d[key].shape for d in scene_dicts]
+            h = min(s[0] for s in shapes)
+            w = min(s[1] for s in shapes)
+
+            count    = np.zeros((h, w), dtype=np.float32)
+            mean     = np.zeros((h, w), dtype=np.float32)
+            M2       = np.zeros((h, w), dtype=np.float32)
+
+            for d in scene_dicts:
+                scene = d[key][:h, :w].astype(np.float32)
+                valid = np.isfinite(scene)
+                count[valid] += 1
+                delta         = np.where(valid, scene - mean, 0.0)
+                mean         += np.where(valid, delta / np.maximum(count, 1), 0.0)
+                delta2        = np.where(valid, scene - mean, 0.0)
+                M2           += np.where(valid, delta * delta2, 0.0)
+                del scene, valid, delta, delta2
+
+            with np.errstate(invalid="ignore", divide="ignore"):
+                pixel_mean = np.where(count > 0, mean, np.nan)
+                pixel_std  = np.where(count > 1,
+                                      np.sqrt(M2 / np.maximum(count - 1, 1)),
+                                      np.nan)
+                pixel_cv   = pixel_std / (np.abs(pixel_mean) + 1e-8)
+
+            del count, mean, M2
+
+            # Mean map
+            ax0 = axes[row, 0]
+            vmin, vmax = np.nanpercentile(pixel_mean[np.isfinite(pixel_mean)], [2, 98])
+            im0 = ax0.imshow(pixel_mean, cmap="RdYlGn" if key == "NDVI" else "viridis",
+                             vmin=vmin, vmax=vmax)
+            ax0.set_title(f"{key} – Pixel-wise Mean\n(across {len(scene_dicts)} scenes)",
+                          fontsize=9, fontweight="bold")
+            ax0.axis("off")
+            plt.colorbar(im0, ax=ax0)
+
+            # CV map
+            ax1 = axes[row, 1]
+            cv_max = np.nanpercentile(pixel_cv[np.isfinite(pixel_cv)], 98)
+            im1 = ax1.imshow(pixel_cv, cmap="YlOrRd", vmin=0, vmax=cv_max)
+            ax1.set_title(f"{key} – Coefficient of Variation\n(temporal instability)",
+                          fontsize=9, fontweight="bold")
+            ax1.axis("off")
+            plt.colorbar(im1, ax=ax1, label="CV = σ / |μ|")
+
+        fig.suptitle("Sentinel-2 Multi-Scene Index Variability",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-11. Fusion weight map (how much each sensor contributes)
+    # ------------------------------------------------------------------
+    def plot_fusion_weight_map(self,
+                                landsat_data: dict,
+                                sentinel2_data: dict,
+                                fused_data: dict,
+                                time_diff: int,
+                                filename: str = "s2_11_fusion_weights.png"):
+        """
+        Visualise the per-pixel effective contribution of Landsat vs
+        Sentinel-2 after temporal-weighted fusion.  Also validates that
+        the fused values fall within the expected range of the two sensors.
+        """
+        index = next((k for k in ["NDVI","NDBI","MNDWI"]
+                      if k in landsat_data and k in sentinel2_data and k in fused_data),
+                     None)
+        if index is None:
+            logger.warning("[Diagnostics] plot_fusion_weight_map: no common index found.")
+            return
+
+        # Re-compute the weights exactly as done in MultiSensorFusion.fuse_data
+        time_weight_s2 = 1.0 / (1.0 + time_diff / 16.0)
+        time_weight_ls = 1.0 - time_weight_s2
+
+        ls_arr = landsat_data[index].astype(np.float32)
+        s2_arr = sentinel2_data[index].astype(np.float32)
+        fu_arr = fused_data[index].astype(np.float32)
+
+        # Crop to minimum common shape
+        h = min(ls_arr.shape[0], s2_arr.shape[0], fu_arr.shape[0])
+        w = min(ls_arr.shape[1], s2_arr.shape[1], fu_arr.shape[1])
+        ls_arr = ls_arr[:h, :w]
+        s2_arr = s2_arr[:h, :w]
+        fu_arr = fu_arr[:h, :w]
+
+        # Validate: fused should ≈ w_s2*S2 + w_ls*LS
+        expected = time_weight_s2 * s2_arr + time_weight_ls * ls_arr
+        residual = fu_arr - expected
+
+        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+        panels = [
+            (ls_arr, f"Landsat {index}\n(weight={time_weight_ls:.2f})", "RdYlGn"),
+            (s2_arr, f"Sentinel-2 {index}\n(weight={time_weight_s2:.2f})", "RdYlGn"),
+            (fu_arr, f"Fused {index}\n(Δt={time_diff}d)", "RdYlGn"),
+        ]
+        all_vals = np.concatenate([ls_arr[np.isfinite(ls_arr)].ravel(),
+                                    s2_arr[np.isfinite(s2_arr)].ravel()])
+        vmin, vmax = np.nanpercentile(all_vals, [2, 98])
+
+        for ax, (arr, title, cmap) in zip(axes[0], panels):
+            im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(title, fontweight="bold", fontsize=9)
+            ax.axis("off")
+            plt.colorbar(im, ax=ax)
+
+        # Difference maps
+        diff_s2_ls = s2_arr - ls_arr
+        lim = np.nanpercentile(np.abs(diff_s2_ls[np.isfinite(diff_s2_ls)]), 98)
+
+        for ax, arr, title in zip(
+                axes[1],
+                [diff_s2_ls, residual,
+                 np.abs(s2_arr - ls_arr)],
+                ["S2 − Landsat\n(raw sensor discrepancy)",
+                 "Fused − Expected\n(fusion residual error)",
+                 "|S2 − Landsat|\n(absolute discrepancy)"]):
+            lim_use = np.nanpercentile(np.abs(arr[np.isfinite(arr)]), 98) + 1e-8
+            im = ax.imshow(arr, cmap="RdBu_r",
+                           vmin=-lim_use, vmax=lim_use)
+            ax.set_title(title, fontweight="bold", fontsize=9)
+            ax.axis("off")
+            plt.colorbar(im, ax=ax)
+
+        fig.suptitle(
+            f"Fusion Weight Analysis  —  {index}\n"
+            f"Landsat weight={time_weight_ls:.2f}, Sentinel-2 weight={time_weight_s2:.2f}  "
+            f"(Δt={time_diff} days)",
+            fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        self._save(fig, filename)
+
+    # ------------------------------------------------------------------
+    # S2-12. Impervious surface fraction analysis
+    # ------------------------------------------------------------------
+    def plot_impervious_surface_analysis(self,
+                                          fused_data: dict,
+                                          filename: str = "s2_12_impervious_surface.png"):
+        """
+        Detailed analysis of the impervious surface fraction (ISF) layer,
+        showing its spatial distribution, histogram, and cross-plots
+        against NDVI and LST (key UHI relationships).
+        """
+        if "impervious_surface" not in fused_data:
+            logger.warning("[Diagnostics] plot_impervious_surface_analysis: ISF not found.")
+            return
+
+        isf = fused_data["impervious_surface"].astype(np.float32)
+
+        fig = plt.figure(figsize=(16, 10))
+        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+
+        # ISF spatial map
+        ax0 = fig.add_subplot(gs[:, 0])
+        im0 = ax0.imshow(isf, cmap="hot_r", vmin=0, vmax=1)
+        ax0.set_title("Impervious Surface Fraction\n(0=pervious, 1=fully impervious)",
+                      fontweight="bold")
+        ax0.axis("off")
+        plt.colorbar(im0, ax=ax0, label="ISF [0–1]")
+
+        # ISF histogram
+        ax1 = fig.add_subplot(gs[0, 1])
+        valid_isf = isf[np.isfinite(isf)].ravel()
+        ax1.hist(valid_isf, bins=60, color="#E53935", alpha=0.8,
+                 edgecolor="white", density=True)
+        ax1.axvline(valid_isf.mean(), color="black", lw=1.5, linestyle="--",
+                    label=f"μ={valid_isf.mean():.3f}")
+        ax1.axvline(np.median(valid_isf), color="navy", lw=1.5, linestyle=":",
+                    label=f"median={np.median(valid_isf):.3f}")
+        ax1.set_xlabel("ISF")
+        ax1.set_ylabel("Density")
+        ax1.set_title("ISF Distribution")
+        ax1.legend(fontsize=8)
+        ax1.grid(True, alpha=0.3)
+
+        # Cumulative distribution
+        ax2 = fig.add_subplot(gs[1, 1])
+        sorted_isf = np.sort(valid_isf)
+        ax2.plot(sorted_isf, np.linspace(0, 100, len(sorted_isf)),
+                 color="#E53935", lw=2)
+        # Mark urban thresholds
+        for thresh, label in [(0.3,"Low"), (0.6,"Medium"), (0.85,"High")]:
+            pct = np.searchsorted(sorted_isf, thresh) / len(sorted_isf) * 100
+            ax2.axvline(thresh, linestyle="--", lw=1, alpha=0.6)
+            ax2.text(thresh, pct + 2, f"{label}\n{thresh:.0%}", fontsize=7, ha="center")
+        ax2.set_xlabel("ISF threshold")
+        ax2.set_ylabel("Pixels below threshold (%)")
+        ax2.set_title("Cumulative ISF Distribution")
+        ax2.grid(True, alpha=0.3)
+
+        # ISF vs NDVI scatter
+        ax3 = fig.add_subplot(gs[0, 2])
+        if "NDVI" in fused_data:
+            ndvi = fused_data["NDVI"]
+            mask = np.isfinite(isf) & np.isfinite(ndvi)
+            x, y = isf[mask].ravel(), ndvi[mask].ravel()
+            if len(x) > 50_000:
+                sel = np.random.default_rng(0).choice(len(x), 50_000, replace=False)
+                x, y = x[sel], y[sel]
+            ax3.hexbin(x, y, gridsize=50, cmap="YlOrRd", mincnt=1)
+            r = np.corrcoef(x, y)[0, 1] if len(x) > 1 else float("nan")
+            ax3.set_xlabel("ISF")
+            ax3.set_ylabel("NDVI")
+            ax3.set_title(f"ISF vs NDVI  (r={r:.3f})")
+            ax3.grid(True, alpha=0.3)
+
+        # ISF vs LST scatter
+        ax4 = fig.add_subplot(gs[1, 2])
+        if "LST" in fused_data:
+            lst = fused_data["LST"]
+            mask = np.isfinite(isf) & np.isfinite(lst)
+            x, y = isf[mask].ravel(), lst[mask].ravel()
+            if len(x) > 50_000:
+                sel = np.random.default_rng(0).choice(len(x), 50_000, replace=False)
+                x, y = x[sel], y[sel]
+            ax4.hexbin(x, y, gridsize=50, cmap="inferno", mincnt=1)
+            try:
+                z = np.polyfit(x, y, 1)
+                xr = np.linspace(x.min(), x.max(), 200)
+                ax4.plot(xr, np.poly1d(z)(xr), "cyan", lw=1.5,
+                         label=f"slope={z[0]:.2f}°C/unit")
+                ax4.legend(fontsize=8)
+            except Exception:
+                pass
+            r = np.corrcoef(x, y)[0, 1] if len(x) > 1 else float("nan")
+            ax4.set_xlabel("ISF")
+            ax4.set_ylabel("LST (°C)")
+            ax4.set_title(f"ISF vs LST  (r={r:.3f})\n[Core UHI relationship]")
+            ax4.grid(True, alpha=0.3)
+
+        fig.suptitle("Impervious Surface Fraction – Spatial & UHI Analysis",
+                     fontsize=13, fontweight="bold")
+        self._save(fig, filename)
 
     # ------------------------------------------------------------------
     # helper
@@ -835,10 +1942,10 @@ class SatellitePreprocessor:
         Initialize preprocessor
         
         Args:
-            satellite_type: 'landsat'
+            satellite_type: 'landsat' or 'sentinel2'
         """
         self.satellite_type = satellite_type
-        self.config = LANDSAT_CONFIG
+        self.config = LANDSAT_CONFIG if satellite_type == "landsat" else SENTINEL2_CONFIG
         
     def resample_band(self, src_array: np.ndarray, 
                      src_resolution: int,
@@ -1050,6 +2157,21 @@ class SatellitePreprocessor:
             del _s
             # GeoTIFF path: already in [0, 1] — no conversion needed
 
+        else:  # Sentinel-2
+            blue  = _f32(bands["B2"])
+            green = _f32(bands["B3"])
+            red   = _f32(bands["B4"])
+            nir   = _f32(bands["B8"])
+            swir1 = _f32(bands["B11"])
+            swir2 = _f32(bands["B12"])
+
+            # S2_SR_HARMONIZED: reflectance × 10 000 — divide in-place if needed
+            _s = red[np.isfinite(red)]
+            if _s.size > 0 and float(np.nanmedian(_s)) > 2.0:
+                scale = np.float32(1.0 / 10000.0)
+                for arr in (blue, green, red, nir, swir1, swir2):
+                    arr *= scale
+            del _s
 
         # ── Index computation — one at a time, in-place where possible ─────
         # NDVI = (nir - red) / (nir + red + eps)
@@ -1144,6 +2266,8 @@ class SatellitePreprocessor:
             for key, arr in raw_data.items():
                 if (key.startswith('SR_B') or key.startswith('B')) and key not in ['BSI', 'B11', 'B12']:
                     bands[key] = arr
+                elif key in ['B11', 'B12']:  # SWIR bands for Sentinel-2
+                    bands[key] = arr
             
             if len(bands) == 0:
                 logger.error(f"  No valid bands found in {raw_file}")
@@ -1191,6 +2315,196 @@ class SatellitePreprocessor:
             traceback.print_exc()
             return None
 
+
+class MultiSensorFusion:
+    """Fuse data from Landsat and Sentinel-2"""
+    
+    def __init__(self):
+        self.landsat_preprocessor = SatellitePreprocessor("landsat")
+        self.sentinel2_preprocessor = SatellitePreprocessor("sentinel2")
+    
+    def temporal_match(self, landsat_dates: List[Tuple[datetime, Dict]],
+                      sentinel2_dates: List[Tuple[datetime, Dict]],
+                      max_time_diff_days: int = 16) -> List[Tuple[datetime, Dict, Dict, int]]:
+        """
+        Match Landsat and Sentinel-2 data by temporal proximity
+        
+        Args:
+            landsat_dates: List of (date, data) tuples for Landsat
+            sentinel2_dates: List of (date, data) tuples for Sentinel-2
+            max_time_diff_days: Maximum allowed time difference
+            
+        Returns:
+            List of (avg_date, landsat_data, sentinel2_data, time_diff) tuples
+        """
+        matches = []
+        
+        for ls_date, ls_data in landsat_dates:
+            # Find closest Sentinel-2 image
+            best_match = None
+            min_diff = float('inf')
+            
+            for s2_date, s2_data in sentinel2_dates:
+                time_diff = abs((ls_date - s2_date).days)
+                if time_diff < min_diff:
+                    min_diff = time_diff
+                    best_match = (s2_date, s2_data)
+            
+            if best_match and min_diff <= max_time_diff_days:
+                s2_date, s2_data = best_match
+                avg_date = ls_date + (s2_date - ls_date) / 2
+                matches.append((avg_date, ls_data, s2_data, min_diff))
+                logger.info(f"  Matched {ls_date.date()} (Landsat) with {s2_date.date()} (Sentinel-2), diff={min_diff} days")
+        
+        logger.info(f"Created {len(matches)} temporal matches")
+        return matches
+    
+    def fuse_data(self, landsat_data: Dict[str, np.ndarray],
+                sentinel2_data: Dict[str, np.ndarray],
+                time_diff: int,
+                target_resolution: int = 30) -> Dict[str, np.ndarray]:
+        """
+        Fuse Landsat and Sentinel-2 data
+        
+        Strategy:
+        - Use Landsat LST (only source with thermal data)
+        - Use Sentinel-2 for higher resolution spectral indices (10m → 30m)
+        - Weight by temporal proximity
+        - Use common resolution (30m for consistency with Landsat)
+        - Match spatial extents by cropping to minimum overlap
+        
+        Args:
+            landsat_data: Landsat processed data
+            sentinel2_data: Sentinel-2 processed data
+            time_diff: Time difference in days
+            target_resolution: Target resolution in meters
+            
+        Returns:
+            Fused data dictionary
+        """
+        fused = {}
+        
+        # Get reference shape from Landsat LST (this defines our target extent)
+        if "LST" not in landsat_data:
+            logger.error("No LST in Landsat data - cannot fuse")
+            return fused
+        
+        reference_shape = landsat_data["LST"].shape
+        logger.debug(f"  Reference shape (Landsat LST): {reference_shape}")
+        
+        # Start with Landsat LST (only source with thermal data)
+        fused["LST"] = landsat_data["LST"].copy()
+        
+        # Use Sentinel-2 for spectral indices (higher native resolution)
+        spectral_indices = ["NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo"]
+        
+        # Calculate temporal weight (closer in time = higher weight for Sentinel-2)
+        time_weight_s2 = 1.0 / (1.0 + time_diff / 16.0)
+        time_weight_ls = 1.0 - time_weight_s2
+        
+        for idx in spectral_indices:
+            has_s2 = idx in sentinel2_data
+            has_ls = idx in landsat_data
+            
+            if has_s2 and has_ls:
+                # Resample Sentinel-2 (10m) to target resolution (30m)
+                s2_resampled = self.sentinel2_preprocessor.resample_band(
+                    sentinel2_data[idx],
+                    src_resolution=10,
+                    target_resolution=target_resolution,
+                    method='bilinear'
+                )
+                
+                ls_data = landsat_data[idx]
+                
+                # Determine the minimum common extent
+                min_height = min(s2_resampled.shape[0], ls_data.shape[0], reference_shape[0])
+                min_width = min(s2_resampled.shape[1], ls_data.shape[1], reference_shape[1])
+                
+                # Crop to common extent
+                s2_cropped = s2_resampled[:min_height, :min_width]
+                ls_cropped = ls_data[:min_height, :min_width]
+                
+                # Weighted fusion
+                fused[idx] = (time_weight_s2 * s2_cropped + 
+                            time_weight_ls * ls_cropped)
+                
+                logger.debug(f"  {idx}: fused (S2 weight={time_weight_s2:.2f}, shape={fused[idx].shape})")
+                
+            elif has_s2:
+                # Only Sentinel-2 available
+                s2_resampled = self.sentinel2_preprocessor.resample_band(
+                    sentinel2_data[idx],
+                    src_resolution=10,
+                    target_resolution=target_resolution,
+                    method='bilinear'
+                )
+                
+                # Crop to reference shape
+                min_height = min(s2_resampled.shape[0], reference_shape[0])
+                min_width = min(s2_resampled.shape[1], reference_shape[1])
+                fused[idx] = s2_resampled[:min_height, :min_width]
+                
+                logger.debug(f"  {idx}: Sentinel-2 only (shape={fused[idx].shape})")
+                
+            elif has_ls:
+                # Only Landsat available
+                ls_data = landsat_data[idx]
+                
+                # Crop to reference shape
+                min_height = min(ls_data.shape[0], reference_shape[0])
+                min_width = min(ls_data.shape[1], reference_shape[1])
+                fused[idx] = ls_data[:min_height, :min_width]
+                
+                logger.debug(f"  {idx}: Landsat only (shape={fused[idx].shape})")
+        
+        # Determine final consistent shape from fused spectral indices
+        if len(fused) > 1:  # We have LST + at least one spectral index
+            # Get the minimum dimensions across all fused features
+            all_shapes = [arr.shape for arr in fused.values() if isinstance(arr, np.ndarray)]
+            if all_shapes:
+                final_height = min(shape[0] for shape in all_shapes)
+                final_width = min(shape[1] for shape in all_shapes)
+                final_shape = (final_height, final_width)
+                
+                # Crop all features to consistent final shape
+                for key in list(fused.keys()):
+                    fused[key] = fused[key][:final_height, :final_width]
+                
+                logger.debug(f"  Standardized all features to shape: {final_shape}")
+            else:
+                final_shape = reference_shape
+        else:
+            final_shape = reference_shape
+        
+        # Add raw bands from Landsat (cropped to final shape)
+        for key in landsat_data.keys():
+            if key.startswith('SR_B') and key not in fused:
+                ls_band = landsat_data[key]
+                fused[key] = ls_band[:final_shape[0], :final_shape[1]]
+        
+        # Verify all arrays have consistent shape
+        shapes = {k: v.shape for k, v in fused.items() if isinstance(v, np.ndarray)}
+        unique_shapes = set(shapes.values())
+        
+        if len(unique_shapes) > 1:
+            logger.warning(f"  Inconsistent shapes after fusion: {shapes}")
+            # Force consistency by cropping to minimum
+            min_h = min(s[0] for s in unique_shapes)
+            min_w = min(s[1] for s in unique_shapes)
+            for key in fused.keys():
+                if isinstance(fused[key], np.ndarray):
+                    fused[key] = fused[key][:min_h, :min_w]
+            final_shape = (min_h, min_w)
+        
+        logger.info(f"  Fused {len(fused)} features at {target_resolution}m resolution")
+        logger.info(f"  Final shape: {final_shape}")
+        
+        # Validate minimum size
+        if final_shape[0] < 64 or final_shape[1] < 64:
+            logger.warning(f"  Warning: Fused data shape {final_shape} is too small for 64x64 patches")
+        
+        return fused
 
 class FeatureEngineer:
     """Engineer additional features from processed satellite data"""
@@ -2151,32 +3465,37 @@ class EnhancedDatasetCreator(DatasetCreator):
         return cv_splits
 
 def main():
-    """Main preprocessing pipeline - processes Landsat 8 and 9 data"""
+    """Main preprocessing pipeline - processes and fuses multi-sensor data"""
     logger.info("="*70)
-    logger.info("LANDSAT PREPROCESSING PIPELINE")
+    logger.info("MULTI-SENSOR PREPROCESSING PIPELINE")
     logger.info("="*70)
     
     # Define input directories
     raw_data_dir = RAW_DATA_DIR
     landsat_dir = raw_data_dir / "landsat"
+    sentinel2_dir = raw_data_dir / "sentinel2"
+    
     # Check what data is available
     has_landsat = landsat_dir.exists()
+    has_sentinel2 = sentinel2_dir.exists()
     
-    if not has_landsat:
+    if not has_landsat and not has_sentinel2:
         logger.error(f"No raw data found in {raw_data_dir}")
         logger.error("Please run earth_engine_loader.py first to download data")
         return
     
     logger.info(f"Data availability:")
     logger.info(f"  Landsat: {'✓' if has_landsat else '✗'}")
+    logger.info(f"  Sentinel-2: {'✓' if has_sentinel2 else '✗'}")
     
     # Initialize components
     landsat_preprocessor = SatellitePreprocessor(satellite_type="landsat")
+    sentinel2_preprocessor = SatellitePreprocessor(satellite_type="sentinel2")
+    fusion = MultiSensorFusion()
     dataset_creator = DatasetCreator()
     feature_engineer = FeatureEngineer()
 
     # ── DIAGNOSTICS: initialise visualisation helper ────────────────────────
-    # Diagnostics go to the project dataset dir (same as output)
     output_dataset_dir_early = PROCESSED_DATA_DIR / "cnn_dataset"
     diag = PreprocessingDiagnostics(output_dir=output_dataset_dir_early)
     logger.info("[Diagnostics] Diagnostics module initialised")
@@ -2270,6 +3589,108 @@ def main():
         
         logger.info(f"\n✓ Processed {len(landsat_processed)} Landsat files")
     
+    # Step 2: Process Sentinel-2 data
+    sentinel2_processed = []
+    if has_sentinel2:
+        logger.info("\n" + "="*70)
+        logger.info("STEP 1B: Process Sentinel-2 data")
+        logger.info("="*70)
+        
+        sentinel2_files = sorted(
+            list(sentinel2_dir.glob("Sentinel2_*.tif")) +   # GEE export (new)
+            list(sentinel2_dir.glob("sentinel2_*.tif")) +   # lower-case variant
+            list(sentinel2_dir.glob("sentinel2_*.npz"))     # legacy npz
+        )
+        logger.info(f"Found {len(sentinel2_files)} Sentinel-2 files")
+        
+        for raw_file in sentinel2_files:
+            # Handles both Sentinel2_YYYY_MM.tif and sentinel2_YYYY_MM.npz
+            parts = raw_file.stem.split('_')
+            try:
+                year  = int(parts[-2])
+                month = int(parts[-1])
+            except (IndexError, ValueError):
+                logger.warning(f"  Cannot parse date from {raw_file.name}, skipping")
+                continue
+            timestamp = pd.Timestamp(year=year, month=month, day=15)
+            
+            # Process the file
+            processed = sentinel2_preprocessor.process_raw_file(raw_file, calculate_lst=False)
+            
+            if processed is None:
+                continue
+            
+            # Check if we have essential indices
+            required = ["NDVI", "NDBI", "MNDWI"]
+            if not all(idx in processed for idx in required):
+                logger.warning(f"  Missing required indices in {raw_file.name}, skipping")
+                continue
+            
+            sentinel2_processed.append((timestamp, processed))
+            logger.info(f"  ✓ {raw_file.name}")
+
+            # ── DIAGNOSTIC PLOTS (first S2 file only) ─────────────────
+            if len(sentinel2_processed) == 1:
+                try:
+                    raw_s2_data = load_raw_file(raw_file) or {}
+                    diag.plot_s2_raw_bands(
+                        raw_s2_data,
+                        filename="s2_01_raw_bands.png",
+                    )
+                    diag.plot_s2_spectral_indices(
+                        processed,
+                        filename="s2_02_spectral_indices.png",
+                    )
+                    diag.plot_s2_band_statistics(
+                        raw_s2_data,
+                        filename="s2_03_band_statistics.png",
+                    )
+                    diag.plot_s2_data_quality(
+                        raw_s2_data,
+                        filename="s2_04_data_quality.png",
+                    )
+                    diag.plot_s2_band_ratios(
+                        raw_s2_data,
+                        filename="s2_05_band_ratios.png",
+                    )
+                    diag.plot_s2_landcover_proxy(
+                        processed,
+                        filename="s2_06_landcover_proxy.png",
+                    )
+                except Exception as _e:
+                    logger.warning(f"[Diagnostics] S2 plots failed for {raw_file.name}: {_e}")
+            # ──────────────────────────────────────────────────────────
+        
+        logger.info(f"\n✓ Processed {len(sentinel2_processed)} Sentinel-2 files")
+
+        # ── DIAGNOSTIC: S2 temporal trends & resolution comparison ────
+        try:
+            if len(sentinel2_processed) >= 2:
+                diag.plot_s2_temporal_trends(
+                    sentinel2_processed,
+                    filename="s2_07_temporal_trends.png",
+                )
+            if len(sentinel2_processed) >= 1 and len(landsat_processed) >= 1:
+                diag.plot_sensor_agreement(
+                    landsat_processed[0][1],
+                    sentinel2_processed[0][1],
+                    filename="s2_08_sensor_agreement.png",
+                )
+                diag.plot_resolution_comparison(
+                    sentinel2_processed[0][1],
+                    landsat_processed[0][1],
+                    index="NDVI",
+                    filename="s2_09_resolution_comparison.png",
+                )
+            if len(sentinel2_processed) >= 2:
+                diag.plot_s2_scene_variability(
+                    sentinel2_processed,
+                    filename="s2_10_scene_variability.png",
+                )
+        except Exception as _e:
+            logger.warning(f"[Diagnostics] S2 multi-scene plots failed: {_e}")
+        # ──────────────────────────────────────────────────────────────
+    
     # Steps 2 + 3 (combined): fuse and immediately extract patches,
     # freeing each raster as soon as its patches are done.
     # Previously all_fused_data held every raster in RAM before patch
@@ -2285,33 +3706,65 @@ def main():
 
     def _fuse_extract_free(fused_data: Dict, date, label: str) -> None:
         """Extract position-only patches, store raster ref, free bands later."""
-        # UHI_STRIDE: controls patch overlap.  Default 56 gives ~12% overlap
-        # between 64-px patches — enough variety without massive redundancy.
-        # stride=24 (old default) produced ~988 K patches; stride=56 → ~50-150 K.
-        # UHI_MAX_PATCHES_PER_SCENE caps per-scene contribution (0 = no cap).
-        _stride    = int(_os.environ.get("UHI_STRIDE", 56))
-        _scene_cap = int(_os.environ.get("UHI_MAX_PATCHES_PER_SCENE", 3000))
-
         patches = dataset_creator.extract_patches(
             fused_data,
-            patch_size=64, stride=_stride, min_valid_ratio=0.95,
+            patch_size=64, stride=24, min_valid_ratio=0.95,
             min_variance=0.3, min_temp=20.0, max_temp=58.0,
         )
-        # Spatially subsample if over the per-scene cap
-        if _scene_cap > 0 and len(patches) > _scene_cap:
-            step = max(1, len(patches) // _scene_cap)
-            patches = patches[::step][:_scene_cap]
-
         for p in patches:
             p["date"] = date
         all_patches.extend(patches)
         all_dates.append(date)
+        # Keep a reference to the raster alongside its patches so
+        # create_training_samples can slice from it without re-loading.
         all_rasters.append((fused_data, patches))
         logger.info(f"  {label}: {len(patches)} patches "
                     f"(running total: {len(all_patches)})")
 
-    if has_landsat and len(landsat_processed) > 0:
-        logger.info("Processing Landsat data...")
+    if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
+        logger.info("Performing multi-sensor fusion (streaming)...")
+        matches = fusion.temporal_match(
+            landsat_processed, sentinel2_processed, max_time_diff_days=16
+        )
+        del landsat_processed, sentinel2_processed
+        gc.collect()
+
+        for mi, (avg_date, ls_data, s2_data, time_diff) in enumerate(matches):
+            logger.info(f"\nFusing pair {mi+1}/{len(matches)} (Δt={time_diff}d):")
+            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff, target_resolution=30)
+
+            if all(k in fused_data for k in ("NDVI", "NDBI", "MNDWI")):
+                fused_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                    fused_data["NDVI"], fused_data["NDBI"], fused_data["MNDWI"]
+                )
+
+            if first_fused_diag:
+                try:
+                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
+                                                index="NDVI",
+                                                filename="09_fusion_comparison_NDVI.png")
+                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
+                                                index="NDBI",
+                                                filename="09b_fusion_comparison_NDBI.png")
+                    diag.plot_fusion_weight_map(ls_data, s2_data, fused_data,
+                                                time_diff=time_diff,
+                                                filename="s2_11_fusion_weights.png")
+                    diag.plot_impervious_surface_analysis(fused_data,
+                                                          filename="s2_12_impervious_surface.png")
+                except Exception as _e:
+                    logger.warning(f"[Diagnostics] fusion plots failed: {_e}")
+                first_fused_diag = False
+
+            del ls_data, s2_data
+            gc.collect()
+
+            _fuse_extract_free(fused_data, avg_date, f"Pair {mi+1}/{len(matches)}")
+
+        logger.info(f"\n✓ Processed {len(matches)} fused pairs, "
+                    f"{len(all_patches)} total patches")
+
+    elif has_landsat and len(landsat_processed) > 0:
+        logger.info("Using Landsat data only (no Sentinel-2 available)")
         n_ls = len(landsat_processed)
         for li, (timestamp, ls_data) in enumerate(landsat_processed):
             if all(k in ls_data for k in ("NDVI", "NDBI", "MNDWI")):
@@ -2321,6 +3774,10 @@ def main():
             _fuse_extract_free(ls_data, timestamp, f"Landsat {li+1}/{n_ls}")
         del landsat_processed
         gc.collect()
+
+    else:
+        logger.error("No valid data available for training")
+        return
 
     if not all_patches:
         logger.error("No patches extracted")
@@ -2332,420 +3789,250 @@ def main():
     except Exception as _e:
         logger.warning(f"[Diagnostics] patch plot failed: {_e}")
 
-    # ── Step 4: QC-inline stream → project data dir, no temp files ───────────
-    # ─────────────────────────────────────────────────────────────────────────
-    # DESIGN:
-    #  • Phase 4a: lightweight QC scan using _lst_mean/_lst_std already stored
-    #    by extract_patches — no raster pixels are read here.  Counts accepted
-    #    patches and prints disk estimate before touching the drive.
-    #  • Phase 4b: only QC-passing patches are written to disk (no rejected data
-    #    ever hits the drive).  Output goes to PROCESSED_DATA_DIR/cnn_dataset/_raw
-    #    inside the project tree — not to OneDrive or a temp folder.
-    #  • All subsequent passes (norm stats, split, normalise) are chunked so
-    #    peak RAM stays O(CHUNK × patch_bytes).
-    # ─────────────────────────────────────────────────────────────────────────
+    # Step 4: Create training samples (streaming — one raster at a time)
     logger.info("\n" + "="*70)
-    logger.info("STEP 4: Stream patches to disk (QC-inline, project data dir)")
+    logger.info("STEP 4: Create training samples")
     logger.info("="*70)
 
-    import json as _json, shutil as _shutil
+    temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
+    dates_all = np.array([patch["date"] for patch in all_patches])
 
+    # Build X/y by streaming through each (raster, patches) pair, freeing
+    # the raster dict immediately after its patches are written into X/y.
     channel_order = [
         "SR_B4", "SR_B5", "SR_B6", "SR_B7",
         "NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo",
     ]
     n_channels = len(channel_order)
-    patch_size  = 64
-    temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
+    patch_size = 64
+    n_total    = len(all_patches)
 
-    # Chunk size: patches held in RAM at once.
-    # Default 1024 ≈ ~160 MiB.  Lower with:  set UHI_CHUNK=256
-    CHUNK = int(_os.environ.get("UHI_CHUNK", 1024))
+    X = np.zeros((n_total, patch_size, patch_size, n_channels), dtype=np.float32)
+    y = np.zeros((n_total, patch_size, patch_size, 1),           dtype=np.float32)
 
-    # All output goes into the project data directory — same location as before,
-    # but now memmaps also live here so no writes hit OneDrive quota or /tmp.
-    output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
-    output_dataset_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"  Output directory: {output_dataset_dir}")
-
-    # ── 4a. QC scan — count accepted patches, estimate disk ───────────────────
-    logger.info("  Phase 4a: QC scan (no disk writes)...")
-    valid_patch_info = []   # (raster_id, position, date, lst_mean)
-    raster_by_id     = {}   # id(raster) → raster dict
-
+    write_idx = 0
     for raster_data, raster_patches in all_rasters:
-        rid = id(raster_data)
-        raster_by_id[rid] = raster_data
         for p in raster_patches:
-            lm, ls = p["_lst_mean"], p["_lst_std"]
-            if ls < 0.3 or not (20.0 <= lm <= 58.0):
-                continue
-            valid_patch_info.append((rid, p["position"], p["date"], lm))
-
-    n_valid    = len(valid_patch_info)
-    n_scanned  = len(all_patches)
-    n_rejected = n_scanned - n_valid
-
-    bytes_raw = n_valid * patch_size * patch_size * (n_channels + 1) * 4
-    logger.info(f"  QC: {n_scanned:,} scanned  {n_rejected:,} rejected  "
-                f"{n_valid:,} accepted")
-    logger.info(f"  Raw memmap size estimate: {bytes_raw / 1024**3:.1f} GiB")
-
-    if n_valid == 0:
-        logger.error("No QC-passing patches — aborting.")
-        return
-
-    # ── 4b. Write accepted patches to project _raw dir ────────────────────────
-    logger.info("  Phase 4b: writing accepted patches...")
-    raw_dir = output_dataset_dir / "_raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    X_path = raw_dir / "X_all.dat"
-    y_path = raw_dir / "y_all.dat"
-    X_mm = np.memmap(X_path, dtype=np.float32, mode="w+",
-                     shape=(n_valid, patch_size, patch_size, n_channels))
-    y_mm = np.memmap(y_path, dtype=np.float32, mode="w+",
-                     shape=(n_valid, patch_size, patch_size, 1))
-
-    valid_dates = np.empty(n_valid, dtype=object)
-    valid_lm    = np.empty(n_valid, dtype=np.float32)
-    write_idx   = 0
-
-    for rid, (row, col), date, lm in valid_patch_info:
-        rd = raster_by_id[rid]
-        for ch_idx, feat in enumerate(channel_order):
-            arr = rd.get(feat)
-            if arr is not None:
-                sl = arr[row:row+patch_size, col:col+patch_size].astype(np.float32)
-                nm = ~np.isfinite(sl)
-                if nm.any():
-                    sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
-                X_mm[write_idx, :, :, ch_idx] = sl
-        lst_arr = rd.get("LST")
-        if lst_arr is not None:
-            sl = lst_arr[row:row+patch_size, col:col+patch_size].astype(np.float32)
-            nm = ~np.isfinite(sl)
-            if nm.any():
-                sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
-            np.clip(sl, 10.0, 65.0, out=sl)
-            y_mm[write_idx, :, :, 0] = sl
-        valid_dates[write_idx] = date
-        valid_lm[write_idx]    = lm
-        write_idx += 1
-        if write_idx % 10_000 == 0:
-            logger.info(f"    Written {write_idx:,}/{n_valid:,} patches...")
-
-    X_mm.flush(); y_mm.flush()
-
-    for rd in raster_by_id.values():
-        rd.clear()
-    del all_rasters, all_patches, raster_by_id, valid_patch_info
-    gc.collect()
-    logger.info(f"  Written {write_idx:,} patches → {raw_dir}")
-
-    # ── 4c. LST temperature stats (chunked) ────────────────────────────────────
-    y_sum = 0.0; y_sq = 0.0; y_min = np.inf; y_max = -np.inf
-    n_pix = n_valid * patch_size * patch_size
-    for start in range(0, n_valid, CHUNK):
-        end = min(start + CHUNK, n_valid)
-        yc  = np.asarray(y_mm[start:end]).ravel().astype(np.float64)
-        y_sum += float(yc.sum()); y_sq += float((yc**2).sum())
-        y_min = min(y_min, float(yc.min())); y_max = max(y_max, float(yc.max()))
-        del yc; gc.collect()
-    y_mean = y_sum / n_pix
-    y_std  = float(np.sqrt(max(y_sq / n_pix - y_mean**2, 0.0)))
-    logger.info(f"  LST: [{y_min:.2f}, {y_max:.2f}]°C  "
-                f"mean={y_mean:.2f}  std={y_std:.2f}")
-
-    # ── 4d. Sample weights ─────────────────────────────────────────────────────
-    n_wb  = 10
-    be_   = np.linspace(valid_lm.min(), valid_lm.max() + 1e-6, n_wb + 1)
-    bids_ = np.clip(np.digitize(valid_lm, be_) - 1, 0, n_wb - 1)
-    bc_   = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
-    rw_   = 1.0 / bc_[bids_]
-    sample_weights = (rw_ / rw_.mean()).astype(np.float32)
-    del valid_lm; gc.collect()
-
-    # ── Step 5: Index-only stratified split ────────────────────────────────────
-    logger.info("\n" + "="*70)
-    logger.info("STEP 5: Create train/val/test splits (index-only)")
-    logger.info("="*70)
-
-    dates_dt = pd.to_datetime(valid_dates)
-    seasons  = (dates_dt.month % 12 // 3).values
-
-    # Spatial clustering on per-channel means (chunked)
-    logger.info("  Computing spatial clustering features...")
-    n_sp = min(3, n_channels)
-    sp_feats = np.zeros((n_valid, n_sp), dtype=np.float32)
-    for ch in range(n_sp):
-        for start in range(0, n_valid, CHUNK):
-            end = min(start + CHUNK, n_valid)
-            sp_feats[start:end, ch] = np.asarray(
-                X_mm[start:end, :, :, ch]).mean(axis=(1, 2))
-
-    from sklearn.cluster import KMeans
-    sp_blocks = KMeans(n_clusters=5, random_state=42, n_init=10).fit_predict(sp_feats)
-    del sp_feats; gc.collect()
-
-    # LST variance bins (chunked)
-    logger.info("  Computing LST variance bins...")
-    lst_stds = np.empty(n_valid, dtype=np.float32)
-    for start in range(0, n_valid, CHUNK):
-        end = min(start + CHUNK, n_valid)
-        lst_stds[start:end] = (np.asarray(y_mm[start:end, :, :, 0])
-                               .reshape(end - start, -1).std(axis=1))
-    lst_bins = pd.qcut(lst_stds, q=4, labels=False, duplicates="drop").astype(int)
-    del lst_stds; gc.collect()
-
-    strata = seasons * 5 * 4 + sp_blocks * 4 + lst_bins
-
-    from collections import Counter
-    counts = Counter(strata)
-    keep   = np.array([counts[s] >= 2 for s in strata])
-    if not keep.all():
-        removed = int((~keep).sum())
-        logger.warning(f"  Removing {removed} singleton-strata samples")
-        keep_idx       = np.where(keep)[0]
-        strata         = strata[keep]
-        seasons        = seasons[keep]
-        sp_blocks      = sp_blocks[keep]
-        valid_dates    = valid_dates[keep]
-        sample_weights = sample_weights[keep]
-
-        # Remap memmaps (chunked copy)
-        n_kept  = int(keep.sum())
-        Xk_path = raw_dir / "X_kept.dat"
-        yk_path = raw_dir / "y_kept.dat"
-        Xk_mm = np.memmap(Xk_path, dtype=np.float32, mode="w+",
-                          shape=(n_kept, patch_size, patch_size, n_channels))
-        yk_mm = np.memmap(yk_path, dtype=np.float32, mode="w+",
-                          shape=(n_kept, patch_size, patch_size, 1))
-        for out_s in range(0, n_kept, CHUNK):
-            out_e    = min(out_s + CHUNK, n_kept)
-            src_rows = keep_idx[out_s:out_e]
-            Xk_mm[out_s:out_e] = X_mm[src_rows]
-            yk_mm[out_s:out_e] = y_mm[src_rows]
-        Xk_mm.flush(); yk_mm.flush()
-        X_mm._mmap.close(); y_mm._mmap.close()
-        _os.remove(X_path); _os.remove(y_path)
-        X_mm, y_mm     = Xk_mm, yk_mm
-        X_path, y_path = Xk_path, yk_path
-        n_valid = n_kept
+            r, c = p["position"]
+            for ch_idx, feat in enumerate(channel_order):
+                arr = raster_data.get(feat)
+                if arr is not None:
+                    X[write_idx, :, :, ch_idx] = arr[r:r+patch_size, c:c+patch_size]
+            lst_arr = raster_data.get("LST")
+            if lst_arr is not None:
+                y[write_idx, :, :, 0] = lst_arr[r:r+patch_size, c:c+patch_size]
+            write_idx += 1
+        # Free this raster immediately — its data is now in X/y
+        raster_data.clear()
         gc.collect()
 
-    train_r, val_r, test_r = 0.65, 0.15, 0.20
-    tv_idx, test_idx = train_test_split(
-        np.arange(n_valid), test_size=test_r, stratify=strata, random_state=42)
-    train_idx, val_idx = train_test_split(
-        tv_idx, test_size=val_r / (train_r + val_r),
-        stratify=strata[tv_idx], random_state=42)
-    logger.info(f"  Train:{len(train_idx):,}  Val:{len(val_idx):,}  "
-                f"Test:{len(test_idx):,}")
-
-    # ── Step 5.5: Normalisation stats (chunked, train only) ───────────────────
-    logger.info("\n" + "="*70)
-    logger.info("STEP 5.5: Compute normalisation statistics")
-    logger.info("="*70)
-
-    n_train = len(train_idx)
-    n_px_tr = n_train * patch_size * patch_size
-    f_sum   = np.zeros(n_channels, dtype=np.float64)
-    f_sq    = np.zeros(n_channels, dtype=np.float64)
-    t_sum   = 0.0; t_sq = 0.0
-
-    for start in range(0, n_train, CHUNK):
-        end    = min(start + CHUNK, n_train)
-        idx_ch = train_idx[start:end]
-        Xc     = np.asarray(X_mm[idx_ch], dtype=np.float64)
-        yc     = np.asarray(y_mm[idx_ch], dtype=np.float64)
-        f_sum += Xc.sum(axis=(0, 1, 2))
-        f_sq  += (Xc**2).sum(axis=(0, 1, 2))
-        t_sum += float(yc.sum()); t_sq += float((yc**2).sum())
-        del Xc, yc; gc.collect()
-
-    f_mean = f_sum / n_px_tr
-    f_std  = np.sqrt(np.maximum(f_sq / n_px_tr - f_mean**2, 1e-10))
-    t_mean = t_sum / n_px_tr
-    t_std  = float(np.sqrt(max(t_sq / n_px_tr - t_mean**2, 1e-10)))
-
-    norm_stats = {
-        "features": {"mean": f_mean.tolist(), "std": f_std.tolist()},
-        "target":   {"mean": float(t_mean),   "std": float(t_std)},
-        "channel_order": channel_order,
-    }
-    with open(output_dataset_dir / "normalization_stats.json", "w") as _f:
-        _json.dump(norm_stats, _f, indent=2)
-    logger.info(f"  Feature mean range: [{f_mean.min():.4f}, {f_mean.max():.4f}]")
-    logger.info(f"  Feature std  range: [{f_std.min():.4f},  {f_std.max():.4f}]")
-    logger.info(f"  Target: mean={t_mean:.4f}  std={t_std:.4f}")
-    logger.info(f"  ✅ Norm stats saved")
-
-    f_mean_f32 = f_mean.astype(np.float32)
-    f_std_f32  = f_std.astype(np.float32)
-    t_mean_f32 = np.float32(t_mean)
-    t_std_f32  = np.float32(t_std)
-
-    # ── Step 5.6: Normalise + save splits (chunked) ───────────────────────────
-    logger.info("\n" + "="*70)
-    logger.info("STEP 5.6: Normalise and save splits")
-    logger.info("="*70)
-
-    def _save_split(name: str, indices: np.ndarray, sw=None):
-        n         = len(indices)
-        split_dir = output_dataset_dir / name
-        split_dir.mkdir(parents=True, exist_ok=True)
-        Xo = np.memmap(split_dir / "X.npy", dtype=np.float32, mode="w+",
-                       shape=(n, patch_size, patch_size, n_channels))
-        yo = np.memmap(split_dir / "y.npy", dtype=np.float32, mode="w+",
-                       shape=(n, patch_size, patch_size, 1))
-        xm_acc = np.zeros(n_channels, dtype=np.float64)
-        ym_acc = 0.0; ys_acc = 0.0
-        for start in range(0, n, CHUNK):
-            end    = min(start + CHUNK, n)
-            idx_ch = indices[start:end]
-            Xc = (np.asarray(X_mm[idx_ch]) - f_mean_f32) / f_std_f32
-            yc = (np.asarray(y_mm[idx_ch]) - t_mean_f32) / t_std_f32
-            Xo[start:end] = Xc
-            yo[start:end] = yc
-            k = end - start
-            xm_acc += Xc.mean(axis=(0, 1, 2)).astype(np.float64) * k
-            ym_acc += float(yc.mean()) * k
-            ys_acc += float(yc.std())  * k
-            del Xc, yc; gc.collect()
-        Xo.flush(); yo.flush()
-        np.save(split_dir / "dates.npy", valid_dates[indices])
-        if sw is not None:
-            np.save(split_dir / "weights_train.npy", sw)
-            logger.info(f"    Weights: [{sw.min():.3f}, {sw.max():.3f}]")
-        xm = xm_acc / n; ym = ym_acc / n; ys = ys_acc / n
-        logger.info(f"  ✓ {name:5s}: {n:,} samples | "
-                    f"X̄≈{xm.mean():.3f}  ȳ≈{ym:.3f}  σy≈{ys:.3f}")
-        if name == "train" and not (-0.15 < float(xm.mean()) < 0.15):
-            logger.warning("⚠️  X_train mean far from 0 — check norm stats")
-
-    _save_split("train", train_idx, sw=sample_weights[train_idx])
-    _save_split("val",   val_idx)
-    _save_split("test",  test_idx)
-
-    # ── Metadata ───────────────────────────────────────────────────────────────
-    metadata = {
-        "n_samples":    n_valid,
-        "patch_size":   patch_size,
-        "n_channels":   n_channels,
-        "channel_order": channel_order,
-        "temporal_features": temporal_features,
-        "temperature_range": {
-            "min": float(y_min), "max": float(y_max),
-            "mean": float(y_mean), "std": float(y_std),
-        },
-        "fusion_info": {
-            "fusion_strategy":   "landsat-only",
-            "landsat_available": has_landsat,
-            "total_samples":     n_valid,
-        },
-        "split_counts": {
-            "train": int(len(train_idx)),
-            "val":   int(len(val_idx)),
-            "test":  int(len(test_idx)),
-        },
-        "qc_info": {
-            "scanned":  int(n_scanned),
-            "rejected": int(n_rejected),
-            "accepted": int(n_valid),
-        },
-    }
-    with open(output_dataset_dir / "metadata.json", "w") as _f:
-        _json.dump(metadata, _f, indent=2)
-
-    # ── Diagnostic plots ──────────────────────────────────────────────────────
-    _MD = 5_000   # max patches to load into RAM for plotting
-
-    # 06 — Split LST distributions
-    try:
-        def _ysamp(idx):
-            chosen = idx[:_MD]
-            return np.asarray(y_mm[chosen])   # normalised, shape (n, 64, 64, 1)
-        diag.plot_split_distributions(
-            {"y_train": _ysamp(train_idx),
-             "y_val":   _ysamp(val_idx),
-             "y_test":  _ysamp(test_idx)},
-            filename="06_split_distributions.png")
-        logger.info("[Diagnostics] 06_split_distributions saved.")
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
-
-    # 07 — Normalisation diagnostics (raw vs normalised, sample of training data)
-    try:
-        _samp_idx = train_idx[:min(_MD, len(train_idx))]
-        _X_raw_s  = np.asarray(X_mm[_samp_idx])            # unnormalised
-        _y_raw_s  = np.asarray(y_mm[_samp_idx])
-        _X_norm_s = (_X_raw_s - f_mean_f32) / f_std_f32    # normalised
-        _y_norm_s = (_y_raw_s - t_mean_f32) / t_std_f32
-        diag.plot_normalization_diagnostics(
-            _X_raw_s, _X_norm_s, _y_raw_s, _y_norm_s,
-            channel_names=channel_order,
-            filename="07_normalization.png")
-        logger.info("[Diagnostics] 07_normalization saved.")
-        del _X_raw_s, _y_raw_s, _X_norm_s, _y_norm_s; gc.collect()
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] normalization plot failed: {_e}")
-
-    # 08 — Channel correlation heatmap (sample of training data, normalised)
-    try:
-        _samp_idx2 = train_idx[:min(_MD, len(train_idx))]
-        _X_corr = np.asarray(X_mm[_samp_idx2])
-        _X_corr = (_X_corr - f_mean_f32) / f_std_f32
-        diag.plot_channel_correlation(
-            _X_corr, channel_names=channel_order,
-            filename="08_channel_correlation.png")
-        logger.info("[Diagnostics] 08_channel_correlation saved.")
-        del _X_corr; gc.collect()
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] channel correlation plot failed: {_e}")
-
-    # 10 — Pipeline summary dashboard
-    try:
-        _splits_for_summary = {
-            "y_train":     np.asarray(y_mm[train_idx[:_MD]]),
-            "y_val":       np.asarray(y_mm[val_idx[:_MD]]),
-            "y_test":      np.asarray(y_mm[test_idx[:_MD]]),
-            "split_counts": {
-                "train": int(len(train_idx)),
-                "val":   int(len(val_idx)),
-                "test":  int(len(test_idx)),
-            },
-        }
-        diag.plot_pipeline_summary(
-            _splits_for_summary, metadata,
-            filename="10_pipeline_summary.png")
-        logger.info("[Diagnostics] 10_pipeline_summary saved.")
-        del _splits_for_summary; gc.collect()
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] pipeline summary plot failed: {_e}")
-
-    # ── Clean up raw memmaps ───────────────────────────────────────────────────
-    try:
-        X_mm._mmap.close(); y_mm._mmap.close()
-        _shutil.rmtree(raw_dir, ignore_errors=True)
-        logger.info(f"  Cleaned up raw memmaps from {raw_dir}")
-    except Exception as _e:
-        logger.warning(f"  Could not remove raw memmaps: {_e}")
+    del all_rasters
     gc.collect()
 
+    # Free the patch list — no longer needed once X/y are filled
+    del all_patches
+    gc.collect()
+    logger.info("  Freed rasters and patch list from memory")
 
+    # QC + NaN fill + safety clip
+    valid_mask = np.ones(n_total, dtype=bool)
+    for s in range(n_total):
+        lst_p = y[s, :, :, 0]
+        fin   = np.isfinite(lst_p)
+        if fin.mean() < 0.95:
+            valid_mask[s] = False; continue
+        lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
+        if not (20.0 <= lst_mean <= 58.0):
+            valid_mask[s] = False
 
-    # ── Final summary ──────────────────────────────────────────────────────────
+    if not valid_mask.all():
+        dropped = int((~valid_mask).sum())
+        logger.info(f"  QC dropped {dropped}/{n_total} samples")
+        X          = X[valid_mask]
+        y          = y[valid_mask]
+        dates_all  = dates_all[valid_mask]
+
+    n_samples = len(X)
+    for s in range(n_samples):
+        for ch in range(n_channels):
+            sl = X[s, :, :, ch]; nm = ~np.isfinite(sl)
+            if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
+        sl = y[s, :, :, 0]; nm = ~np.isfinite(sl)
+        if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
+
+    np.clip(y, 10.0, 65.0, out=y)
+
+    # Sample weights
+    patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+    n_wb          = 10
+    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
+    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
+    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
+    rw_           = 1.0 / bc_[bids_]
+    sample_weights = rw_ / rw_.mean()
+
+    metadata = {
+        "n_samples":        n_samples,
+        "patch_size":       patch_size,
+        "n_channels":       n_channels,
+        "channel_order":    channel_order,
+        "temporal_features": temporal_features,
+        "temperature_range": {
+            "min": float(np.min(y)), "max": float(np.max(y)),
+            "mean": float(np.mean(y)), "std": float(np.std(y)),
+        },
+        "sample_weights": sample_weights,
+    }
+
+    logger.info(f"  Created X={X.shape}, y={y.shape}")
+    logger.info(f"  Temp range: [{metadata['temperature_range']['min']:.2f}, "
+                f"{metadata['temperature_range']['max']:.2f}]°C")
+
+    dates = dates_all[:n_samples]
+
+    # Step 6: Create splits - MODIFIED
     logger.info("\n" + "="*70)
-    logger.info("✓ LANDSAT PREPROCESSING COMPLETE")
+    logger.info("STEP 5: Create train/val/test splits")
     logger.info("="*70)
-    logger.info(f"  Patches: {n_valid:,} accepted / {n_scanned:,} scanned "
-                f"({n_rejected:,} rejected by QC)")
-    logger.info(f"  Train / Val / Test: "
-                f"{len(train_idx):,} / {len(val_idx):,} / {len(test_idx):,}")
+    
+    # Use enhanced dataset creator
+    from preprocessing import EnhancedDatasetCreator
+    dataset_creator = EnhancedDatasetCreator()
+    
+    # Stratified split with spatial-temporal distribution
+    # NEW: 65% train, 15% val, 20% test (was 70/15/15)
+    splits = dataset_creator.create_stratified_split(
+        X, y, dates,
+        split_ratios=(0.65, 0.15, 0.20),
+        random_seed=42
+    )
+
+    # Step 6.5: Compute normalization statistics from training data
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.5: Compute normalization statistics")
+    logger.info("="*70)
+
+    output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
+    norm_stats = dataset_creator.compute_and_save_normalization_stats(
+        splits['X_train'], 
+        splits['y_train'],
+        output_dataset_dir
+    )
+
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.5.1: Verify no data leakage (RAW)")
+    logger.info("="*70)
+
+    dataset_creator.verify_no_data_leakage(
+        splits['X_train'], splits['y_train'],
+        splits['X_val'], splits['y_val'],
+        splits['X_test'], splits['y_test'],
+        norm_stats
+    )
+
+    # Step 6.6: Normalize all splits
+    logger.info("\n" + "="*70)
+    logger.info("STEP 5.6: Normalize data")
+    logger.info("="*70)
+
+    logger.info("Normalizing training data...")
+    splits['X_train'], splits['y_train'] = dataset_creator.normalize_data(
+        splits['X_train'], splits['y_train'], norm_stats
+    )
+
+    logger.info("Normalizing validation data...")
+    splits['X_val'], splits['y_val'] = dataset_creator.normalize_data(
+        splits['X_val'], splits['y_val'], norm_stats
+    )
+
+    logger.info("Normalizing test data...")
+    splits['X_test'], splits['y_test'] = dataset_creator.normalize_data(
+        splits['X_test'], splits['y_test'], norm_stats
+    )
+
+    # Verify normalization on training data
+    logger.info("\n" + "="*70)
+    logger.info("NORMALIZATION VERIFICATION")
+    logger.info("="*70)
+    logger.info("Training data after normalization:")
+    logger.info(f"  X_train: mean={splits['X_train'].mean():.4f}, std={splits['X_train'].std():.4f}")
+    logger.info(f"  y_train: mean={splits['y_train'].mean():.4f}, std={splits['y_train'].std():.4f}")
+
+    if not (-0.1 < splits['X_train'].mean() < 0.1):
+        logger.warning("⚠️ X_train mean is not close to 0!")
+    if not (0.9 < splits['X_train'].std() < 1.1):
+        logger.warning("⚠️ X_train std is not close to 1!")
+    if not (-0.1 < splits['y_train'].mean() < 0.1):
+        logger.warning("⚠️ y_train mean is not close to 0!")
+    if not (0.9 < splits['y_train'].std() < 1.1):
+        logger.warning("⚠️ y_train std is not close to 1!")
+
+    logger.info("="*70)
+
+    # ── DIAGNOSTIC PLOTS: splits, normalisation, channel correlation ───────
+    try:
+        channel_names = metadata.get("channel_order", None)
+
+        diag.plot_split_distributions(splits, filename="06_split_distributions.png")
+        logger.info("[Diagnostics] Split distribution plot saved.")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
+    # ──────────────────────────────────────────────────────────────────────
+
+
+    # Step 6.7: Update metadata with fusion info
+    logger.info("\n" + "="*70)
+    logger.info("STEP 6.7: Update metadata")
+    logger.info("="*70)
+
+    fusion_strategy = (
+        'multi-sensor' if (has_landsat and has_sentinel2)
+        else 'landsat-only'
+    )
+    metadata['fusion_info'] = {
+        'fusion_strategy': fusion_strategy,
+        'landsat_available':   has_landsat,
+        'sentinel2_available': has_sentinel2,
+        'total_samples':       metadata["n_samples"],
+    }
+
+    # Save sample weights for the training split
+    sample_weights = metadata.pop("sample_weights", None)
+    if sample_weights is not None:
+        y_train_raw = splits['y_train']
+        patch_means_train = y_train_raw[:, :, :, 0].reshape(len(y_train_raw), -1).mean(axis=1)
+        n_wb = 10
+        be = np.linspace(patch_means_train.min(), patch_means_train.max() + 1e-6, n_wb + 1)
+        bids = np.clip(np.digitize(patch_means_train, be) - 1, 0, n_wb - 1)
+        bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)
+        rw = 1.0 / bc[bids]
+        train_weights = rw / rw.mean()
+        weights_path = output_dataset_dir / "train" / "weights_train.npy"
+        np.save(weights_path, train_weights.astype(np.float32))
+        logger.info(f"✅ Saved sample weights → {weights_path}")
+        logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]")
+
+    # save_dataset streams one split at a time, deleting each from `splits` after saving
+    dataset_creator.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
+
+    # ── Final summary (splits dict is now empty — use metadata) ─────────────
+    logger.info("\n" + "="*70)
+    logger.info("✓ MULTI-SENSOR PREPROCESSING COMPLETE")
+    logger.info("="*70)
+    logger.info(f"Data sources:")
+    logger.info(f"  Landsat available:    {has_landsat}")
+    logger.info(f"  Sentinel-2 available: {has_sentinel2}")
+    logger.info(f"  Fusion strategy:      {fusion_strategy}")
+    logger.info(f"Training data:")
+    logger.info(f"  Total samples (after QC): {metadata['n_samples']}")
+    logger.info(f"Output:")
     logger.info(f"  Dataset saved to: {output_dataset_dir}")
-    logger.info(f"  Norm stats:       ✅")
+    logger.info(f"Normalization:")
+    logger.info(f"  Stats saved: ✅")
+    logger.info(f"  All splits normalized in-place: ✅")
     logger.info("="*70)
     logger.info("\nNext step: Run model training")
+
+
 if __name__ == "__main__":
     main()

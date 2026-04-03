@@ -196,11 +196,7 @@ class DiagnosticsPlotter:
     # ── 2. Predicted vs Actual ────────────────────────────────────────────────
     def plot_pred_vs_actual(self, preds: np.ndarray, targets: np.ndarray,
                             label: str = "Model", metrics: dict = None):
-        """Scatter + residual plot.
-
-        Inputs may be normalised (straight from the CNN/GBM output) or already
-        in °C — we detect and denormalise automatically so axes always show °C.
-        """
+        """Scatter + residual plot (denormalised °C values)."""
         try:
             from scipy.stats import linregress
             self._use_style()
@@ -210,21 +206,8 @@ class DiagnosticsPlotter:
             mask    = np.isfinite(preds) & np.isfinite(targets)
             preds, targets = preds[mask], targets[mask]
 
-            # Denormalise if values look normalised (mean ≈ 0, std ≈ 1)
-            _ns = load_normalization_stats()
-            if _ns is not None and abs(targets.mean()) < 5.0 and targets.std() < 5.0:
-                preds   = denormalize_predictions(preds,   _ns)
-                targets = denormalize_predictions(targets, _ns)
-                unit = "°C"
-            else:
-                unit = "°C" if targets.mean() > 5 else "(norm)"
-
             slope, intercept, r_val, *_ = linregress(targets, preds)
             residuals = preds - targets
-            mbe       = float(residuals.mean())
-            pred_std  = float(preds.std())
-            tgt_std   = float(targets.std())
-            std_ratio = pred_std / tgt_std if tgt_std > 0 else float("nan")
 
             fig, axes = plt.subplots(1, 2, figsize=(14, 6))
             fig.suptitle(f"{label} – Predicted vs Actual", fontsize=14, fontweight="bold")
@@ -232,30 +215,20 @@ class DiagnosticsPlotter:
             ax = axes[0]
             sc = ax.scatter(targets, preds, alpha=0.35, s=12,
                             c=np.abs(residuals), cmap="RdYlGn_r", label="Samples")
-            plt.colorbar(sc, ax=ax, label=f"|Residual| ({unit})")
+            plt.colorbar(sc, ax=ax, label="|Residual| (°C)")
             lo = min(targets.min(), preds.min()); hi = max(targets.max(), preds.max())
             ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="Perfect (slope=1)")
             fit_x = np.linspace(lo, hi, 200)
             ax.plot(fit_x, slope * fit_x + intercept, "r-", lw=1.5,
                     label=f"Fit  slope={slope:.3f}")
-            ax.set_xlabel(f"Actual ({unit})"); ax.set_ylabel(f"Predicted ({unit})")
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Predicted (°C)")
             ax.legend(fontsize=8)
-            info = [f"R²={r_val**2:.4f}",
-                    f"RMSE={np.sqrt(np.mean(residuals**2)):.3f}{unit}",
-                    f"MAE={np.mean(np.abs(residuals)):.3f}{unit}",
-                    f"MBE={mbe:.3f}{unit}",
-                    f"slope={slope:.3f}",
-                    f"std_ratio={std_ratio:.3f}"]
+            info = [f"R²={r_val**2:.4f}", f"RMSE={np.sqrt(np.mean(residuals**2)):.3f}°C",
+                    f"MAE={np.mean(np.abs(residuals)):.3f}°C",
+                    f"slope={slope:.3f}", f"intercept={intercept:.3f}"]
             if metrics:
-                # Override with pre-computed denorm metrics if supplied
-                info = [
-                    f"R²={metrics.get('r2', r_val**2):.4f}",
-                    f"RMSE={metrics.get('rmse', float('nan')):.3f}{unit}",
-                    f"MAE={metrics.get('mae', float('nan')):.3f}{unit}",
-                    f"MBE={metrics.get('mbe', mbe):.3f}{unit}",
-                    f"slope={metrics.get('slope', slope):.3f}",
-                    f"std_ratio={metrics.get('std_ratio', std_ratio):.3f}",
-                ]
+                info += [f"std_ratio={metrics.get('std_ratio', float('nan')):.3f}",
+                         f"MBE={metrics.get('mbe', float('nan')):.3f}°C"]
             ax.text(0.03, 0.97, "\n".join(info), transform=ax.transAxes,
                     fontsize=8, va="top", bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
 
@@ -264,7 +237,7 @@ class DiagnosticsPlotter:
             ax.axhline(0, color="black", lw=1.2)
             ax.axhline(+np.std(residuals), color="orange", ls="--", lw=0.9, label="±1σ")
             ax.axhline(-np.std(residuals), color="orange", ls="--", lw=0.9)
-            ax.set_xlabel(f"Actual ({unit})"); ax.set_ylabel(f"Residual ({unit})")
+            ax.set_xlabel("Actual (°C)"); ax.set_ylabel("Residual (°C)")
             ax.set_title("Residuals vs Actual"); ax.legend(fontsize=8)
 
             plt.tight_layout()
@@ -276,21 +249,11 @@ class DiagnosticsPlotter:
     # ── 3. Residual distribution ──────────────────────────────────────────────
     def plot_residual_distribution(self, preds: np.ndarray, targets: np.ndarray,
                                    label: str = "Model"):
-        """Histogram + Q-Q plot of residuals (auto-denormalises if needed)."""
+        """Histogram + Q-Q plot of residuals."""
         try:
             from scipy import stats
             self._use_style()
-            p = np.asarray(preds).flatten()
-            t = np.asarray(targets).flatten()
-            # Denormalise if values look normalised
-            _ns = load_normalization_stats()
-            if _ns is not None and abs(t.mean()) < 5.0 and t.std() < 5.0:
-                p = denormalize_predictions(p, _ns)
-                t = denormalize_predictions(t, _ns)
-                unit = "°C"
-            else:
-                unit = "°C" if t.mean() > 5 else "(norm)"
-            residuals = (p - t)
+            residuals = (np.asarray(preds) - np.asarray(targets)).flatten()
             residuals = residuals[np.isfinite(residuals)]
 
             fig, axes = plt.subplots(1, 2, figsize=(13, 5))
@@ -304,7 +267,7 @@ class DiagnosticsPlotter:
             ax.plot(x_pdf, stats.norm.pdf(x_pdf, mu, sigma), "r-", lw=2,
                     label=f"N({mu:.3f}, {sigma:.3f})")
             ax.axvline(0, color="black", lw=1.2, ls="--")
-            ax.set_xlabel(f"Residual ({unit})"); ax.set_ylabel("Density"); ax.legend()
+            ax.set_xlabel("Residual (°C)"); ax.set_ylabel("Density"); ax.legend()
             skew = stats.skew(residuals)
             kurt = stats.kurtosis(residuals)
             _, p_norm = stats.normaltest(residuals)
@@ -317,7 +280,7 @@ class DiagnosticsPlotter:
             ax.scatter(osm, osr, s=6, alpha=0.4, color="#EF5350")
             qq_line = np.array([osm[0], osm[-1]])
             ax.plot(qq_line, sl * qq_line + ic, "k-", lw=1.2)
-            ax.set_xlabel(f"Theoretical quantiles ({unit})"); ax.set_ylabel(f"Sample quantiles ({unit})")
+            ax.set_xlabel("Theoretical quantiles"); ax.set_ylabel("Sample quantiles")
             ax.set_title(f"Q-Q  (r={r:.4f})")
 
             plt.tight_layout()
@@ -379,17 +342,7 @@ class DiagnosticsPlotter:
         """Train vs Val LST histogram in normalised and °C space."""
         try:
             self._use_style()
-            # Subsample large memmaps to avoid loading everything into RAM.
-            # 50 000 values gives an accurate histogram without memory pressure.
-            _MAX = 50_000
-            def _safe_flat(arr):
-                a = np.asarray(arr).flatten()
-                if len(a) > _MAX:
-                    rng = np.random.default_rng(0)
-                    a = a[rng.choice(len(a), _MAX, replace=False)]
-                return a
-            train_flat = _safe_flat(y_train)
-            val_flat   = _safe_flat(y_val)
+            train_flat = y_train.flatten(); val_flat = y_val.flatten()
             n_panels = 2 if norm_stats else 1
             fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5))
             fig.suptitle("Target (LST) Distribution – Train vs Val",
@@ -527,11 +480,6 @@ class DiagnosticsPlotter:
             targets = np.asarray(targets).flatten()
             mask    = np.isfinite(preds) & np.isfinite(targets)
             preds, targets = preds[mask], targets[mask]
-            # Denormalise so bin centres are in °C
-            _ns = load_normalization_stats()
-            if _ns is not None and abs(targets.mean()) < 5.0 and targets.std() < 5.0:
-                preds   = denormalize_predictions(preds,   _ns)
-                targets = denormalize_predictions(targets, _ns)
 
             bins = np.percentile(targets, np.linspace(0, 100, n_bins + 1))
             centers, rmse_v, mae_v, mbe_v, counts = [], [], [], [], []
@@ -694,15 +642,14 @@ class DiagnosticsPlotter:
                                y_train: np.ndarray = None,
                                y_val: np.ndarray = None,
                                norm_stats: dict = None,
-                               ensemble_comparison: dict = None,
-                               cnn_preds_4d: np.ndarray = None,
-                               targets_4d: np.ndarray = None):
+                               ensemble_comparison: dict = None):
         """Convenience wrapper — calls every available plot method."""
         logger.info("\n📊 Generating all post-training diagnostic plots...")
         self.plot_training_curves(history)
         self.plot_diagnostic_metrics_over_epochs(history)
         self.plot_summary_dashboard(history, ensemble_metrics, cnn_metrics,
                                     gbm_metrics, ensemble_weights)
+        # FIX 3: generate ensemble strategy comparison chart when data is available
         if ensemble_comparison is not None:
             self.plot_ensemble_comparison(ensemble_comparison)
         if cnn_preds_flat is not None and targets_flat is not None:
@@ -717,9 +664,6 @@ class DiagnosticsPlotter:
             self.plot_gbm_feature_importance(gbm_model)
         if y_train is not None and y_val is not None:
             self.plot_data_distribution(y_train, y_val, norm_stats)
-        # Spatial error map (08) — uses 4-D arrays (N, 1, H, W) from CNN
-        if cnn_preds_4d is not None and targets_4d is not None:
-            self.plot_spatial_error_map(cnn_preds_4d, targets_4d, label="CNN", n_samples=6)
         logger.info(f"✅ All plots saved to: {self.save_dir}")
 
 
@@ -2037,11 +1981,6 @@ class EnsembleTrainer:
                 if self.gbm_trained else None
             )
 
-            # Build 4-D arrays for spatial error map (08) — cap at 6 patches
-            _N_SPATIAL = 6
-            _cnn_4d  = np.concatenate(_plot_preds)[:_N_SPATIAL]   # (N,1,H,W)
-            _tgts_4d = np.concatenate(_plot_tgts)[:_N_SPATIAL]    # (N,1,H,W)
-
             self.plotter.plot_all_post_training(
                 history          = self.history,
                 ensemble_metrics = ensemble_metrics,
@@ -2053,12 +1992,10 @@ class EnsembleTrainer:
                 gbm_preds_flat   = _gbm_flat,
                 gbm_targets_flat = _gbm_tgt,
                 gbm_model        = _gbm_model_for_plot,
-                y_train          = y_train,
+                y_train          = y_train,   # FIX 2: pass real arrays so data-dist plot (06) generates
                 y_val            = y_val,
                 norm_stats       = _norm_stats,
-                ensemble_comparison = self.history.get("ensemble_comparison"),
-                cnn_preds_4d     = _cnn_4d,
-                targets_4d       = _tgts_4d,
+                ensemble_comparison = self.history.get("ensemble_comparison"),  # FIX 3: plot 04
             )
         except Exception as _pe:
             logger.warning(f"Post-training plot generation failed: {_pe}")
@@ -2234,56 +2171,18 @@ def validate_data_quality(X: np.ndarray, y: np.ndarray, split: str) -> bool:
 
 
 def load_data(split: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Load preprocessed data.
-
-    Preprocessing writes split arrays as raw numpy memmaps (np.memmap mode="w+")
-    with an .npy extension — NOT the .npy pickle/header format that np.load
-    expects.  We reconstruct the shape from the dataset metadata.json that
-    preprocessing always writes alongside the split files, then open via
-    np.memmap in read-only mode so no data is copied into RAM.
-    """
-    import json as _json
-
-    dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
-    data_dir    = dataset_dir / split
-
+    """Load preprocessed data"""
+    data_dir = PROCESSED_DATA_DIR / "cnn_dataset" / split
+    
     if not data_dir.exists():
         raise FileNotFoundError(f"Missing data directory: {data_dir}")
-
-    # Read shape from metadata
-    meta_path = dataset_dir / "metadata.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(
-            f"metadata.json not found at {meta_path}. "
-            "Re-run preprocessing.py to regenerate the dataset."
-        )
-    with open(meta_path) as _f:
-        meta = _json.load(_f)
-
-    patch_size   = meta["patch_size"]
-    n_channels   = meta["n_channels"]
-    n_samples    = meta["split_counts"][split]
-
-    X_shape = (n_samples, patch_size, patch_size, n_channels)
-    y_shape = (n_samples, patch_size, patch_size, 1)
-
-    X = np.memmap(data_dir / "X.npy", dtype=np.float32, mode="r", shape=X_shape)
-    y = np.memmap(data_dir / "y.npy", dtype=np.float32, mode="r", shape=y_shape)
+    
+    X = np.load(data_dir / "X.npy")
+    y = np.load(data_dir / "y.npy")
     
     logger.info(f"Loaded {split} data: X shape {X.shape}, y shape {y.shape}")
     logger.info(f"  X range: [{X.min():.4f}, {X.max():.4f}]")
     logger.info(f"  y range: [{y.min():.4f}, {y.max():.4f}]")
-
-    # Verify channel count matches the Landsat-only pipeline (10 channels)
-    expected_channels = CNN_CONFIG["input_channels"]
-    actual_channels   = X.shape[-1]          # shape is (N, H, W, C)
-    if actual_channels != expected_channels:
-        raise ValueError(
-            f"{split}: expected {expected_channels} input channels "
-            f"(Landsat-only) but got {actual_channels}. "
-            f"Re-run preprocessing.py to regenerate the dataset."
-        )
     
     if not validate_data_quality(X, y, split):
         raise ValueError(f"{split} data failed quality checks")
@@ -2320,9 +2219,7 @@ def main():
         norm_stats = json.load(f)
     
     logger.info(f"✅ Found normalization stats: {stats_path}")
-    channel_order = norm_stats.get('channel_order', [])
-    n_ch = len(channel_order) if channel_order else norm_stats.get('n_channels', 'N/A')
-    logger.info(f"   Channels ({n_ch}): {', '.join(channel_order) if channel_order else 'N/A'}")
+    logger.info(f"   Features: {norm_stats.get('n_channels', 'N/A')} channels")
     
     if 'target' in norm_stats:
         target_mean = norm_stats['target']['mean']
