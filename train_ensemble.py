@@ -1,28 +1,60 @@
 import sys
+import json
+import shutil
+import pickle
+import logging
+import warnings
+import traceback
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-import pandas as pd
-from pathlib import Path
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from tqdm import tqdm
-import logging
-from typing import Dict, Tuple, Optional
-import json
-import shutil
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import lightgbm as lgb
-import pickle
+import joblib
+from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend — safe for headless/Windows runs
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import TwoSlopeNorm
-import warnings
+from scipy.stats import linregress  # moved from inline imports
+from scipy import stats             # for DiagnosticsPlotter residual/QQ plots
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from config import *
+from config import (
+    # Paths
+    PROCESSED_DATA_DIR,
+    MODEL_DIR,
+    # Model / training
+    CNN_CONFIG,
+    GBM_CONFIG,
+    ENSEMBLE_WEIGHTS,
+    TRAINING_CONFIG,
+    AUGMENTATION_CONFIG,
+    VALIDATION_CONFIG,
+    COMPUTE_CONFIG,
+    # New structured configs (replaces scattered magic numbers)
+    SCHEDULER_CONFIG,
+    EARLY_STOPPING_CONFIG,
+    LAYERWISE_WEIGHT_DECAY,
+    PROGRESSIVE_LOSS_CONFIG,
+    AUGMENTATION_PROB_CONFIG,
+    STRATIFIED_SAMPLER_CONFIG,
+    CHECKPOINT_CONFIG,
+    DATA_QUALITY_CONFIG,
+    DISK_CONFIG,
+    DIAGNOSTICS_CONFIG,
+    MONITORING_CONFIG,
+    LOGGING_CONFIG,
+)
 from models import UNet, ProgressiveLSTLoss, EarlyStopping, initialize_weights, count_parameters
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -32,22 +64,19 @@ logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 def load_normalization_stats() -> Optional[Dict]:
-    """
-    Load normalization statistics for denormalization during evaluation
-    
+    """Load normalization statistics for denormalization during evaluation.
+
     Returns:
-        Normalization statistics dictionary or None if not found
+        Normalization statistics dictionary, or None if not found.
     """
     stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
-    
+
     if not stats_path.exists():
         logger.warning("⚠️ Normalization stats not found - predictions will remain in normalized space")
         return None
-    
+
     with open(stats_path, 'r') as f:
-        stats = json.load(f)
-    
-    return stats
+        return json.load(f)
 
 def denormalize_predictions(predictions: np.ndarray, norm_stats: Dict) -> np.ndarray:
     """
@@ -71,20 +100,24 @@ def denormalize_predictions(predictions: np.ndarray, norm_stats: Dict) -> np.nda
     
     return denormalized
 
-def check_disk_space(path: Path, required_mb: int = 1000) -> bool:
-    """Check if sufficient disk space is available"""
+def check_disk_space(path: Path, required_mb: int = DISK_CONFIG["required_mb"]) -> bool:
+    """Check if sufficient disk space is available.
+
+    Returns False (rather than True) on error: we'd rather abort than silently
+    proceed when we can't even verify free space.
+    """
     try:
         stat = shutil.disk_usage(path)
         available_mb = stat.free / (1024 * 1024)
         logger.info(f"Available disk space: {available_mb:.2f} MB")
-        
+
         if available_mb < required_mb:
             logger.warning(f"Low disk space! Available: {available_mb:.2f} MB, Required: {required_mb} MB")
             return False
         return True
     except Exception as e:
-        logger.warning(f"Could not check disk space: {e}")
-        return True
+        logger.warning(f"Could not check disk space: {e} — aborting as a precaution")
+        return False
 
 
 
@@ -139,7 +172,7 @@ class DiagnosticsPlotter:
     def _save(self, fig, name: str):
         path = self.save_dir / f"{name}.png"
         try:
-            fig.savefig(path, dpi=150, bbox_inches="tight")
+            fig.savefig(path, dpi=DIAGNOSTICS_CONFIG["save_dpi"], bbox_inches="tight")
             logger.info(f"  ✅ Saved: {path.name}")
         except Exception as e:
             logger.warning(f"  ⚠️ Could not save {path.name}: {e}")
@@ -166,9 +199,11 @@ class DiagnosticsPlotter:
             ax = axes[0, 1]
             if history["cnn_metrics"]:
                 r2_scores = [m["r2"] for m in history["cnn_metrics"]]
-                r2_epochs = range(1, len(r2_scores) + 1)  # FIX: use own range (may differ from train_loss length)
+                r2_epochs = range(1, len(r2_scores) + 1)
                 ax.plot(r2_epochs, r2_scores, label="Val R²", color="#4CAF50")
-                ax.axhline(0.85, ls="--", color="gray", lw=0.8, label="Target (0.85)")
+                r2_target = DIAGNOSTICS_CONFIG["r2_target_line"]
+                ax.axhline(r2_target, ls="--", color="gray", lw=0.8,
+                           label=f"Target ({r2_target})")
                 ax.set_title("CNN Validation R²"); ax.set_xlabel("Epoch"); ax.set_ylabel("R²")
                 ax.set_ylim([-0.1, 1.05]); ax.legend()
 
@@ -199,7 +234,6 @@ class DiagnosticsPlotter:
                             label: str = "Model", metrics: dict = None):
         """Scatter + residual plot (denormalised °C values)."""
         try:
-            from scipy.stats import linregress
             self._use_style()
 
             preds   = np.asarray(preds).flatten()
@@ -256,7 +290,6 @@ class DiagnosticsPlotter:
                                    label: str = "Model"):
         """Histogram + Q-Q plot of residuals."""
         try:
-            from scipy import stats
             self._use_style()
             residuals = (np.asarray(preds) - np.asarray(targets)).flatten()
             residuals = residuals[np.isfinite(residuals)]
@@ -321,7 +354,7 @@ class DiagnosticsPlotter:
             logger.warning(f"plot_ensemble_comparison failed: {e}")
 
     # ── 5. GBM feature importance ─────────────────────────────────────────────
-    def plot_gbm_feature_importance(self, gbm_model, top_n: int = 30):
+    def plot_gbm_feature_importance(self, gbm_model, top_n: int = DIAGNOSTICS_CONFIG["gbm_importance_top_n"]):
         """Horizontal bar chart of LightGBM feature importances."""
         try:
             if gbm_model is None:
@@ -414,11 +447,13 @@ class DiagnosticsPlotter:
                     ax.legend(fontsize=8)
 
             _plot(axes[0, 0], r2_vals,    "Validation R²",        "R²",
-                  target=0.85)
+                  target=DIAGNOSTICS_CONFIG["r2_target_line"])
             _plot(axes[0, 1], slopes,     "Prediction Slope",     "Slope",
-                  target=1.0, danger=0.85)
+                  target=DIAGNOSTICS_CONFIG["slope_target"],
+                  danger=DIAGNOSTICS_CONFIG["slope_danger"])
             _plot(axes[1, 0], std_ratios, "Std Ratio (pred/tgt)", "Std Ratio",
-                  target=1.0, danger=0.80)
+                  target=DIAGNOSTICS_CONFIG["std_ratio_target"],
+                  danger=DIAGNOSTICS_CONFIG["std_ratio_danger"])
             _plot(axes[1, 1], mbe_vals,   "Mean Bias Error",      "MBE (°C)")
             axes[1, 1].axhline(0, color="green", ls="--", lw=1, label="Target (0)")
             axes[1, 1].legend(fontsize=8)
@@ -430,7 +465,8 @@ class DiagnosticsPlotter:
 
     # ── 8. Spatial error maps ─────────────────────────────────────────────────
     def plot_spatial_error_map(self, preds_4d: np.ndarray, targets_4d: np.ndarray,
-                               label: str = "Model", n_samples: int = 6):
+                               label: str = "Model",
+                               n_samples: int = DIAGNOSTICS_CONFIG["spatial_n_samples"]):
         """Actual / Predicted / Error side-by-side for first n_samples patches."""
         try:
             self._use_style()
@@ -488,7 +524,8 @@ class DiagnosticsPlotter:
 
     # ── 9. Temperature-stratified error ──────────────────────────────────────
     def plot_stratified_error(self, preds: np.ndarray, targets: np.ndarray,
-                              label: str = "Model", n_bins: int = 10):
+                              label: str = "Model",
+                              n_bins: int = DIAGNOSTICS_CONFIG["stratified_n_bins"]):
         """RMSE, MAE, MBE bucketed by temperature percentile bins."""
         try:
             self._use_style()
@@ -733,77 +770,61 @@ class UHIDataset(Dataset):
     
     def _augment(self, x, y):
         """
-        IMPROVED: Stronger augmentation for better generalization
-        Simulates various atmospheric conditions, viewing angles, and noise
+        Stochastic augmentation pipeline.  All probabilities and magnitudes are
+        read from AUGMENTATION_PROB_CONFIG in config.py so they can be tuned
+        without touching model code.
         """
-        
-        # 1. Geometric transformations (80% probability - INCREASED from 60%)
-        if torch.rand(1) > 0.2:  # Changed from 0.4
-            # Horizontal flip
-            if torch.rand(1) > 0.5:
+        cfg = AUGMENTATION_PROB_CONFIG
+
+        # 1. Geometric transformations
+        if torch.rand(1) < cfg["geometric_prob"]:
+            if torch.rand(1) < cfg["flip_prob"]:
                 x = torch.flip(x, dims=[2])
                 y = torch.flip(y, dims=[2])
-            
-            # Vertical flip
-            if torch.rand(1) > 0.5:
+            if torch.rand(1) < cfg["flip_prob"]:
                 x = torch.flip(x, dims=[1])
                 y = torch.flip(y, dims=[1])
-            
-            # 90-degree rotation
-            if torch.rand(1) > 0.5:
+            if torch.rand(1) < cfg["rot90_prob"]:
                 k = torch.randint(1, 4, (1,)).item()
                 x = torch.rot90(x, k, dims=[1, 2])
                 y = torch.rot90(y, k, dims=[1, 2])
-        
-        # 2. Brightness adjustment (50% probability - INCREASED from 30%)
-        # Simulates different times of day / solar angles
-        if torch.rand(1) > 0.5:  # Changed from 0.7
-            brightness_factor = 1.0 + (torch.rand(1) - 0.5) * 0.3  # ±15% (was ±7.5%)
-            x = x * brightness_factor
-        
-        # 3. Contrast adjustment (40% probability - INCREASED from 30%)
-        # Simulates different atmospheric conditions
-        if torch.rand(1) > 0.6:  # Changed from 0.7
-            contrast_factor = 1.0 + (torch.rand(1) - 0.5) * 0.3  # ±15%
+
+        # 2. Brightness adjustment — simulates different solar angles / ToD
+        if torch.rand(1) < cfg["brightness_prob"]:
+            factor = 1.0 + (torch.rand(1) - 0.5) * cfg["brightness_range"]
+            x = x * factor
+
+        # 3. Contrast adjustment — simulates atmospheric variation
+        if torch.rand(1) < cfg["contrast_prob"]:
+            factor = 1.0 + (torch.rand(1) - 0.5) * cfg["contrast_range"]
             mean = x.mean(dim=[1, 2], keepdim=True)
-            x = (x - mean) * contrast_factor + mean
-        
-        # 4. Gaussian noise (40% probability - INCREASED from 25%)
-        # Simulates sensor noise and atmospheric interference
-        if torch.rand(1) > 0.6:  # Changed from 0.75
-            noise = torch.randn_like(x) * 0.10  # INCREASED from 0.015
-            x = x + noise
-        
-        # 5. Regional dropout (20% probability)
-        # Simulates cloud patches or missing data
-        if torch.rand(1) > 0.8:
+            x = (x - mean) * factor + mean
+
+        # 4. Gaussian noise — simulates sensor noise / atmospheric interference
+        if torch.rand(1) < cfg["noise_prob"]:
+            x = x + torch.randn_like(x) * cfg["noise_std"]
+
+        # 5. Regional dropout — simulates cloud patches / missing data
+        if torch.rand(1) < cfg["cutout_prob"]:
             h, w = x.shape[1], x.shape[2]
-            cut_h = int(h * 0.25)
-            cut_w = int(w * 0.25)
+            cut_h = int(h * cfg["cutout_size_frac"])
+            cut_w = int(w * cfg["cutout_size_frac"])
             cx = torch.randint(0, w - cut_w + 1, (1,)).item()
             cy = torch.randint(0, h - cut_h + 1, (1,)).item()
-            
-            # Fill with mean instead of zeros (more realistic)
-            x[:, cy:cy+cut_h, cx:cx+cut_w] = x.mean(dim=[1, 2], keepdim=True)
-        
-        # 6. IMPROVED: MixUp augmentation (20% probability - NEW)
-        # Helps model learn smoother decision boundaries
-        if torch.rand(1) > 0.8:
-            alpha = 0.2
+            # Fill with patch mean (more realistic than zeros)
+            x[:, cy:cy + cut_h, cx:cx + cut_w] = x.mean(dim=[1, 2], keepdim=True)
+
+        # 6. MixUp — helps model learn smoother decision boundaries
+        if torch.rand(1) < cfg["mixup_prob"]:
+            alpha = cfg["mixup_alpha"]
             lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-            
-            # Create permuted version
             perm_h = torch.randperm(x.shape[1])
             perm_w = torch.randperm(x.shape[2])
-            x_perm = x[:, perm_h, :]
-            x_perm = x_perm[:, :, perm_w]
-            y_perm = y[:, perm_h, :]
-            y_perm = y_perm[:, :, perm_w]
-            
-            # Mix
+            x_perm = x[:, perm_h, :][:, :, perm_w]
+            y_perm = y[:, perm_h, :][:, :, perm_w]
             x = lam * x + (1 - lam) * x_perm
             y = lam * y + (1 - lam) * y_perm
-        
+
         return x, y
 
 
@@ -913,7 +934,6 @@ def extract_cnn_bottleneck_features(X: np.ndarray, cnn_model,
     Returns:
         bottleneck_stats: (N, 3 * bottleneck_channels) array
     """
-    import torch
     cnn_model.eval()
     all_stats = []
 
@@ -1038,23 +1058,21 @@ class GBMTrainer:
 
 def create_temperature_stratified_sampler(y_train):
     """
-    Create sampler that balances temperature ranges
-    Ensures model sees equal amounts of hot and cold samples
-    
+    Create a sampler that balances temperature ranges so the model sees equal
+    amounts of hot and cold samples each epoch.
+
+    Bins are defined in normalised LST space and read from
+    STRATIFIED_SAMPLER_CONFIG in config.py.
+
     Args:
-        y_train: Training targets (N, H, W, 1) - NORMALIZED
-    
+        y_train: Training targets (N, H, W, 1) — NORMALIZED
+
     Returns:
         WeightedRandomSampler
     """
-    from torch.utils.data import WeightedRandomSampler
-    
-    # Get mean temperature per sample (in normalized space)
     sample_means = y_train.reshape(len(y_train), -1).mean(axis=1).flatten()
-    
-    # Define temperature bins
-    # In normalized space: -1.5 = very cold, 0 = average, +1.5 = very hot
-    bins = np.array([-np.inf, -1.0, -0.5, 0.0, 0.5, 1.0, np.inf])
+
+    bins        = np.array(STRATIFIED_SAMPLER_CONFIG["bins"])
     bin_indices = np.digitize(sample_means, bins)
     
     # Count samples per bin
@@ -1079,9 +1097,17 @@ def create_temperature_stratified_sampler(y_train):
     )
 
 class CheckpointManager:
-    """Manages multiple best checkpoints for different metrics"""
-    
-    def __init__(self, save_dir: Path, metrics: list = ['r2', 'rmse', 'mae']):
+    """Manages multiple best checkpoints for different metrics.
+
+    Tracked metrics and the primary selection metric are read from
+    CHECKPOINT_CONFIG in config.py.
+    """
+
+    def __init__(
+        self,
+        save_dir: Path,
+        metrics: list = CHECKPOINT_CONFIG["metrics"],
+    ):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.metrics = metrics
@@ -1181,26 +1207,29 @@ class EnsembleTrainer:
         self.criterion = ProgressiveLSTLoss()
         logger.info("✓ Using ProgressiveLSTLoss v2 (gradient-alignment + temp-weighted MSE)")
 
-        # FIX 2: Layer-wise weight decay — deeper/output layers get stronger
-        # regularisation to stop the monotonically-growing weight norm observed
-        # in diagnostics (75→320 over training).
+        # Layer-wise weight decay — deeper / output layers get stronger
+        # regularisation. Values are read from LAYERWISE_WEIGHT_DECAY in config.py.
         if config["optimizer"] == "adamw":
+            lwd = LAYERWISE_WEIGHT_DECAY
             self.optimizer = optim.AdamW(
                 [
-                    {"params": cnn_model.enc1.parameters(),      "weight_decay": 1e-3},
-                    {"params": cnn_model.enc2.parameters(),      "weight_decay": 2e-3},
-                    {"params": cnn_model.enc3.parameters(),      "weight_decay": 3e-3},
-                    {"params": cnn_model.enc4.parameters(),      "weight_decay": 4e-3},
-                    {"params": cnn_model.bottleneck.parameters(),"weight_decay": 5e-3},
-                    {"params": cnn_model.dec4.parameters(),      "weight_decay": 4e-3},
-                    {"params": cnn_model.dec3.parameters(),      "weight_decay": 3e-3},
-                    {"params": cnn_model.dec2.parameters(),      "weight_decay": 2e-3},
-                    {"params": cnn_model.dec1.parameters(),      "weight_decay": 1e-3},
-                    {"params": cnn_model.output.parameters(),    "weight_decay": 5e-3},
+                    {"params": cnn_model.enc1.parameters(),      "weight_decay": lwd["enc1"]},
+                    {"params": cnn_model.enc2.parameters(),      "weight_decay": lwd["enc2"]},
+                    {"params": cnn_model.enc3.parameters(),      "weight_decay": lwd["enc3"]},
+                    {"params": cnn_model.enc4.parameters(),      "weight_decay": lwd["enc4"]},
+                    {"params": cnn_model.bottleneck.parameters(),"weight_decay": lwd["bottleneck"]},
+                    {"params": cnn_model.dec4.parameters(),      "weight_decay": lwd["dec4"]},
+                    {"params": cnn_model.dec3.parameters(),      "weight_decay": lwd["dec3"]},
+                    {"params": cnn_model.dec2.parameters(),      "weight_decay": lwd["dec2"]},
+                    {"params": cnn_model.dec1.parameters(),      "weight_decay": lwd["dec1"]},
+                    {"params": cnn_model.output.parameters(),    "weight_decay": lwd["output"]},
                 ],
                 lr=config["initial_lr"],
             )
-            logger.info("✓ Layer-wise weight decay: 1e-3 (enc1) → 5e-3 (bottleneck/output)")
+            logger.info(
+                f"✓ Layer-wise weight decay: "
+                f"{lwd['enc1']} (enc1) → {lwd['bottleneck']} (bottleneck/output)"
+            )
         else:
             self.optimizer = optim.Adam(
                 cnn_model.parameters(),
@@ -1209,13 +1238,12 @@ class EnsembleTrainer:
         
         self.scheduler = self._create_scheduler()
 
-        # FIX 7: Tighter early stopping — patience=20, min_delta=0.002 so small
-        # oscillations (visible in R² curve) don't reset the counter.
-        # Monitor val R² (mode=max): stable across progressive loss phases.
+        # Early stopping monitors val R² (mode=max): stable across progressive
+        # loss phases.  Parameters read from EARLY_STOPPING_CONFIG in config.py.
         self.early_stopping = EarlyStopping(
-            patience=config.get("patience", 20),
-            min_delta=0.002,
-            mode="max",
+            patience=EARLY_STOPPING_CONFIG["patience"],
+            min_delta=EARLY_STOPPING_CONFIG["min_delta"],
+            mode=EARLY_STOPPING_CONFIG["mode"],
         )
         
         # GBM trainer
@@ -1228,7 +1256,7 @@ class EnsembleTrainer:
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
             save_dir=MODEL_DIR / "checkpoints",
-            metrics=['r2', 'rmse', 'mae']
+            metrics=CHECKPOINT_CONFIG["metrics"],
         )
 
         # Diagnostics plotter — saves all figures to MODEL_DIR/diagnostics/
@@ -1246,24 +1274,24 @@ class EnsembleTrainer:
         
     def _create_scheduler(self):
         """
-        FIX 3: CosineAnnealingWarmRestarts (SGDR) replaces monotonic cosine decay.
+        CosineAnnealingWarmRestarts (SGDR) — periodically resets LR to allow
+        the optimiser to escape local minima. Parameters from SCHEDULER_CONFIG.
 
-        Diagnostics showed R² plateauing at ~0.79 from epoch 30, with the old
-        scheduler never dropping LR low enough to escape the local minimum.
-        SGDR periodically resets LR to allow the optimiser to explore and find
-        better minima, doubling the restart period after each cycle.
-
-        T_0=50  → first restart after 50 epochs
-        T_mult=2 → periods: 50, 100, 200 … (fits a 200-epoch budget)
-        eta_min=1e-6 → minimum LR at the bottom of each cosine valley
+        T_0    → epochs before first restart
+        T_mult → period doubles after each restart (50 → 100 → 200 …)
+        eta_min → LR floor at the bottom of each cosine valley
         """
+        cfg = SCHEDULER_CONFIG
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=50,
-            T_mult=2,
-            eta_min=1e-6,
+            T_0=cfg["T_0"],
+            T_mult=cfg["T_mult"],
+            eta_min=cfg["eta_min"],
         )
-        logger.info("✓ SGDR scheduler: T_0=50, T_mult=2, eta_min=1e-6")
+        logger.info(
+            f"✓ SGDR scheduler: T_0={cfg['T_0']}, "
+            f"T_mult={cfg['T_mult']}, eta_min={cfg['eta_min']}"
+        )
         return scheduler
     
     def _log_regularization_metrics(self, epoch):
@@ -1377,63 +1405,64 @@ class EnsembleTrainer:
     
     def _check_for_overfitting_warnings(self, train_metrics, val_metrics):
         """
-        IMPROVED: Check for overfitting and other performance issues
-        Warns about variance collapse, range compression, and overfitting
+        Check for overfitting and other performance issues.
+        All thresholds are read from MONITORING_CONFIG and VALIDATION_CONFIG in config.py.
         """
+        warn_cfg       = MONITORING_CONFIG["warnings"]
         warnings_found = False
-        
-        # Warning 1: Overfitting (train-val gap)
+
+        # Warning 1: Overfitting (train-val R² gap)
         if 'r2' in train_metrics and 'r2' in val_metrics:
-            train_r2 = train_metrics['r2']
-            val_r2 = val_metrics['r2']
-            gap = train_r2 - val_r2
-            
-            if gap > 0.10:
+            gap = train_metrics['r2'] - val_metrics['r2']
+            threshold = warn_cfg["overfitting_threshold"]
+            if gap > threshold:
                 logger.warning(f"⚠️ OVERFITTING DETECTED!")
-                logger.warning(f"   Train R²: {train_r2:.3f}")
-                logger.warning(f"   Val R²: {val_r2:.3f}")
-                logger.warning(f"   Gap: {gap:.3f} (should be < 0.10)")
+                logger.warning(f"   Train R²: {train_metrics['r2']:.3f}")
+                logger.warning(f"   Val R²:   {val_metrics['r2']:.3f}")
+                logger.warning(f"   Gap: {gap:.3f} (should be < {threshold})")
                 warnings_found = True
-        
-        # Warning 2: Variance Collapse
+
+        # Warning 2: Variance collapse
         if 'std_ratio' in val_metrics:
             std_ratio = val_metrics['std_ratio']
-            if std_ratio < 0.80:
+            threshold = warn_cfg["variance_collapse_threshold"]
+            if std_ratio < threshold:
                 logger.warning(f"⚠️ VARIANCE COLLAPSE!")
-                logger.warning(f"   Std ratio: {std_ratio:.3f} (should be ≈1.0)")
+                logger.warning(f"   Std ratio: {std_ratio:.3f} (should be ≈1.0, threshold={threshold})")
                 logger.warning(f"   Predictions are too clustered around mean")
                 warnings_found = True
-        
-        # Warning 3: Range Compression (regression to mean)
+
+        # Warning 3: Range compression (regression to mean)
         if 'slope' in val_metrics:
-            slope = val_metrics['slope']
-            if slope < 0.85:
+            slope     = val_metrics['slope']
+            threshold = warn_cfg["range_compression_threshold"]
+            if slope < threshold:
                 logger.warning(f"⚠️ RANGE COMPRESSION!")
-                logger.warning(f"   Slope: {slope:.3f} (should be ≈1.0)")
+                logger.warning(f"   Slope: {slope:.3f} (should be ≈1.0, threshold={threshold})")
                 logger.warning(f"   Model is regressing to the mean")
                 warnings_found = True
-        
-        # Warning 4: Systematic Bias
+
+        # Warning 4: Systematic bias
         if 'mbe' in val_metrics:
             mbe = val_metrics['mbe']
             if abs(mbe) > 1.0:
                 logger.warning(f"⚠️ SYSTEMATIC BIAS!")
                 logger.warning(f"   MBE: {mbe:+.3f}°C (should be ≈0)")
                 warnings_found = True
-        
-        # Warning 5: Mean Shift
+
+        # Warning 5: Mean shift
         if 'pred_mean' in val_metrics and 'target_mean' in val_metrics:
             mean_diff = abs(val_metrics['pred_mean'] - val_metrics['target_mean'])
             if mean_diff > 1.5:
                 logger.warning(f"⚠️ MEAN SHIFT!")
-                logger.warning(f"   Pred mean: {val_metrics['pred_mean']:.2f}°C")
+                logger.warning(f"   Pred mean:   {val_metrics['pred_mean']:.2f}°C")
                 logger.warning(f"   Target mean: {val_metrics['target_mean']:.2f}°C")
-                logger.warning(f"   Difference: {mean_diff:.2f}°C (should be < 1.5)")
+                logger.warning(f"   Difference:  {mean_diff:.2f}°C (should be < 1.5)")
                 warnings_found = True
-        
+
         if not warnings_found:
             logger.info("✓ No major issues detected")
-        
+
         return warnings_found
     
     def train_gbm(self, X_train, y_train, X_val, y_val):
@@ -1457,7 +1486,6 @@ class EnsembleTrainer:
             # Without compression, 768 bottleneck dims = 86% of all 890 features,
             # giving the GBM a near-perfect identity signal for train samples.
             n_components = GBM_CONFIG.get("bottleneck_pca_components", 32)
-            from sklearn.decomposition import PCA
             logger.info(f"  Compressing bottleneck features: {bot_train.shape[1]} → {n_components} dims (PCA)")
             pca = PCA(n_components=n_components, random_state=42)
             bot_train = pca.fit_transform(bot_train)   # fit ONLY on train
@@ -1467,7 +1495,6 @@ class EnsembleTrainer:
             self._pca = pca   # cache for inference
 
             # Persist PCA so uhi_inference.py can apply the same projection
-            import joblib
             _pca_path = getattr(self, '_save_dir', None)
             if _pca_path is None:
                 _pca_path = MODEL_DIR
@@ -1626,7 +1653,10 @@ class EnsembleTrainer:
         # ── Load best CNN checkpoint ──────────────────────────────────────────
         logger.info("Loading best CNN checkpoint...")
         best_ckpt = self.checkpoint_manager.load_best(
-            self.cnn_model, metric='r2', device=self.device)
+            self.cnn_model,
+            metric=CHECKPOINT_CONFIG["primary_metric"],
+            device=self.device,
+        )
         if best_ckpt is None:
             logger.warning("⚠️ No best CNN checkpoint found; using current state")
         else:
@@ -1732,11 +1762,10 @@ class EnsembleTrainer:
     
     def _calculate_metrics(self, preds, targets, name=""):
         """
-        Calculate comprehensive evaluation metrics
-        IMPROVED: Now includes slope and std_ratio to detect range compression and variance collapse
+        Calculate comprehensive evaluation metrics (denormalised °C).
+        Uses the module-level linregress import — no repeated inline import.
+        Includes slope and std_ratio to detect range compression and variance collapse.
         """
-        from scipy.stats import linregress
-        
         # Load normalization stats for denormalization
         norm_stats = load_normalization_stats()
         
@@ -1900,9 +1929,9 @@ class EnsembleTrainer:
         # Load best CNN checkpoint
         logger.info("Loading best CNN checkpoint...")
         best_cnn_checkpoint = self.checkpoint_manager.load_best(
-            self.cnn_model, 
-            metric='r2', 
-            device=self.device
+            self.cnn_model,
+            metric=CHECKPOINT_CONFIG["primary_metric"],
+            device=self.device,
         )
         
         if best_cnn_checkpoint:
@@ -1924,9 +1953,6 @@ class EnsembleTrainer:
         logger.info("\n" + "="*60)
         logger.info("FITTING POST-HOC LINEAR CALIBRATION")
         logger.info("="*60)
-
-        from scipy.stats import linregress as _linregress
-        from sklearn.metrics import r2_score as _r2s
 
         # Collect ENSEMBLE predictions on val set (not just CNN)
         # so calibration corrects the full ensemble output, not just CNN in isolation.
@@ -1966,11 +1992,10 @@ class EnsembleTrainer:
         }
         logger.info(f"  Cal slope={_cal_slope:.4f} (target_std/pred_std = {_tgt_std:.4f}/{_pred_std:.4f})")
         logger.info(f"  Cal intercept={_cal_intercept:.4f}")
-        logger.info(f"  R² before: {_r2s(_ct, _cp):.4f}  after: {_r2s(_ct, _corrected):.4f}")
-        logger.info(f"  Slope before: {_linregress(_cp,_ct)[0]:.4f}  after: {_linregress(_corrected,_ct)[0]:.4f}")
-        import json as _json
+        logger.info(f"  R² before: {r2_score(_ct, _cp):.4f}  after: {r2_score(_ct, _corrected):.4f}")
+        logger.info(f"  Slope before: {linregress(_cp,_ct)[0]:.4f}  after: {linregress(_corrected,_ct)[0]:.4f}")
         with open(save_dir / "calibration_params.json", "w") as _f:
-            _json.dump(calibration_params, _f, indent=2)
+            json.dump(calibration_params, _f, indent=2)
         logger.info(f"  Calibration params saved to {save_dir / 'calibration_params.json'}")
         logger.info("="*60)
         # ─────────────────────────────────────────────────────────────────────
@@ -2006,9 +2031,8 @@ class EnsembleTrainer:
             _norm_stats = None
             _ns_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
             if _ns_path.exists():
-                import json as _js
                 with open(_ns_path) as _f:
-                    _norm_stats = _js.load(_f)
+                    _norm_stats = json.load(_f)
 
             _gbm_model_for_plot = (
                 self.gbm_trainer.best_model or self.gbm_trainer.model
@@ -2124,99 +2148,94 @@ class EnsembleTrainer:
 
 
 def validate_data_quality(X: np.ndarray, y: np.ndarray, split: str) -> bool:
-    """Validate data quality before training"""
+    """Validate data quality before training.
+
+    All thresholds are read from DATA_QUALITY_CONFIG in config.py.
+    """
     logger.info(f"\n{'='*60}")
     logger.info(f"DATA QUALITY CHECK: {split.upper()}")
     logger.info(f"{'='*60}")
-    
+
+    dqc    = DATA_QUALITY_CONFIG
     issues = []
-    
+
     # Check for NaN/Inf
     if np.isnan(X).any() or np.isinf(X).any():
         nan_pct = np.isnan(X).sum() / X.size * 100
         inf_pct = np.isinf(X).sum() / X.size * 100
         issues.append(f"X contains NaN ({nan_pct:.2f}%) or Inf ({inf_pct:.2f}%)")
-    
+
     if np.isnan(y).any() or np.isinf(y).any():
         nan_pct = np.isnan(y).sum() / y.size * 100
         inf_pct = np.isinf(y).sum() / y.size * 100
         issues.append(f"y contains NaN ({nan_pct:.2f}%) or Inf ({inf_pct:.2f}%)")
-    
+
     # Calculate statistics
-    X_mean = X.mean()
-    X_std = X.std()
-    y_mean = y.mean()
-    y_std = y.std()
-    y_min = y.min()
-    y_max = y.max()
-    
-    # Log feature statistics
+    X_mean = X.mean(); X_std = X.std()
+    y_mean = y.mean(); y_std = y.std()
+
     logger.info(f"Features (X) statistics:")
-    logger.info(f"  Mean: {X_mean:.4f}")
-    logger.info(f"  Std:  {X_std:.4f}")
-    logger.info(f"  Min:  {X.min():.4f}")
-    logger.info(f"  Max:  {X.max():.4f}")
-    
-    # Log target statistics
+    logger.info(f"  Mean: {X_mean:.4f}  Std: {X_std:.4f}  Min: {X.min():.4f}  Max: {X.max():.4f}")
+
     logger.info(f"Target (y) statistics:")
-    logger.info(f"  Mean: {y_mean:.4f}")
-    logger.info(f"  Std:  {y_std:.4f}")
-    logger.info(f"  Min:  {y_min:.4f}")
-    logger.info(f"  Max:  {y_max:.4f}")
+    logger.info(f"  Mean: {y_mean:.4f}  Std: {y_std:.4f}  Min: {y.min():.4f}  Max: {y.max():.4f}")
     logger.info(f"  Unique values: {len(np.unique(y))}")
-    
-    # Check normalization for TRAINING split
+
+    # Normalization checks for training split
     if split == "train":
+        mean_tol  = dqc["train_mean_tol"]
+        std_low   = dqc["train_std_low"]
+        std_high  = dqc["train_std_high"]
         logger.info(f"\nNormalization checks (expecting mean≈0, std≈1):")
-        
-        if not (-0.2 < X_mean < 0.2):
+
+        if abs(X_mean) > mean_tol:
             issues.append(f"X not properly normalized (mean={X_mean:.4f}, expected ≈0)")
-            logger.warning(f"  ⚠️ X mean={X_mean:.4f} (should be ≈0)")
+            logger.warning(f"  ⚠️ X mean={X_mean:.4f} (should be ≈0, tol={mean_tol})")
         else:
             logger.info(f"  ✅ X mean={X_mean:.4f}")
-        
-        if not (0.8 < X_std < 1.2):
+
+        if not (std_low < X_std < std_high):
             issues.append(f"X not properly normalized (std={X_std:.4f}, expected ≈1)")
-            logger.warning(f"  ⚠️ X std={X_std:.4f} (should be ≈1)")
+            logger.warning(f"  ⚠️ X std={X_std:.4f} (expected {std_low}–{std_high})")
         else:
             logger.info(f"  ✅ X std={X_std:.4f}")
-        
-        if not (-0.2 < y_mean < 0.2):
+
+        if abs(y_mean) > mean_tol:
             issues.append(f"y not properly normalized (mean={y_mean:.4f}, expected ≈0)")
-            logger.warning(f"  ⚠️ y mean={y_mean:.4f} (should be ≈0)")
+            logger.warning(f"  ⚠️ y mean={y_mean:.4f} (should be ≈0, tol={mean_tol})")
         else:
             logger.info(f"  ✅ y mean={y_mean:.4f}")
-        
-        if not (0.8 < y_std < 1.2):
+
+        if not (std_low < y_std < std_high):
             issues.append(f"y not properly normalized (std={y_std:.4f}, expected ≈1)")
-            logger.warning(f"  ⚠️ y std={y_std:.4f} (should be ≈1)")
+            logger.warning(f"  ⚠️ y std={y_std:.4f} (expected {std_low}–{std_high})")
         else:
             logger.info(f"  ✅ y std={y_std:.4f}")
     else:
-        # For val/test, just check they're in normalized space
+        # Val/test: just check values aren't wildly out of range
+        val_max = dqc["val_mean_max"]
         logger.info(f"\nValidation/Test data checks:")
-        if abs(X_mean) > 5.0:
+        if abs(X_mean) > val_max:
             logger.warning(f"  ⚠️ X mean={X_mean:.4f} seems too large for normalized data")
-        if abs(y_mean) > 5.0:
+        if abs(y_mean) > val_max:
             logger.warning(f"  ⚠️ y mean={y_mean:.4f} seems too large for normalized data")
-    
-    # Check variance
-    if y_std < 0.1:
+
+    # Variance floor
+    if y_std < dqc["min_target_std"]:
         issues.append(f"Target has very low variance (std={y_std:.4f})")
-    
-    if y_std < 1e-6:
+    if y_std < dqc["zero_variance_floor"]:
         issues.append(f"Target has ZERO variance")
-    
-    # Report results
+
+    # Report
     if issues:
         logger.error(f"❌ DATA QUALITY ISSUES FOUND:")
         for i, issue in enumerate(issues, 1):
             logger.error(f"  {i}. {issue}")
         return False
-    else:
-        logger.info(f"\n✅ Data quality checks passed")
-        logger.info(f"{'='*60}\n")
-        return True
+
+    logger.info(f"\n✅ Data quality checks passed")
+    logger.info(f"{'='*60}\n")
+    return True
 
 
 def load_data(split: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -2248,34 +2267,29 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and COMPUTE_CONFIG["use_gpu"] else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Verify normalization stats exist
+    # Verify and load normalization statistics (single call via shared helper)
     logger.info("\n" + "="*60)
     logger.info("VERIFYING NORMALIZATION STATISTICS")
     logger.info("="*60)
-    
+
     stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
-    if not stats_path.exists():
+    norm_stats = load_normalization_stats()
+    if norm_stats is None:
         logger.error("❌ Normalization stats not found!")
         logger.error(f"   Expected: {stats_path}")
-        logger.error("   ")
         logger.error("   This file should be created during preprocessing.")
         logger.error("   Run preprocessing.py to create normalized data with statistics.")
         raise FileNotFoundError(f"Missing normalization stats: {stats_path}")
-    
-    # Load and display normalization stats
-    import json
-    with open(stats_path, 'r') as f:
-        norm_stats = json.load(f)
-    
+
     logger.info(f"✅ Found normalization stats: {stats_path}")
     logger.info(f"   Features: {norm_stats.get('n_channels', 'N/A')} channels")
-    
+
     if 'target' in norm_stats:
         target_mean = norm_stats['target']['mean']
-        target_std = norm_stats['target']['std']
+        target_std  = norm_stats['target']['std']
         logger.info(f"   Target LST: mean={target_mean:.2f}°C, std={target_std:.2f}°C")
         logger.info(f"   (These are the ORIGINAL values before normalization)")
-    
+
     logger.info("="*60)
     
     # Load data
@@ -2337,9 +2351,8 @@ def main():
         )
     except Exception as e:
         logger.error(f"\n❌ Training failed: {e}")
-        import traceback
         traceback.print_exc()
-        return
+        raise
     
     logger.info("\n" + "="*60)
     logger.info("ENSEMBLE TRAINING COMPLETE")

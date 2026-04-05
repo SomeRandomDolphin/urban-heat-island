@@ -78,8 +78,8 @@ _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
 _THERMAL_CMAP   = LinearSegmentedColormap.from_list('thermal', _THERMAL_COLORS, N=256)
 _UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f']
-_UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–1 °C)',
-                   'Moderate (1–2 °C)', 'Strong (2–3 °C)', 'Very Strong (>3 °C)']
+_UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–2 °C)',
+                   'Moderate (2–4 °C)', 'Strong (4–6 °C)', 'Very Strong (>6 °C)']
 
 sns.set_theme(style="whitegrid", font_scale=1.05)
 plt.rcParams.update({
@@ -111,11 +111,38 @@ class UHIVisualizer:
     def create_lst_map(self, lst_data: np.ndarray, output_path: Path,
                        title: str = "Land Surface Temperature Map",
                        vmin: Optional[float] = None, vmax: Optional[float] = None,
-                       add_colorbar: bool = True):
+                       add_colorbar: bool = True,
+                       water_mask: Optional[np.ndarray] = None):
+        """
+        Render a Land Surface Temperature map.
+
+        Args:
+            water_mask: Optional boolean array (True = water/sea pixel).
+                        Water pixels are overlaid with a semi-transparent
+                        steel-blue hatch so they are visually distinct from
+                        cold land surfaces and not mistaken for UHI signal.
+        """
         logger.info(f"Creating LST map: {title}")
+        # Compute vmin/vmax from land pixels only so the colour scale is not
+        # anchored to the much colder sea temperature.
+        if vmin is None or vmax is None:
+            land_vals = lst_data[~water_mask] if water_mask is not None else lst_data
+            land_vals = land_vals[np.isfinite(land_vals)]
+            if vmin is None:
+                vmin = float(np.percentile(land_vals, 2))
+            if vmax is None:
+                vmax = float(np.percentile(land_vals, 98))
         fig, ax = plt.subplots(figsize=self.figsize)
         im = ax.imshow(lst_data, cmap=_THERMAL_CMAP, vmin=vmin, vmax=vmax,
                        interpolation='nearest', aspect='auto')
+        # Overlay water pixels with a distinct hatched blue mask
+        if water_mask is not None and water_mask.any():
+            water_rgba = np.zeros((*water_mask.shape, 4), dtype=np.float32)
+            water_rgba[water_mask] = [0.27, 0.51, 0.71, 0.55]   # steel-blue, semi-transparent
+            ax.imshow(water_rgba, interpolation='nearest', aspect='auto')
+            from matplotlib.patches import Patch as _Patch
+            ax.legend(handles=[_Patch(facecolor='#456eb4', alpha=0.55, label='Sea / Water')],
+                      loc='lower right', fontsize=9)
         ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
         ax.set_xlabel('X Coordinate', fontsize=12)
         ax.set_ylabel('Y Coordinate', fontsize=12)
@@ -128,29 +155,58 @@ class UHIVisualizer:
         plt.close()
 
     def create_uhi_intensity_map(self, uhi_data: np.ndarray, output_path: Path,
-                                  title: str = "UHI Intensity Map"):
+                                  title: str = "UHI Intensity Map",
+                                  water_mask: Optional[np.ndarray] = None):
+        """
+        Render a classified UHI intensity map.
+
+        Args:
+            water_mask: Optional boolean array (True = sea/water pixel).
+                        Water pixels are rendered as a 6th category "Sea / Water"
+                        in steel-blue so they are not conflated with the
+                        "No UHI / Cooling" land class.
+        """
         logger.info(f"Creating UHI intensity map: {title}")
         fig, ax = plt.subplots(figsize=self.figsize)
-        classified = np.zeros_like(uhi_data)
-        classified[uhi_data < 0]                               = 0
-        classified[(uhi_data >= 0) & (uhi_data < 1)]          = 1
-        classified[(uhi_data >= 1) & (uhi_data < 2)]          = 2
-        classified[(uhi_data >= 2) & (uhi_data < 3)]          = 3
-        classified[uhi_data >= 3]                              = 4
-        cmap  = mcolors.ListedColormap(_UHI_CAT_COLORS)
-        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
-        norm  = mcolors.BoundaryNorm(bounds, cmap.N)
+
+        # Determine water pixels: explicit mask OR NaN cells in uhi_data
+        if water_mask is not None:
+            sea_pixels = water_mask
+        else:
+            sea_pixels = ~np.isfinite(uhi_data)
+
+        # Classify only finite (land) pixels; sea gets category 5
+        classified = np.full(uhi_data.shape, -1, dtype=np.int8)
+        finite = np.isfinite(uhi_data)
+        classified[finite & (uhi_data < 0)]                            = 0
+        classified[finite & (uhi_data >= 0) & (uhi_data < 2)]         = 1
+        classified[finite & (uhi_data >= 2) & (uhi_data < 4)]         = 2
+        classified[finite & (uhi_data >= 4) & (uhi_data < 6)]         = 3
+        classified[finite & (uhi_data >= 6)]                           = 4
+        classified[sea_pixels]                                         = 5
+
+        sea_color  = '#456eb4'   # steel-blue for sea
+        cat_colors = _UHI_CAT_COLORS + [sea_color]
+        cat_labels = _UHI_CAT_LABELS + ['Sea / Water']
+
+        cmap   = mcolors.ListedColormap(cat_colors)
+        bounds = [-1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 5.5]
+        norm   = mcolors.BoundaryNorm(bounds, cmap.N)
         im = ax.imshow(classified, cmap=cmap, norm=norm,
                        interpolation='nearest', aspect='auto')
         ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
         ax.set_xlabel('X Coordinate', fontsize=12)
         ax.set_ylabel('Y Coordinate', fontsize=12)
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                            boundaries=bounds, ticks=[0, 1, 2, 3, 4])
-        cbar.set_label('UHI Category', fontsize=12)
-        cbar.ax.set_yticklabels(['No UHI/Cooling', 'Weak\n(0-1°C)',
-                                 'Moderate\n(1-2°C)', 'Strong\n(2-3°C)',
-                                 'Very Strong\n(>3°C)'])
+
+        from matplotlib.patches import Patch as _Patch
+        legend_handles = [
+            _Patch(facecolor=cat_colors[i], label=cat_labels[i])
+            for i in range(len(cat_labels))
+            if (classified == i).any()
+        ]
+        ax.legend(handles=legend_handles, loc='lower right', fontsize=8,
+                  title='UHI Category', title_fontsize=9)
+
         plt.tight_layout()
         plt.savefig(output_path, dpi=self.dpi, bbox_inches='tight')
         logger.info(f"Saved UHI intensity map: {output_path}")
@@ -1171,10 +1227,10 @@ class UHIVisualizer:
         ax = fig.add_subplot(gs[0, 1])
         classified = np.zeros_like(uhi_map)
         classified[uhi_map < 0]                               = 0
-        classified[(uhi_map >= 0) & (uhi_map < 1)]           = 1
-        classified[(uhi_map >= 1) & (uhi_map < 2)]           = 2
-        classified[(uhi_map >= 2) & (uhi_map < 3)]           = 3
-        classified[uhi_map >= 3]                              = 4
+        classified[(uhi_map >= 0) & (uhi_map < 2)]           = 1
+        classified[(uhi_map >= 2) & (uhi_map < 4)]           = 2
+        classified[(uhi_map >= 4) & (uhi_map < 6)]           = 3
+        classified[uhi_map >= 6]                              = 4
         cmap_c  = mcolors.ListedColormap(_UHI_CAT_COLORS)
         norm_c  = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap_c.N)
         im2 = ax.imshow(classified, cmap=cmap_c, norm=norm_c,
@@ -1182,7 +1238,7 @@ class UHIVisualizer:
         cbar2 = fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04,
                              boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
                              ticks=[0, 1, 2, 3, 4])
-        cbar2.ax.set_yticklabels(["None", "Weak", "Mod.", "Strong", "V.Strong"],
+        cbar2.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(>6)"],
                                  fontsize=7)
         ax.set_title("UHI Intensity Classification")
         ax.set_xlabel("X"); ax.set_ylabel("Y")
@@ -1287,8 +1343,8 @@ class UHIVisualizer:
         sorted_u = np.sort(flat)
         cdf      = np.linspace(0, 1, len(sorted_u))
         ax.plot(sorted_u, cdf, color="#4393c3", lw=2)
-        for thr, col in [(0, "#99d594"), (1, "#fee08b"),
-                         (2, "#fc8d59"), (3, "#d53e4f")]:
+        for thr, col in [(0, "#99d594"), (2, "#fee08b"),
+                         (4, "#fc8d59"), (6, "#d53e4f")]:
             pct = 100 * (1 - np.interp(thr, sorted_u, cdf))
             ax.axvline(thr, color=col, lw=1.2, ls="--")
             ax.text(thr + 0.05, 0.05, f"{pct:.1f}%",

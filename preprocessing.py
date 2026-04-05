@@ -5,16 +5,21 @@ Does NOT download data - only transforms existing raw data files
 """
 import sys
 import gc
+import json
+import logging
+import os as _os
+from collections import Counter
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import box
-from typing import Dict, Tuple, List, Optional
-import logging
-from pathlib import Path
-from scipy.ndimage import uniform_filter, zoom
 import pyproj
-from datetime import datetime, timedelta
+from scipy.ndimage import gaussian_filter as _gaussian_filter
+from scipy.ndimage import uniform_filter, zoom
+from shapely.geometry import box
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
 import rasterio
@@ -24,7 +29,14 @@ from config import (
     RAW_DATA_DIR, PROCESSED_DATA_DIR,
     LANDSAT_CONFIG, SENTINEL2_CONFIG,
     LOGGING_CONFIG, STUDY_AREA,
+    PREPROCESSING_CONFIG, DATE_RANGE,
 )
+
+# Optional dependency — used to tighten the memory budget in _compute_downsample_factor
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -57,20 +69,10 @@ _SENTINEL2_BAND_ORDER = ["B2", "B3", "B4", "B8", "B11", "B12", "SCL"]
 # ---------------------------------------------------------------------------
 # Maximum number of pixels (rows × cols) allowed per band before adaptive
 # downsampling kicks in.  At float32 each pixel costs 4 bytes, so:
-#   12_000_000 px  →  ~46 MiB per band  →  ~410 MiB for 9 Landsat bands
-# Raise this if your machine has more headroom; lower it if you still OOM.
-# The value can also be overridden via an environment variable:
+#   10_000_000 px  →  ~38 MiB per band  →  ~343 MiB for 9 Landsat bands
+# The default is read from PREPROCESSING_CONFIG and can also be overridden via:
 #   export UHI_MAX_PIXELS=8000000
-#
-# FIX: Raised default from 1_921_100 to 12_000_000.
-# The previous budget (~1.9 M px) caused aggressive downsampling that varied
-# epoch-to-epoch depending on each scene's bounding box.  Different downsample
-# factors → different grid_rows/grid_cols per epoch → wrong patch-column mode →
-# patches placed in incorrect canvas columns → blocky/misaligned mosaic.
-# At 12 M px each 1152×1024 scene (~1.18 M px) loads at full native resolution,
-# giving consistent grid dimensions across all epochs.
-import os as _os
-_DEFAULT_MAX_PIXELS = 10_000_000
+_DEFAULT_MAX_PIXELS: int = PREPROCESSING_CONFIG["max_pixels_default"]
 MAX_PIXELS: int = int(_os.environ.get("UHI_MAX_PIXELS", _DEFAULT_MAX_PIXELS))
 
 
@@ -80,9 +82,9 @@ def _compute_downsample_factor(rows: int, cols: int,
     """
     Return the linear scale factor (≤ 1.0) needed so that rows*cols ≤ max_pixels.
 
-    We also peek at available system RAM (via psutil if installed, otherwise we
-    use a conservative 1 GiB budget) and tighten the factor if even the
-    downsampled load would exceed half the free memory.
+    Peeks at available system RAM via the module-level _psutil (installed
+    optionally) and tightens the factor if even the downsampled load would
+    exceed the configured RAM budget fraction of free memory.
 
     Args:
         rows, cols : native raster dimensions
@@ -102,20 +104,16 @@ def _compute_downsample_factor(rows: int, cols: int,
 
     # Factor driven by available RAM (optional, requires psutil)
     ram_factor = 1.0
-    try:
-        import psutil
-        free_bytes = psutil.virtual_memory().available
-        # Budget: use at most 40 % of free RAM for the bands (conservative)
-        budget_bytes = free_bytes * 0.40
+    if _psutil is not None:
+        free_bytes = _psutil.virtual_memory().available
+        budget_bytes = free_bytes * PREPROCESSING_CONFIG["ram_budget_fraction"]
         bytes_per_band_native = native_px * 4  # float32
         bytes_total_native = bytes_per_band_native * n_bands
         if bytes_total_native > budget_bytes:
             ram_factor = (budget_bytes / bytes_total_native) ** 0.5
-    except ImportError:
-        pass  # psutil not installed — fall back to pixel budget only
 
     factor = min(pixel_factor, ram_factor)
-    return max(factor, 0.05)   # never go below 5 % of native resolution
+    return max(factor, PREPROCESSING_CONFIG["min_downsample_factor"])
 
 
 def load_tif_as_bands(tif_path: Path,
@@ -461,10 +459,7 @@ class PreprocessingDiagnostics:
             x, y = idx_vals[mask], lst[mask]
 
             # Subsample for speed if very large
-            if len(x) > 50_000:
-                rng = np.random.default_rng(0)
-                sel = rng.choice(len(x), 50_000, replace=False)
-                x, y = x[sel], y[sel]
+            x, y = _subsample(x), _subsample(y)
 
             ax.hexbin(x, y, gridsize=50, cmap="YlOrRd", mincnt=1)
             # Simple linear fit
@@ -1281,8 +1276,7 @@ class PreprocessingDiagnostics:
             arr = bands[b].ravel()
             arr = arr[np.isfinite(arr)]
             # Subsample for speed
-            if len(arr) > 100_000:
-                arr = np.random.default_rng(42).choice(arr, 100_000, replace=False)
+            arr = _subsample(arr, n=min(100_000, PREPROCESSING_CONFIG["plot_subsample_n"]), seed=42)
             data_lists.append(arr)
 
         bp = ax.boxplot(data_lists, tick_labels=band_order, patch_artist=True,
@@ -1648,10 +1642,8 @@ class PreprocessingDiagnostics:
             s2_vals = sentinel2_data[key][np.isfinite(sentinel2_data[key])].ravel()
 
             # Subsample
-            if len(ls_vals) > 50_000:
-                ls_vals = np.random.default_rng(0).choice(ls_vals, 50_000, replace=False)
-            if len(s2_vals) > 50_000:
-                s2_vals = np.random.default_rng(0).choice(s2_vals, 50_000, replace=False)
+            ls_vals = _subsample(ls_vals)
+            s2_vals = _subsample(s2_vals)
 
             # ── Per-index sensible display range ─────────────────────────
             # Standard spectral indices live in [-1, 1] (or [-1, 2] for NDVI).
@@ -2067,9 +2059,7 @@ class PreprocessingDiagnostics:
             ndvi = fused_data["NDVI"]
             mask = np.isfinite(isf) & np.isfinite(ndvi)
             x, y = isf[mask].ravel(), ndvi[mask].ravel()
-            if len(x) > 50_000:
-                sel = np.random.default_rng(0).choice(len(x), 50_000, replace=False)
-                x, y = x[sel], y[sel]
+            x, y = _subsample(x), _subsample(y)
             ax3.hexbin(x, y, gridsize=50, cmap="YlOrRd", mincnt=1)
             r = np.corrcoef(x, y)[0, 1] if len(x) > 1 else float("nan")
             ax3.set_xlabel("ISF")
@@ -2083,9 +2073,7 @@ class PreprocessingDiagnostics:
             lst = fused_data["LST"]
             mask = np.isfinite(isf) & np.isfinite(lst)
             x, y = isf[mask].ravel(), lst[mask].ravel()
-            if len(x) > 50_000:
-                sel = np.random.default_rng(0).choice(len(x), 50_000, replace=False)
-                x, y = x[sel], y[sel]
+            x, y = _subsample(x), _subsample(y)
             ax4.hexbin(x, y, gridsize=50, cmap="inferno", mincnt=1)
             try:
                 z = np.polyfit(x, y, 1)
@@ -2966,6 +2954,103 @@ logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Module-level utility helpers (extracted from inner scopes for reusability
+# and testability — previously defined inside function / method bodies).
+# ---------------------------------------------------------------------------
+
+def _to_f32(arr: np.ndarray) -> np.ndarray:
+    """Return a float32 array; reuse memory if already float32."""
+    if arr.dtype == np.float32:
+        return arr.copy()
+    return arr.astype(np.float32)
+
+
+def _subsample(arr: np.ndarray,
+               n: int = None,
+               seed: int = 0) -> np.ndarray:
+    """Return a random subsample of *arr* of at most *n* elements.
+
+    Uses PREPROCESSING_CONFIG["plot_subsample_n"] when *n* is None.
+    If the array is already smaller than *n*, it is returned unchanged.
+    """
+    if n is None:
+        n = PREPROCESSING_CONFIG["plot_subsample_n"]
+    if len(arr) <= n:
+        return arr
+    return arr[np.random.default_rng(seed).choice(len(arr), n, replace=False)]
+
+
+def _crop_to_common_shape(
+        arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Crop all 2-D arrays in *arrays* to the minimum common (H, W).
+
+    Non-ndarray values are passed through unchanged. Returns a new dict;
+    the original is not mutated.
+    """
+    shapes = [v.shape for v in arrays.values() if isinstance(v, np.ndarray)]
+    if not shapes:
+        return dict(arrays)
+    min_h = min(s[0] for s in shapes)
+    min_w = min(s[1] for s in shapes)
+    return {
+        k: (v[:min_h, :min_w] if isinstance(v, np.ndarray) else v)
+        for k, v in arrays.items()
+    }
+
+
+def _gaussian_inpaint_pass(arr2d: np.ndarray, sigma: float) -> int:
+    """One isotropic Gaussian inpainting pass (in-place).
+
+    NaN pixels are temporarily replaced with the patch median (a neutral
+    value that doesn't bias the convolution for adjacent valid pixels),
+    then the Gaussian-blurred result is written back only where the original
+    was NaN.  Valid pixels are never altered.
+
+    Args:
+        arr2d : 2-D float32 array modified in-place.
+        sigma : Gaussian σ in pixels.
+
+    Returns:
+        Number of NaN pixels that were filled this pass (0 → array is
+        fully finite, safe to stop iterating).
+    """
+    nan_mask = ~np.isfinite(arr2d)
+    n_nan = int(nan_mask.sum())
+    if n_nan == 0:
+        return 0
+    finite_vals = arr2d[~nan_mask]
+    placeholder = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+    tmp = arr2d.copy()
+    tmp[nan_mask] = placeholder
+    blurred = _gaussian_filter(
+        tmp.astype(np.float64), sigma=sigma, mode="reflect"
+    ).astype(np.float32)
+    arr2d[nan_mask] = blurred[nan_mask]
+    return n_nan
+
+
+def _inpaint_array(arr2d: np.ndarray,
+                   fallback_value: float = 0.0) -> None:
+    """Iterative Gaussian inpainting followed by a median fallback (in-place).
+
+    Runs the sigma schedule from PREPROCESSING_CONFIG["inpaint_sigmas"].
+    Any pixels still NaN after all passes are filled with the patch median
+    (or *fallback_value* if no finite pixels remain).
+    """
+    sigmas = PREPROCESSING_CONFIG["inpaint_sigmas"]
+    if np.isfinite(arr2d).all():
+        return
+    for sigma in sigmas:
+        if _gaussian_inpaint_pass(arr2d, sigma) == 0:
+            break
+    still_nan = ~np.isfinite(arr2d)
+    if still_nan.any():
+        finite_vals = arr2d[~still_nan]
+        fill = float(np.median(finite_vals)) if finite_vals.size > 0 else fallback_value
+        arr2d[still_nan] = fill
+
+
 class SatellitePreprocessor:
     """Transform raw satellite data into processed features"""
     
@@ -3074,8 +3159,8 @@ class SatellitePreprocessor:
         return lst_celsius
     
     def validate_lst(self, lst: np.ndarray,
-                    min_temp: float = 10,
-                    max_temp: float = 65) -> Tuple[np.ndarray, Dict]:
+                    min_temp: float = PREPROCESSING_CONFIG["lst_min_pixel_temp"],
+                    max_temp: float = PREPROCESSING_CONFIG["lst_max_pixel_temp"]) -> Tuple[np.ndarray, Dict]:
         """
         Validate and clean LST data for Jakarta climate.
 
@@ -3161,21 +3246,16 @@ class SatellitePreprocessor:
         indices = {}
         eps = np.float32(1e-8)
 
-        # ── Helper: ensure float32 copy without double-allocating ──────────
-        def _f32(arr: np.ndarray) -> np.ndarray:
-            """Return a float32 array; reuse memory if already float32."""
-            if arr.dtype == np.float32:
-                return arr.copy()
-            return arr.astype(np.float32)
+        # Use module-level _to_f32 helper (avoids redefining on every call)
 
         # ── Band extraction ─────────────────────────────────────────────────
         if self.satellite_type == "landsat":
-            blue  = _f32(bands.get("SR_B2", np.zeros_like(bands["SR_B4"])))
-            green = _f32(bands.get("SR_B3", np.zeros_like(bands["SR_B4"])))
-            red   = _f32(bands["SR_B4"])
-            nir   = _f32(bands["SR_B5"])
-            swir1 = _f32(bands["SR_B6"])
-            swir2 = _f32(bands["SR_B7"])
+            blue  = _to_f32(bands.get("SR_B2", np.zeros_like(bands["SR_B4"])))
+            green = _to_f32(bands.get("SR_B3", np.zeros_like(bands["SR_B4"])))
+            red   = _to_f32(bands["SR_B4"])
+            nir   = _to_f32(bands["SR_B5"])
+            swir1 = _to_f32(bands["SR_B6"])
+            swir2 = _to_f32(bands["SR_B7"])
 
             # Detect DN (legacy export) vs pre-scaled reflectance (GeoTIFF).
             # Pre-scaled values are in [0, 1]; raw DN medians are ~5 000–30 000.
@@ -3227,12 +3307,12 @@ class SatellitePreprocessor:
             del _fill_mask
 
         else:  # Sentinel-2
-            blue  = _f32(bands["B2"])
-            green = _f32(bands["B3"])
-            red   = _f32(bands["B4"])
-            nir   = _f32(bands["B8"])
-            swir1 = _f32(bands["B11"])
-            swir2 = _f32(bands["B12"])
+            blue  = _to_f32(bands["B2"])
+            green = _to_f32(bands["B3"])
+            red   = _to_f32(bands["B4"])
+            nir   = _to_f32(bands["B8"])
+            swir1 = _to_f32(bands["B11"])
+            swir2 = _to_f32(bands["B12"])
 
             # S2_SR_HARMONIZED: reflectance × 10 000 — divide in-place if needed.
             #
@@ -3411,7 +3491,6 @@ class SatellitePreprocessor:
                         # meters wide, i.e. >> 1 pixel). We preserve NaN positions
                         # by smoothing only finite pixels, then writing results back.
                         try:
-                            from scipy.ndimage import gaussian_filter as _gf
                             _nan_mask = ~np.isfinite(lst_clean)
                             if np.isfinite(lst_clean).any():
                                 fill_value = float(np.nanmedian(lst_clean))
@@ -3422,11 +3501,12 @@ class SatellitePreprocessor:
                             _tmp = lst_clean.copy()
                             _tmp[_nan_mask] = fill_value
 
-                            _smoothed = _gf(_tmp.astype(np.float64), sigma=0.8).astype(np.float32)
+                            _sigma_s = PREPROCESSING_CONFIG["lst_smooth_sigma"]
+                            _smoothed = _gaussian_filter(_tmp.astype(np.float64), sigma=_sigma_s).astype(np.float32)
                             _smoothed[_nan_mask] = np.nan
                             lst_clean = _smoothed
                             del _tmp, _smoothed, _nan_mask
-                            logger.info("  Applied Gaussian LST smoothing (σ=0.8 px) to reduce 30m pixel-grid artefacts")
+                            logger.info(f"  Applied Gaussian LST smoothing (σ={_sigma_s} px) to reduce 30m pixel-grid artefacts")
                         except Exception as _se:
                             logger.warning(f"  LST Gaussian smoothing skipped: {_se}")
                         # ─────────────────────────────────────────────────────────
@@ -3624,13 +3704,8 @@ class MultiSensorFusion:
         
         if len(unique_shapes) > 1:
             logger.warning(f"  Inconsistent shapes after fusion: {shapes}")
-            # Force consistency by cropping to minimum
-            min_h = min(s[0] for s in unique_shapes)
-            min_w = min(s[1] for s in unique_shapes)
-            for key in fused.keys():
-                if isinstance(fused[key], np.ndarray):
-                    fused[key] = fused[key][:min_h, :min_w]
-            final_shape = (min_h, min_w)
+            fused = _crop_to_common_shape(fused)
+            final_shape = next(v.shape for v in fused.values() if isinstance(v, np.ndarray))
         
         logger.info(f"  Fused {len(fused)} features at {target_resolution}m resolution")
         logger.info(f"  Final shape: {final_shape}")
@@ -3647,9 +3722,10 @@ class FeatureEngineer:
     def __init__(self):
         pass
         
-    def calculate_impervious_surface(self, ndvi: np.ndarray, 
-                                    ndbi: np.ndarray,
-                                    mndwi: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def calculate_impervious_surface(ndvi: np.ndarray,
+                                     ndbi: np.ndarray,
+                                     mndwi: np.ndarray) -> np.ndarray:
         """
         Calculate impervious surface fraction
         ISF = (NDBI + (1 - NDVI) + (1 - MNDWI)) / 3
@@ -3663,18 +3739,21 @@ class FeatureEngineer:
         isf = (ndbi + (1 - ndvi) + (1 - mndwi)) / 3
         return np.clip(isf, 0, 1)
     
-    def calculate_spatial_context(self, arr: np.ndarray, 
-                                  window_sizes: List[int] = [3, 5, 7]) -> Dict[str, np.ndarray]:
+    @staticmethod
+    def calculate_spatial_context(arr: np.ndarray,
+                                  window_sizes: List[int] = None) -> Dict[str, np.ndarray]:
         """
         Calculate spatial context features (neighborhood statistics)
-        
+
         Args:
             arr: Input array
-            window_sizes: List of window sizes
-            
+            window_sizes: List of window sizes (defaults to [3, 5, 7])
+
         Returns:
             Dictionary of spatial statistics
         """
+        if window_sizes is None:
+            window_sizes = [3, 5, 7]
         context = {}
         
         for ws in window_sizes:
@@ -3690,7 +3769,8 @@ class FeatureEngineer:
         
         return context
     
-    def encode_temporal_features(self, timestamp: pd.Timestamp) -> Dict[str, float]:
+    @staticmethod
+    def encode_temporal_features(timestamp: pd.Timestamp) -> Dict[str, float]:
         """
         Encode temporal features
         
@@ -3721,19 +3801,16 @@ class DatasetCreator:
     def __init__(self):
         self.feature_engineer = FeatureEngineer()
         
-    def extract_patches(self, raster_data: Dict[str, np.ndarray],
-                    patch_size: int = 64,
-                    stride: int = 32,
-                    min_valid_ratio: float = 0.95,  # RAISED from 0.8: eliminates NaN-heavy patches
-                                                    # that caused the central spike at normalised LST ≈ 0
-                    min_variance: float = 0.5,
-                    min_temp: float = 15.0,         # Patch-mean lower bound (°C) — LOWERED from 20°C
-                                                    # Jakarta coastal/vegetated patches can reach
-                                                    # 15–20°C in wet-season mornings; the old 20°C
-                                                    # floor was truncating the cool tail and hurting
-                                                    # cool-end calibration. Pixel-level Tier-1
-                                                    # guard (10°C) still catches instrument artifacts.
-                    max_temp: float = 58.0) -> List[Dict]:  # Patch-mean upper bound (°C)
+    def extract_patches(
+            self,
+            raster_data: Dict[str, np.ndarray],
+            patch_size: int = PREPROCESSING_CONFIG["patch_size"],
+            stride: int = PREPROCESSING_CONFIG["patch_stride"],
+            min_valid_ratio: float = PREPROCESSING_CONFIG["patch_min_valid_ratio"],
+            min_variance: float = PREPROCESSING_CONFIG["patch_min_variance"],
+            min_temp: float = PREPROCESSING_CONFIG["lst_min_patch_temp"],
+            max_temp: float = PREPROCESSING_CONFIG["lst_max_patch_temp"],
+    ) -> List[Dict]:
         """
         Extract patches from raster data with quality control for Jakarta climate.
 
@@ -4058,70 +4135,20 @@ class DatasetCreator:
         #
         # Performance: gaussian_filter is a separable O(N·σ) operation and runs
         # entirely in C — comparable speed to median_filter for these kernel sizes.
-        from scipy.ndimage import gaussian_filter as _gf
-
-        _INPAINT_SIGMAS   = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]   # px
-        _MAX_INPAINT_PASS = len(_INPAINT_SIGMAS)
-
-        def _gaussian_inpaint_pass(arr2d: np.ndarray, sigma: float) -> int:
-            """One isotropic Gaussian inpainting pass.
-
-            NaN pixels are temporarily replaced with the patch median (a
-            neutral value that doesn't bias the convolution for *adjacent*
-            valid pixels), then the Gaussian-blurred result is written back
-            only where the original was NaN.
-
-            Args:
-                arr2d : 2-D float32 array modified in-place.
-                sigma : Gaussian σ in pixels.
-
-            Returns:
-                Number of NaN pixels that received a fill value this pass
-                (0 means the array is fully finite — stop iterating).
-            """
-            nan_mask = ~np.isfinite(arr2d)
-            n_nan = int(nan_mask.sum())
-            if n_nan == 0:
-                return 0
-            finite_vals = arr2d[~nan_mask]
-            placeholder = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
-            tmp = arr2d.copy()
-            tmp[nan_mask] = placeholder
-            blurred = _gf(tmp.astype(np.float64), sigma=sigma, mode='reflect').astype(np.float32)
-            # Accept blurred values only for originally-NaN positions.
-            # This ensures valid pixels are never altered by the inpainting.
-            arr2d[nan_mask] = blurred[nan_mask]
-            return n_nan
-
+        # Iterative Gaussian inpainting — uses module-level _inpaint_array
         for s in range(n_samples):
             for ch in range(n_channels):
-                sl = X[s, :, :, ch]
-                if not np.isfinite(sl).all():
-                    for _sigma in _INPAINT_SIGMAS:
-                        if _gaussian_inpaint_pass(sl, _sigma) == 0:
-                            break
-                    # Last-resort fallback: patch median (not mean)
-                    still_nan = ~np.isfinite(sl)
-                    if still_nan.any():
-                        finite_vals = sl[~still_nan]
-                        sl[still_nan] = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
-
-            sl = y[s, :, :, 0]
-            if not np.isfinite(sl).all():
-                for _sigma in _INPAINT_SIGMAS:
-                    if _gaussian_inpaint_pass(sl, _sigma) == 0:
-                        break
-                still_nan = ~np.isfinite(sl)
-                if still_nan.any():
-                    finite_vals = sl[~still_nan]
-                    sl[still_nan] = float(np.median(finite_vals)) if finite_vals.size > 0 else 35.0
+                _inpaint_array(X[s, :, :, ch], fallback_value=0.0)
+            _inpaint_array(y[s, :, :, 0], fallback_value=35.0)
 
         # Tier 3 safety clip — in-place
-        np.clip(y, 10.0, 65.0, out=y)
+        _t3_lo = PREPROCESSING_CONFIG["lst_min_pixel_temp"]
+        _t3_hi = PREPROCESSING_CONFIG["lst_max_pixel_temp"]
+        np.clip(y, _t3_lo, _t3_hi, out=y)
 
         # ── Sample weights ────────────────────────────────────────────────────
         patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
-        n_wb          = 10
+        n_wb          = PREPROCESSING_CONFIG["sample_weight_n_bins"]
         bin_edges     = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
         bin_ids       = np.clip(np.digitize(patch_means, bin_edges) - 1, 0, n_wb - 1)
         bin_counts    = np.maximum(np.bincount(bin_ids, minlength=n_wb).astype(np.float32), 1)
@@ -4220,7 +4247,6 @@ class DatasetCreator:
         output_dir.mkdir(parents=True, exist_ok=True)
         stats_path = output_dir / "normalization_stats.json"
         
-        import json
         with open(stats_path, 'w') as f:
             json.dump(normalization_stats, f, indent=2)
         
@@ -4295,7 +4321,8 @@ class DatasetCreator:
         logger.info(f"  Stats std: {stats_std:.4f}, Actual: {actual_train_std:.4f}, "
                 f"Diff: {std_diff:.6f}")
         
-        if mean_diff > 0.01 or std_diff > 0.01:
+        _tol = PREPROCESSING_CONFIG["leakage_tolerance"]
+        if mean_diff > _tol or std_diff > _tol:
             logger.error("❌ POTENTIAL DATA LEAKAGE: Stats don't match training data!")
             raise ValueError("Normalization stats mismatch")
         else:
@@ -4362,7 +4389,6 @@ class DatasetCreator:
             gc.collect()
             logger.info(f"  ✓ Saved and freed {split_name} split → {split_dir}")
 
-        import json
         metadata_clean = {}
         for k, v in metadata.items():
             if isinstance(v, (np.integer, np.floating)):
@@ -4484,7 +4510,7 @@ class EnhancedDatasetCreator(DatasetCreator):
         
         # Cluster locations into spatial blocks
         from sklearn.cluster import KMeans
-        n_spatial_blocks = 5
+        n_spatial_blocks = 5  # fixed at 5 spatial blocks for Jakarta AOI
         kmeans = KMeans(n_clusters=n_spatial_blocks, random_state=random_seed)
         spatial_blocks = kmeans.fit_predict(spatial_features)
         
@@ -4531,8 +4557,6 @@ class EnhancedDatasetCreator(DatasetCreator):
 
         unique_strata = len(np.unique(strata))
         logger.info(f"\nCombined stratification (season × spatial × LST-var): {unique_strata} unique strata")
-
-        from collections import Counter
 
         class_counts = Counter(strata)
 
@@ -4821,11 +4845,11 @@ def main():
             lst_std = float(np.nanstd(lst_finite)) if lst_finite.size > 1 else 0.0
             lst_valid_ratio = lst_finite.size / processed["LST"].size
             
-            if lst_std < 0.5:
+            if lst_std < PREPROCESSING_CONFIG["scene_min_lst_std"]:
                 logger.warning(f"  LST variance too low ({lst_std:.2f}°C), skipping")
                 continue
             
-            if lst_valid_ratio < 0.1:
+            if lst_valid_ratio < PREPROCESSING_CONFIG["scene_min_valid_ratio"]:
                 logger.warning(f"  LST valid ratio too low ({lst_valid_ratio*100:.1f}%), skipping")
                 continue
             
@@ -5071,14 +5095,16 @@ def main():
     if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
         logger.info("Performing multi-sensor fusion (streaming)...")
         matches = fusion.temporal_match(
-            landsat_processed, sentinel2_processed, max_time_diff_days=16
+            landsat_processed, sentinel2_processed,
+            max_time_diff_days=PREPROCESSING_CONFIG["max_time_diff_days"],
         )
         del landsat_processed, sentinel2_processed
         gc.collect()
 
         for mi, (avg_date, ls_data, s2_data, time_diff) in enumerate(matches):
             logger.info(f"\nFusing pair {mi+1}/{len(matches)} (Δt={time_diff}d):")
-            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff, target_resolution=30)
+            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff,
+                                         target_resolution=PREPROCESSING_CONFIG["fusion_target_resolution"])
 
             if all(k in fused_data for k in ("NDVI", "NDBI", "MNDWI")):
                 fused_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
@@ -5153,12 +5179,9 @@ def main():
 
     # Build X/y by streaming through each (raster, patches) pair, freeing
     # the raster dict immediately after its patches are written into X/y.
-    channel_order = [
-        "SR_B4", "SR_B5", "SR_B6", "SR_B7",
-        "NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo",
-    ]
+    channel_order = PREPROCESSING_CONFIG["channel_order"]
     n_channels = len(channel_order)
-    patch_size = 64
+    patch_size = PREPROCESSING_CONFIG["patch_size"]
     n_total    = len(all_patches)
 
     X = np.zeros((n_total, patch_size, patch_size, n_channels), dtype=np.float32)
@@ -5197,13 +5220,16 @@ def main():
     # QC + NaN fill + safety clip
     # Temperature bounds aligned with validate_lst (Tier-1 pixel gate: 10–65 °C).
     valid_mask = np.ones(n_total, dtype=bool)
+    _qc_min_valid = PREPROCESSING_CONFIG["patch_min_valid_ratio"]
+    _qc_t_lo = PREPROCESSING_CONFIG["lst_min_pixel_temp"]
+    _qc_t_hi = PREPROCESSING_CONFIG["lst_max_pixel_temp"]
     for s in range(n_total):
         lst_p = y[s, :, :, 0]
         fin   = np.isfinite(lst_p)
-        if fin.mean() < 0.95:
+        if fin.mean() < _qc_min_valid:
             valid_mask[s] = False; continue
         lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
-        if not (10.0 <= lst_mean <= 65.0):
+        if not (_qc_t_lo <= lst_mean <= _qc_t_hi):
             valid_mask[s] = False
 
     if not valid_mask.all():
@@ -5247,8 +5273,7 @@ def main():
         # FIX: use the authoritative col count from extract_patches() (pre-QC),
         # not the max observed _grid_col which is truncated by QC rejection at
         # the east/south edges (water, cloud, low-variance coastal pixels).
-        from collections import Counter as _Counter
-        _col_counts = _Counter(_all_grid_cols)
+        _col_counts = Counter(_all_grid_cols)
         patch_grid_cols = int(_col_counts.most_common(1)[0][0])
 
         # Cross-check: if some epochs had different raster widths (e.g. one epoch
@@ -5338,7 +5363,7 @@ def main():
             positions_all   = positions_all,
             patch_grid_cols = _mosaic_cols,
             all_grid_rows   = _all_grid_rows,
-            stride          = 24,
+            stride          = PREPROCESSING_CONFIG["patch_stride"],
             geo_bounds      = STUDY_AREA.get("bounds"),
             filename        = "P_mosaic_lst_reconstruction.png",
         )
@@ -5360,11 +5385,12 @@ def main():
         sl = y[s, :, :, 0]; nm = ~np.isfinite(sl)
         if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
 
-    np.clip(y, 10.0, 65.0, out=y)
+    np.clip(y, PREPROCESSING_CONFIG["lst_min_pixel_temp"],
+            PREPROCESSING_CONFIG["lst_max_pixel_temp"], out=y)
 
     # Sample weights
     patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
-    n_wb          = 10
+    n_wb          = PREPROCESSING_CONFIG["sample_weight_n_bins"]
     be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
     bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
     bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
@@ -5386,7 +5412,7 @@ def main():
         # to reconstruct the spatially-correct full-area mosaic at inference time.
         "patch_grid_rows": patch_grid_rows,
         "patch_grid_cols": patch_grid_cols,
-        "patch_stride":    24,   # keep in sync with stride used above
+        "patch_stride":    PREPROCESSING_CONFIG["patch_stride"],
         # ── Per-epoch grid dimensions — required for correct multi-epoch collapse.
         # patch_grid_rows is the TOTAL stacked rows (sum of all per-epoch rows).
         # The inference mosaic uses the full per-epoch list to slice correctly,
@@ -5424,8 +5450,12 @@ def main():
     # NEW: 65% train, 15% val, 20% test (was 70/15/15)
     splits = dataset_creator.create_stratified_split(
         X, y, dates,
-        split_ratios=(0.65, 0.15, 0.20),
-        random_seed=42,
+        split_ratios=(
+            DATE_RANGE["train_ratio"],
+            DATE_RANGE["val_ratio"],
+            DATE_RANGE["test_ratio"],
+        ),
+        random_seed=PREPROCESSING_CONFIG["split_random_seed"],
         patch_positions=metadata.get("patch_positions"),
     )
 
@@ -5487,13 +5517,16 @@ def main():
     logger.info(f"  X_train: mean={splits['X_train'].mean():.4f}, std={splits['X_train'].std():.4f}")
     logger.info(f"  y_train: mean={splits['y_train'].mean():.4f}, std={splits['y_train'].std():.4f}")
 
-    if not (-0.1 < splits['X_train'].mean() < 0.1):
+    _nm_tol = PREPROCESSING_CONFIG["norm_mean_tolerance"]
+    _ns_lo  = PREPROCESSING_CONFIG["norm_std_low"]
+    _ns_hi  = PREPROCESSING_CONFIG["norm_std_high"]
+    if not (-_nm_tol < splits['X_train'].mean() < _nm_tol):
         logger.warning("⚠️ X_train mean is not close to 0!")
-    if not (0.9 < splits['X_train'].std() < 1.1):
+    if not (_ns_lo < splits['X_train'].std() < _ns_hi):
         logger.warning("⚠️ X_train std is not close to 1!")
-    if not (-0.1 < splits['y_train'].mean() < 0.1):
+    if not (-_nm_tol < splits['y_train'].mean() < _nm_tol):
         logger.warning("⚠️ y_train mean is not close to 0!")
-    if not (0.9 < splits['y_train'].std() < 1.1):
+    if not (_ns_lo < splits['y_train'].std() < _ns_hi):
         logger.warning("⚠️ y_train std is not close to 1!")
 
     logger.info("="*70)
@@ -5565,7 +5598,7 @@ def main():
     if sample_weights is not None:
         y_train_raw = splits['y_train']
         patch_means_train = y_train_raw[:, :, :, 0].reshape(len(y_train_raw), -1).mean(axis=1)
-        n_wb = 10
+        n_wb = PREPROCESSING_CONFIG["sample_weight_n_bins"]
         be = np.linspace(patch_means_train.min(), patch_means_train.max() + 1e-6, n_wb + 1)
         bids = np.clip(np.digitize(patch_means_train, be) - 1, 0, n_wb - 1)
         bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)

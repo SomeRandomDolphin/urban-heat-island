@@ -779,53 +779,183 @@ def stage_postprocess(args, results: dict, data_dir: Path) -> tuple:
 
 # ── Stage 6: UHI analysis ────────────────────────────────────────────────────
 
+def _build_water_mask(lst: np.ndarray) -> np.ndarray:
+    """
+    Detect sea / large water body pixels that should be excluded from UHI
+    reference calculations.
+
+    Strategy
+    --------
+    Water bodies (sea, large reservoirs) appear as spatially coherent cold
+    regions whose LST is significantly below the land surface temperature.
+    We identify them with a two-step approach:
+
+    1. **Hard cold threshold** – pixels colder than
+       ``P5(LST) + COLD_OFFSET_DEG`` are flagged as candidate water.
+       COLD_OFFSET_DEG = 0  means "below the 5th percentile of the whole
+       scene", which already excludes 95 % of land pixels.
+
+    2. **Spatial connectivity filter** – only connected blobs that are
+       larger than MIN_WATER_FRAC of the total scene area are kept.
+       This removes isolated cold rooftops / shadows that happen to be
+       at the same temperature as the sea.
+
+    The result is a boolean array that is True where water is detected.
+    Callers should pass ``~water_mask`` as the ``land_only`` filter before
+    computing urban / rural percentiles.
+
+    Notes
+    -----
+    * The function never raises — if scipy.ndimage is unavailable or the
+      detection finds nothing plausible, it returns an all-False mask so
+      the pipeline degrades gracefully to the old behaviour.
+    * Tune COLD_OFFSET_DEG and MIN_WATER_FRAC via the module-level
+      constants below if your scene has unusually warm coastal water or
+      very small water bodies that should be included.
+    """
+    COLD_OFFSET_DEG  = 2.0   # °C above P5 — pixels below this are "candidate water"
+    MIN_WATER_FRAC   = 0.02  # blobs < 2 % of scene area are not water
+    DILATE_PIXELS    = 3     # morphological dilation to absorb mixed edge pixels
+
+    try:
+        from scipy.ndimage import label, binary_dilation, generate_binary_structure
+
+        finite_mask = np.isfinite(lst)
+        p5 = float(np.nanpercentile(lst, 5))
+        cold_thr = p5 + COLD_OFFSET_DEG
+
+        candidate = (lst <= cold_thr) & finite_mask
+
+        # Label connected components
+        struct   = generate_binary_structure(2, 2)   # 8-connectivity
+        labeled, n_features = label(candidate, structure=struct)
+
+        min_pixels = int(lst.size * MIN_WATER_FRAC)
+        water = np.zeros_like(candidate, dtype=bool)
+        for region_id in range(1, n_features + 1):
+            region = labeled == region_id
+            if region.sum() >= min_pixels:
+                water |= region
+
+        # Dilate slightly to absorb mixed land/water edge pixels
+        if water.any() and DILATE_PIXELS > 0:
+            selem = generate_binary_structure(2, 1)
+            for _ in range(DILATE_PIXELS):
+                water = binary_dilation(water, structure=selem)
+            water &= finite_mask   # don't expand into NaN cells
+
+        logger.info(
+            f"  Water mask  : cold_thr={cold_thr:.2f}°C (P5+{COLD_OFFSET_DEG}°C)  "
+            f"blobs≥{min_pixels:,}px  → {water.sum():,} px masked "
+            f"({water.mean()*100:.1f}% of scene)"
+        )
+        return water
+
+    except Exception as exc:
+        logger.warning(f"  _build_water_mask failed ({exc}) — no water exclusion applied")
+        return np.zeros(lst.shape, dtype=bool)
+
+
 def stage_uhi_analysis(args, lst_processed: np.ndarray, data_dir: Path) -> dict:
     _section("STAGE 6 — UHI ANALYSIS")
 
     logger.info(f"  Input map shape : {lst_processed.shape}  "
                 f"(full mosaicked area — {lst_processed.shape[0]}×{lst_processed.shape[1]} px)")
 
-    urban_thr = float(np.nanpercentile(lst_processed, args.urban_percentile))
-    rural_thr = float(np.nanpercentile(lst_processed, args.rural_percentile))
-    urban_mask = lst_processed >= urban_thr
-    rural_mask = lst_processed <= rural_thr
+    # ── Step 1: detect and exclude water / sea pixels ─────────────────────────
+    # Sea pixels are much colder than any land surface and would otherwise be
+    # misclassified as "rural", pulling the rural baseline down by ~10–15 °C
+    # and inflating UHI intensity for the entire land area.
+    water_mask = _build_water_mask(lst_processed)
+    land_mask  = ~water_mask & np.isfinite(lst_processed)
 
+    if land_mask.sum() < 100:
+        logger.warning("  ⚠ Water exclusion left fewer than 100 land pixels — "
+                       "falling back to full scene (no water exclusion)")
+        land_mask = np.isfinite(lst_processed)
+        water_mask = np.zeros_like(land_mask)
+
+    # Save water mask for downstream visualisation
+    np.save(data_dir / "water_mask.npy", water_mask)
+
+    # ── Step 2: compute urban / rural thresholds on land pixels only ──────────
+    # Percentile thresholds are now computed exclusively over land pixels,
+    # so the rural baseline reflects actual vegetated / low-density land
+    # rather than sea temperature.
+    lst_land = lst_processed[land_mask]
+
+    urban_thr = float(np.nanpercentile(lst_land, args.urban_percentile))
+    rural_thr = float(np.nanpercentile(lst_land, args.rural_percentile))
+
+    # Masks apply over the full array but only where land exists
+    urban_mask = (lst_processed >= urban_thr) & land_mask
+    rural_mask = (lst_processed <= rural_thr) & land_mask
+
+    logger.info(f"  Land pixels      : {land_mask.sum():,}  ({land_mask.mean()*100:.1f}% of scene)")
     logger.info(f"  Urban threshold  : {urban_thr:.2f}°C  "
-                f"({urban_mask.mean()*100:.1f}% of pixels)")
+                f"({urban_mask.sum():,} px / {urban_mask.mean()*100:.1f}%)")
     logger.info(f"  Rural threshold  : {rural_thr:.2f}°C  "
-                f"({rural_mask.mean()*100:.1f}% of pixels)")
+                f"({rural_mask.sum():,} px / {rural_mask.mean()*100:.1f}%)")
 
+    # ── Step 3: use median of rural-land pixels as the baseline ───────────────
+    # The mean is sensitive to any residual cold outliers; median is more robust
+    # and better represents the "typical" non-urban land temperature.
+    rural_baseline = float(np.nanmedian(lst_processed[rural_mask]))
+    logger.info(f"  Rural baseline (median of land-rural pixels): {rural_baseline:.2f}°C  "
+                f"  [mean would be {np.nanmean(lst_processed[rural_mask]):.2f}°C]")
+
+    # ── Step 4: run the analyser with land-aware masks ─────────────────────────
     analyzer = UHIAnalyzer(lst_processed)
     ref_temps  = analyzer.define_reference_areas(urban_mask, rural_mask)
-    uhi_map    = analyzer.calculate_uhi_intensity()
+
+    # Override the rural reference with the robust median baseline
+    uhi_map    = analyzer.calculate_uhi_intensity(rural_reference=rural_baseline)
+
+    # NaN-out water pixels in the UHI map so they do not appear in statistics
+    # or classification — they are physically meaningless for UHI analysis.
+    uhi_map_land = uhi_map.copy().astype(np.float32)
+    uhi_map_land[water_mask] = np.nan
+    analyzer.uhi_map = uhi_map_land   # keep analyser state consistent
+
     classified, categories = analyzer.classify_uhi_intensity()
     uhi_stats  = analyzer.calculate_statistics()
 
-    np.save(data_dir / "uhi_intensity.npy",  uhi_map)
+    np.save(data_dir / "uhi_intensity.npy",  uhi_map_land)
     np.save(data_dir / "uhi_classified.npy", classified)
 
-    logger.info(f"  Mean UHI : {uhi_stats['mean_intensity']:.2f}°C")
-    logger.info(f"  Max  UHI : {uhi_stats['max_intensity']:.2f}°C")
-    logger.info(f"  Extent>2°C : {uhi_stats['spatial_extent_km2']:.2f} km²")
+    logger.info(f"  Mean UHI (land)  : {uhi_stats['mean_intensity']:.2f}°C")
+    logger.info(f"  Max  UHI         : {uhi_stats['max_intensity']:.2f}°C")
+    logger.info(f"  Extent>2°C       : {uhi_stats['spatial_extent_km2']:.2f} km²")
 
     return dict(
         analyzer=analyzer,
-        uhi_map=uhi_map,
+        uhi_map=uhi_map_land,
         classified=classified,
         categories=categories,
         uhi_stats=uhi_stats,
         urban_mask=urban_mask,
         rural_mask=rural_mask,
+        water_mask=water_mask,
+        land_mask=land_mask,
         ref_temps=ref_temps,
     )
 
 
 # ── Stage 7: Hotspot detection ────────────────────────────────────────────────
 
-def stage_hotspots(args, lst_processed: np.ndarray, data_dir: Path) -> dict:
+def stage_hotspots(args, lst_processed: np.ndarray, data_dir: Path,
+                   water_mask: np.ndarray = None) -> dict:
     _section("STAGE 7 — HOTSPOT DETECTION")
 
-    detector     = HotspotDetector(lst_processed, resolution=50.0)
+    # Mask sea pixels so Gi* statistics are not contaminated by cold water.
+    if water_mask is not None and water_mask.any():
+        lst_land_only = lst_processed.copy().astype(np.float32)
+        lst_land_only[water_mask] = np.nan
+        logger.info(f"  Gi* input: water pixels NaN'd ({water_mask.sum():,} px excluded)")
+    else:
+        lst_land_only = lst_processed
+
+    detector     = HotspotDetector(lst_land_only, resolution=50.0)
     gi_star      = detector.calculate_gi_star(search_radius=args.hotspot_radius)
     hotspot_mask, hotspot_list = detector.identify_hotspots(args.hotspot_confidence)
 
@@ -1025,16 +1155,21 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
 
     vis = UHIVisualizer(figsize=(12, 10), dpi=300)
 
+    # Resolve water mask from uhi_ctx (present after the sea-exclusion fix)
+    _water_mask = uhi_ctx.get("water_mask")
+
     # 10a. Core maps ──────────────────────────────────────────────────────────
     _try("LST map",
          vis.create_lst_map, lst_processed,
          maps_dir / "lst_map.png",
-         title=f"Land Surface Temperature — {STUDY_AREA['name']}")
+         title=f"Land Surface Temperature — {STUDY_AREA['name']}",
+         water_mask=_water_mask)
 
     _try("UHI intensity map",
          vis.create_uhi_intensity_map, uhi_ctx["uhi_map"],
          maps_dir / "uhi_intensity_map.png",
-         title="Urban Heat Island Intensity")
+         title="Urban Heat Island Intensity",
+         water_mask=_water_mask)
 
     _try("Hotspot map",
          vis.create_hotspot_map,
@@ -1358,7 +1493,8 @@ def main() -> int:
 
     # 7. Hotspot detection
     try:
-        hotspot_ctx = stage_hotspots(args, lst_processed, data_dir)
+        hotspot_ctx = stage_hotspots(args, lst_processed, data_dir,
+                                         water_mask=uhi_ctx.get("water_mask"))
     except Exception as exc:
         logger.error(f"Hotspot detection failed: {exc}"); return 1
 

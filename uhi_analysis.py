@@ -67,8 +67,8 @@ _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
 _THERMAL_CMAP   = LinearSegmentedColormap.from_list('thermal', _THERMAL_COLORS, N=256)
 _UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f']
-_UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–1 °C)',
-                   'Moderate (1–2 °C)', 'Strong (2–3 °C)', 'Very Strong (>3 °C)']
+_UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–2 °C)',
+                   'Moderate (2–4 °C)', 'Strong (4–6 °C)', 'Very Strong (>6 °C)']
 
 sns.set_theme(style="whitegrid", font_scale=1.05)
 plt.rcParams.update({
@@ -176,7 +176,8 @@ class UHIAnalyzer:
         logger.info(f"  Pixels > 0 °C  : {len(positive):,}  "
                     f"({len(positive)/self.uhi_map.size*100:.2f}%)")
         logger.info(f"  Pixels > 2 °C  : {(self.uhi_map > 2).sum():,}")
-        logger.info(f"  Pixels > 3 °C  : {(self.uhi_map > 3).sum():,}")
+        logger.info(f"  Pixels > 4 °C  : {(self.uhi_map > 4).sum():,}")
+        logger.info(f"  Pixels > 6 °C  : {(self.uhi_map > 6).sum():,}")
 
         return self.uhi_map
 
@@ -190,10 +191,10 @@ class UHIAnalyzer:
 
         classified = np.zeros_like(self.uhi_map, dtype=np.int8)
         classified[self.uhi_map < 0]                                   = 0
-        classified[(self.uhi_map >= 0) & (self.uhi_map < 1)]          = 1
-        classified[(self.uhi_map >= 1) & (self.uhi_map < 2)]          = 2
-        classified[(self.uhi_map >= 2) & (self.uhi_map < 3)]          = 3
-        classified[self.uhi_map >= 3]                                  = 4
+        classified[(self.uhi_map >= 0) & (self.uhi_map < 2)]          = 1
+        classified[(self.uhi_map >= 2) & (self.uhi_map < 4)]          = 2
+        classified[(self.uhi_map >= 4) & (self.uhi_map < 6)]          = 3
+        classified[self.uhi_map >= 6]                                  = 4
 
         categories: Dict[str, int] = {}
         for idx, label in enumerate(_UHI_CAT_LABELS):
@@ -243,7 +244,7 @@ class UHIAnalyzer:
             "p95": float(q95),
             "skewness":               skew,
             "kurtosis":               kurt,
-            "spatial_extent_km2":     float((self.uhi_map > 2).sum() * 0.0025),
+            "spatial_extent_km2":     float((self.uhi_map > 4).sum() * 0.0025),
             "magnitude":              float(uhi_pos.sum()),
             "pct_positive":           float(len(uhi_pos) / max(len(uhi_finite), 1) * 100),
         }
@@ -374,9 +375,9 @@ class UHIAnalyzer:
         if kde_vals is not None:
             ax.plot(x_k, kde_vals, color="#b2182b", lw=2, label="KDE")
         for thr, col, lbl in [(0, "#99d594", "0 °C"),
-                               (1, "#fee08b", "1 °C"),
-                               (2, "#fc8d59", "2 °C"),
-                               (3, "#d53e4f", "3 °C")]:
+                               (2, "#fee08b", "2 °C"),
+                               (4, "#fc8d59", "4 °C"),
+                               (6, "#d53e4f", "6 °C")]:
             ax.axvline(thr, color=col, lw=1.5, ls="--", label=f"+{lbl}")
         ax.set_xlabel("UHI Intensity (°C)")
         ax.set_ylabel("Density")
@@ -388,8 +389,8 @@ class UHIAnalyzer:
         sorted_uhi = np.sort(flat)
         cdf = np.arange(1, len(sorted_uhi) + 1) / len(sorted_uhi)
         ax.plot(sorted_uhi, cdf, color="#4393c3", lw=2)
-        for thr, col in [(0, "#99d594"), (1, "#fee08b"),
-                         (2, "#fc8d59"), (3, "#d53e4f")]:
+        for thr, col in [(0, "#99d594"), (2, "#fee08b"),
+                         (4, "#fc8d59"), (6, "#d53e4f")]:
             ax.axvline(thr, color=col, lw=1.2, ls="--")
             pct_above = 100 * (1 - np.interp(thr, sorted_uhi, cdf))
             ax.text(thr + 0.05, 0.05, f"{pct_above:.1f}%\nabove",
@@ -401,7 +402,7 @@ class UHIAnalyzer:
 
         # ── [1,1] Box-plot per UHI category ──────────────────────────────────
         ax = fig.add_subplot(gs[1, 1])
-        boundaries = [(-99, 0), (0, 1), (1, 2), (2, 3), (3, 99)]
+        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 99)]
         box_data   = []
         for lo, hi in boundaries:
             mask = (uhi >= lo) & (uhi < hi) if hi != 99 else uhi >= lo
@@ -412,7 +413,7 @@ class UHIAnalyzer:
         for patch, col in zip(bp["boxes"], _UHI_CAT_COLORS):
             patch.set_facecolor(col)
             patch.set_alpha(0.7)
-        short_labels = ["≤0", "0–1", "1–2", "2–3", "≥3"]
+        short_labels = ["≤0", "0–2", "2–4", "4–6", "≥6"]
         ax.set_xticklabels(short_labels)
         ax.set_xlabel("UHI Category (°C)")
         ax.set_ylabel("UHI Intensity (°C)")
@@ -479,7 +480,7 @@ class UHIAnalyzer:
         cbar     = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                                 boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
                                 ticks=[0, 1, 2, 3, 4])
-        cbar.ax.set_yticklabels(["No UHI", "Weak", "Moderate", "Strong", "V.Strong"],
+        cbar.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(>6)"],
                                 fontsize=8)
         ax.set_title("Classification Map")
         ax.set_xlabel("X")
@@ -508,7 +509,7 @@ class UHIAnalyzer:
 
         # ── right: per-category mean ± std ────────────────────────────────────
         ax = axes[2]
-        boundaries = [(-99, 0), (0, 1), (1, 2), (2, 3), (3, 99)]
+        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 99)]
         means, stds, counts = [], [], []
         for lo, hi in boundaries:
             mask  = (self.uhi_map >= lo) & (self.uhi_map < hi) if hi != 99 else self.uhi_map >= lo
@@ -516,7 +517,7 @@ class UHIAnalyzer:
             means.append(vals.mean() if len(vals) else 0)
             stds.append(vals.std()   if len(vals) else 0)
             counts.append(len(vals))
-        short_labels = ["≤0", "0–1", "1–2", "2–3", "≥3"]
+        short_labels = ["≤0", "0–2", "2–4", "4–6", "≥6"]
         x = np.arange(len(short_labels))
         bars = ax.bar(x, means, yerr=stds, color=_UHI_CAT_COLORS,
                       alpha=0.8, capsize=5, edgecolor="black", lw=0.8)
@@ -1503,7 +1504,8 @@ class AnalysisDiagnosticsPlotter:
             ax.text(0.97, 0.97,
                     f"mean={np.nanmean(flat):.2f}°C\nstd={np.nanstd(flat):.2f}°C\n"
                     f"% > 0°C: {(flat > 0).mean()*100:.1f}%\n"
-                    f"% > 2°C: {(flat > 2).mean()*100:.1f}%",
+                    f"% > 4°C: {(flat > 4).mean()*100:.1f}%\n"
+                    f"% > 6°C: {(flat > 6).mean()*100:.1f}%",
                     transform=ax.transAxes, fontsize=8, ha="right", va="top",
                     bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
 
@@ -1523,7 +1525,7 @@ class AnalysisDiagnosticsPlotter:
             cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
             ax.plot(sorted_vals, cdf * 100, color="#5E35B1", lw=1.8)
             for threshold, color, ls in [(0, "gray", "--"), (2, "orange", "-."),
-                                         (3, "red", ":")]:
+                                         (4, "coral", "-."), (6, "red", ":")]:
                 pct = float((flat <= threshold).mean() * 100)
                 ax.axvline(threshold, color=color, ls=ls, lw=1.0,
                            label=f"{threshold}°C → {pct:.0f}%ile")
@@ -1553,10 +1555,10 @@ class AnalysisDiagnosticsPlotter:
 
             classified = np.zeros_like(uhi_map, dtype=np.int8)
             classified[uhi_map < 0]                            = 0
-            classified[(uhi_map >= 0) & (uhi_map < 1)]        = 1
-            classified[(uhi_map >= 1) & (uhi_map < 2)]        = 2
-            classified[(uhi_map >= 2) & (uhi_map < 3)]        = 3
-            classified[uhi_map >= 3]                           = 4
+            classified[(uhi_map >= 0) & (uhi_map < 2)]        = 1
+            classified[(uhi_map >= 2) & (uhi_map < 4)]        = 2
+            classified[(uhi_map >= 4) & (uhi_map < 6)]        = 3
+            classified[uhi_map >= 6]                           = 4
 
             counts = [int((classified == i).sum()) for i in range(5)]
             labels = _UHI_CAT_LABELS

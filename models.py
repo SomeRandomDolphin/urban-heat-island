@@ -8,8 +8,14 @@ import numpy as np
 import pandas as pd
 import pickle
 from pathlib import Path
+from scipy.stats import linregress  # moved from inline imports inside methods
 
-from config import CNN_CONFIG, ENSEMBLE_WEIGHTS
+from config import (
+    CNN_CONFIG,
+    ENSEMBLE_WEIGHTS,
+    PROGRESSIVE_LOSS_CONFIG,
+    EARLY_STOPPING_CONFIG,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -18,30 +24,30 @@ logger = logging.getLogger(__name__)
 
 
 class ConvBlock(nn.Module):
-    """Convolutional block with BatchNorm and activation"""
-    
-    def __init__(self, in_channels: int, out_channels: int, 
+    """Convolutional block with BatchNorm and activation."""
+
+    def __init__(self, in_channels: int, out_channels: int,
                  dropout: float = 0.1, use_batchnorm: bool = True):
         super().__init__()
-        
+
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        
+
         self.bn1 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
         self.bn2 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
-        
+
         self.dropout = nn.Dropout2d(dropout)
         self.relu = nn.ReLU(inplace=True)
-        
+
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        
+
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu(x)
-        
+
         x = self.dropout(x)
         return x
 
@@ -135,6 +141,9 @@ class ProgressiveLSTLoss(nn.Module):
     """
     Enhanced loss function preventing variance collapse and range compression.
 
+    Phase weights are read from PROGRESSIVE_LOSS_CONFIG in config.py so they
+    can be tuned without touching model code.
+
     FIX 4: Spatial smoothness penalty REMOVED — it was blurring sharp land-cover
             boundaries (e.g. building/water edges) which are physically real.
             Replaced with a gradient-alignment loss that penalises *disagreement*
@@ -150,12 +159,13 @@ class ProgressiveLSTLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Phase weights — updated each epoch via set_training_progress()
-        self.mse_weight      = 0.6
-        self.variance_weight = 0.1
-        self.range_weight    = 0.1
-        self.bias_weight     = 0.1
-        self.gradient_weight = 0.1   # FIX 4: replaces spatial smoothness
+        # Initialise from phase-1 defaults (updated each epoch via set_training_progress)
+        p1 = PROGRESSIVE_LOSS_CONFIG["phase1"]
+        self.mse_weight      = p1["mse"]
+        self.variance_weight = p1["variance"]
+        self.range_weight    = p1["range"]
+        self.bias_weight     = p1["bias"]
+        self.gradient_weight = p1["gradient"]
 
         self.current_epoch = 0
 
@@ -163,36 +173,28 @@ class ProgressiveLSTLoss(nn.Module):
                     "(gradient-alignment + temperature-weighted MSE, no spatial smoothness)")
 
     def set_training_progress(self, epoch: int, total_epochs: int):
-        """Update loss component weights based on training phase."""
+        """Update loss component weights based on training phase (read from config)."""
         self.current_epoch = epoch
         progress = epoch / max(total_epochs, 1)
 
-        if progress < 0.3:
-            # Phase 1 – WARMUP: lead with weighted MSE; light regularisation
-            self.mse_weight      = 0.65
-            self.variance_weight = 0.10
-            self.range_weight    = 0.10
-            self.bias_weight     = 0.05
-            self.gradient_weight = 0.10
-            phase = "WARMUP"
+        phase1_end = PROGRESSIVE_LOSS_CONFIG["phase1_end"]
+        phase2_end = PROGRESSIVE_LOSS_CONFIG["phase2_end"]
 
-        elif progress < 0.6:
-            # Phase 2 – REFINEMENT: increase variance/range pressure
-            self.mse_weight      = 0.50
-            self.variance_weight = 0.18
-            self.range_weight    = 0.18
-            self.bias_weight     = 0.07
-            self.gradient_weight = 0.07
-            phase = "REFINEMENT"
-
+        if progress < phase1_end:
+            weights = PROGRESSIVE_LOSS_CONFIG["phase1"]
+            phase   = "WARMUP"
+        elif progress < phase2_end:
+            weights = PROGRESSIVE_LOSS_CONFIG["phase2"]
+            phase   = "REFINEMENT"
         else:
-            # Phase 3 – FINE-TUNING: balance all terms
-            self.mse_weight      = 0.40
-            self.variance_weight = 0.22
-            self.range_weight    = 0.20
-            self.bias_weight     = 0.10
-            self.gradient_weight = 0.08
-            phase = "FINE-TUNING"
+            weights = PROGRESSIVE_LOSS_CONFIG["phase3"]
+            phase   = "FINE-TUNING"
+
+        self.mse_weight      = weights["mse"]
+        self.variance_weight = weights["variance"]
+        self.range_weight    = weights["range"]
+        self.bias_weight     = weights["bias"]
+        self.gradient_weight = weights["gradient"]
 
         if epoch % 20 == 0:
             logger.info(f"Loss phase: {phase}  (epoch {epoch}/{total_epochs})  "
@@ -395,9 +397,17 @@ class LSTLoss(nn.Module):
 
 
 class EarlyStopping:
-    """Early stopping to prevent overfitting - IMPROVED"""
-    
-    def __init__(self, patience: int = 10, min_delta: float = 0.001, mode: str = "min"):
+    """Early stopping to prevent overfitting.
+
+    Defaults are read from EARLY_STOPPING_CONFIG in config.py.
+    """
+
+    def __init__(
+        self,
+        patience:  int   = EARLY_STOPPING_CONFIG["patience"],
+        min_delta: float = EARLY_STOPPING_CONFIG["min_delta"],
+        mode:      str   = EARLY_STOPPING_CONFIG["mode"],
+    ):
         self.patience = patience
         self.min_delta = min_delta  # Minimum improvement required
         self.mode = mode
@@ -661,7 +671,7 @@ def count_parameters(model):
 
 
 def initialize_weights(model):
-    """Initialize model weights"""
+    """Initialize model weights using Kaiming normal for Conv/Linear layers."""
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -671,90 +681,35 @@ def initialize_weights(model):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            nn.init.constant_(m.bias, 0)
+            # kaiming_uniform_ matches the conv initialisation strategy;
+            # the old normal_(std=0.01) was too small and slowed learning.
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
 
 def test_model():
-    """Test model architecture"""
+    """Smoke-test: forward pass + loss + ensemble prediction."""
     model = UNet(in_channels=15, out_channels=1)
     initialize_weights(model)
-    
-    # Test forward pass
-    x = torch.randn(2, 15, 128, 128)
-    y = model(x)
-    
-    print(f"Input shape: {x.shape}")
+
+    x      = torch.randn(2, 15, 128, 128)
+    target = torch.randn(2, 1,  128, 128)
+    y      = model(x)
+
+    print(f"Input shape:  {x.shape}")
     print(f"Output shape: {y.shape}")
-    print(f"Total parameters: {count_parameters(model):,}")
-    
-    # Test loss
-    criterion = LSTLoss()
-    target = torch.randn(2, 1, 128, 128)
-    loss, components = criterion(y, target, x)
-    
-    print(f"Total loss: {loss.item():.4f}")
-    print(f"Loss components: {components}")
-    
-    # Test ensemble
+    print(f"Parameters:   {count_parameters(model):,}")
+
+    criterion = ProgressiveLSTLoss()
+    loss, components = criterion(y, target)
+    print(f"Total loss:       {loss.item():.4f}")
+    print(f"Loss components:  {components}")
+
     print("\nTesting ensemble...")
     ensemble = ModelEnsemble(cnn_model=model, device='cpu')
     pred = ensemble.predict(x)
     print(f"Ensemble prediction shape: {pred.shape}")
-
-class VarianceAwareLoss(nn.Module):
-    """
-    Loss function that preserves temperature variance
-    Prevents the model from regressing to the mean
-    """
-    
-    def __init__(self, mse_weight=0.7, var_weight=0.2, spatial_weight=0.1):
-        super().__init__()
-        self.mse_weight = mse_weight
-        self.var_weight = var_weight
-        self.spatial_weight = spatial_weight
-        
-    def forward(self, pred, target, features=None):
-        """
-        Args:
-            pred: Predictions (N, 1, H, W) - NORMALIZED
-            target: Ground truth (N, 1, H, W) - NORMALIZED
-            features: Input features (optional, for physical constraints)
-        
-        Returns:
-            loss, components dict
-        """
-        # 1. Standard MSE
-        mse_loss = nn.functional.mse_loss(pred, target)
-        
-        # 2. Variance preservation loss
-        # Penalize if prediction variance doesn't match target variance
-        pred_var = torch.var(pred)
-        target_var = torch.var(target)
-        var_loss = (pred_var - target_var) ** 2
-        
-        # 3. Spatial smoothness (optional, from original LSTLoss)
-        spatial_loss = 0.0
-        if pred.shape[2] > 1 and pred.shape[3] > 1:
-            # Gradient in x and y
-            dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-            dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-            spatial_loss = torch.mean(dx**2) + torch.mean(dy**2)
-        
-        # Total loss
-        total_loss = (
-            self.mse_weight * mse_loss +
-            self.var_weight * var_loss +
-            self.spatial_weight * spatial_loss
-        )
-        
-        components = {
-            "mse": mse_loss.item(),
-            "variance": var_loss.item(),
-            "spatial": spatial_loss.item() if isinstance(spatial_loss, torch.Tensor) else spatial_loss
-        }
-        
-        return total_loss, components
 
 
 if __name__ == "__main__":
