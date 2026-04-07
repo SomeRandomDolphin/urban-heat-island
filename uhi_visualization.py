@@ -77,9 +77,10 @@ def _safe_kde_2d(x: np.ndarray, y: np.ndarray) -> Optional[np.ndarray]:
 _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
 _THERMAL_CMAP   = LinearSegmentedColormap.from_list('thermal', _THERMAL_COLORS, N=256)
-_UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f']
+_UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f', '#800026']
 _UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–2 °C)',
-                   'Moderate (2–4 °C)', 'Strong (4–6 °C)', 'Very Strong (>6 °C)']
+                   'Moderate (2–4 °C)', 'Strong (4–6 °C)',
+                   'Very Strong (6–8 °C)', 'Extreme (>8 °C)']
 
 sns.set_theme(style="whitegrid", font_scale=1.05)
 plt.rcParams.update({
@@ -182,15 +183,16 @@ class UHIVisualizer:
         classified[finite & (uhi_data >= 0) & (uhi_data < 2)]         = 1
         classified[finite & (uhi_data >= 2) & (uhi_data < 4)]         = 2
         classified[finite & (uhi_data >= 4) & (uhi_data < 6)]         = 3
-        classified[finite & (uhi_data >= 6)]                           = 4
-        classified[sea_pixels]                                         = 5
+        classified[finite & (uhi_data >= 6) & (uhi_data < 8)]         = 4
+        classified[finite & (uhi_data >= 8)]                           = 5
+        classified[sea_pixels]                                         = 6
 
         sea_color  = '#456eb4'   # steel-blue for sea
         cat_colors = _UHI_CAT_COLORS + [sea_color]
         cat_labels = _UHI_CAT_LABELS + ['Sea / Water']
 
         cmap   = mcolors.ListedColormap(cat_colors)
-        bounds = [-1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 5.5]
+        bounds = [-1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 6.5]
         norm   = mcolors.BoundaryNorm(bounds, cmap.N)
         im = ax.imshow(classified, cmap=cmap, norm=norm,
                        interpolation='nearest', aspect='auto')
@@ -287,7 +289,7 @@ class UHIVisualizer:
             f"    Maximum Intensity:           {uhi_stats['max_intensity']:.2f}°C\n"
             f"    Mean Intensity:              {uhi_stats['mean_intensity']:.2f}°C\n"
             f"    Mean Positive Intensity:     {uhi_stats['mean_positive_intensity']:.2f}°C\n"
-            f"    Spatial Extent (>2°C):       {uhi_stats['spatial_extent_km2']:.2f} km²\n"
+            f"    Spatial Extent (>6°C):       {uhi_stats['spatial_extent_km2']:.2f} km²\n"
             f"    UHI Magnitude:               {uhi_stats['magnitude']:.2f}°C·pixels"
         )
         ax.text(0.1, 0.5, stats_text, fontsize=12, family='monospace',
@@ -1230,15 +1232,16 @@ class UHIVisualizer:
         classified[(uhi_map >= 0) & (uhi_map < 2)]           = 1
         classified[(uhi_map >= 2) & (uhi_map < 4)]           = 2
         classified[(uhi_map >= 4) & (uhi_map < 6)]           = 3
-        classified[uhi_map >= 6]                              = 4
+        classified[(uhi_map >= 6) & (uhi_map < 8)]           = 4
+        classified[uhi_map >= 8]                              = 5
         cmap_c  = mcolors.ListedColormap(_UHI_CAT_COLORS)
-        norm_c  = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap_c.N)
+        norm_c  = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5], cmap_c.N)
         im2 = ax.imshow(classified, cmap=cmap_c, norm=norm_c,
                         interpolation="nearest", aspect="auto")
         cbar2 = fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04,
-                             boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
-                             ticks=[0, 1, 2, 3, 4])
-        cbar2.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(>6)"],
+                             boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+                             ticks=[0, 1, 2, 3, 4, 5])
+        cbar2.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(6–8)", "Extreme\n(>8)"],
                                  fontsize=7)
         ax.set_title("UHI Intensity Classification")
         ax.set_xlabel("X"); ax.set_ylabel("Y")
@@ -1344,7 +1347,7 @@ class UHIVisualizer:
         cdf      = np.linspace(0, 1, len(sorted_u))
         ax.plot(sorted_u, cdf, color="#4393c3", lw=2)
         for thr, col in [(0, "#99d594"), (2, "#fee08b"),
-                         (4, "#fc8d59"), (6, "#d53e4f")]:
+                         (4, "#fc8d59"), (6, "#d53e4f"), (8, "#800026")]:
             pct = 100 * (1 - np.interp(thr, sorted_u, cdf))
             ax.axvline(thr, color=col, lw=1.2, ls="--")
             ax.text(thr + 0.05, 0.05, f"{pct:.1f}%",
@@ -1361,7 +1364,7 @@ class UHIVisualizer:
             ["Max UHI (°C)", f"{uhi_stats['max_intensity']:.2f}"],
             ["Mean UHI (°C)", f"{uhi_stats['mean_intensity']:.2f}"],
             ["Std UHI (°C)", f"{uhi_stats['std_intensity']:.2f}"],
-            ["Extent >2°C (km²)", f"{uhi_stats['spatial_extent_km2']:.2f}"],
+            ["Extent >6°C (km²)", f"{uhi_stats['spatial_extent_km2']:.2f}"],
             ["% Positive pixels", f"{uhi_stats['pct_positive']:.1f}%"],
             ["Skewness", f"{uhi_stats['skewness']:.3f}"],
             ["Kurtosis", f"{uhi_stats['kurtosis']:.3f}"],

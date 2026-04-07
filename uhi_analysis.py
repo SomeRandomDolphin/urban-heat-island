@@ -66,9 +66,10 @@ def _safe_kde_2d(x: np.ndarray, y: np.ndarray):
 _THERMAL_COLORS = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0',
                    '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
 _THERMAL_CMAP   = LinearSegmentedColormap.from_list('thermal', _THERMAL_COLORS, N=256)
-_UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f']
+_UHI_CAT_COLORS = ['#3288bd', '#99d594', '#fee08b', '#fc8d59', '#d53e4f', '#800026']
 _UHI_CAT_LABELS = ['No UHI / Cooling', 'Weak (0–2 °C)',
-                   'Moderate (2–4 °C)', 'Strong (4–6 °C)', 'Very Strong (>6 °C)']
+                   'Moderate (2–4 °C)', 'Strong (4–6 °C)',
+                   'Very Strong (6–8 °C)', 'Extreme (>8 °C)']
 
 sns.set_theme(style="whitegrid", font_scale=1.05)
 plt.rcParams.update({
@@ -178,6 +179,7 @@ class UHIAnalyzer:
         logger.info(f"  Pixels > 2 °C  : {(self.uhi_map > 2).sum():,}")
         logger.info(f"  Pixels > 4 °C  : {(self.uhi_map > 4).sum():,}")
         logger.info(f"  Pixels > 6 °C  : {(self.uhi_map > 6).sum():,}")
+        logger.info(f"  Pixels > 8 °C  : {(self.uhi_map > 8).sum():,}")
 
         return self.uhi_map
 
@@ -194,7 +196,8 @@ class UHIAnalyzer:
         classified[(self.uhi_map >= 0) & (self.uhi_map < 2)]          = 1
         classified[(self.uhi_map >= 2) & (self.uhi_map < 4)]          = 2
         classified[(self.uhi_map >= 4) & (self.uhi_map < 6)]          = 3
-        classified[self.uhi_map >= 6]                                  = 4
+        classified[(self.uhi_map >= 6) & (self.uhi_map < 8)]          = 4
+        classified[self.uhi_map >= 8]                                  = 5
 
         categories: Dict[str, int] = {}
         for idx, label in enumerate(_UHI_CAT_LABELS):
@@ -244,7 +247,7 @@ class UHIAnalyzer:
             "p95": float(q95),
             "skewness":               skew,
             "kurtosis":               kurt,
-            "spatial_extent_km2":     float((self.uhi_map > 4).sum() * 0.0025),
+            "spatial_extent_km2":     float((self.uhi_map > 6).sum() * 0.0025),
             "magnitude":              float(uhi_pos.sum()),
             "pct_positive":           float(len(uhi_pos) / max(len(uhi_finite), 1) * 100),
         }
@@ -377,7 +380,8 @@ class UHIAnalyzer:
         for thr, col, lbl in [(0, "#99d594", "0 °C"),
                                (2, "#fee08b", "2 °C"),
                                (4, "#fc8d59", "4 °C"),
-                               (6, "#d53e4f", "6 °C")]:
+                               (6, "#d53e4f", "6 °C"),
+                               (8, "#800026", "8 °C")]:
             ax.axvline(thr, color=col, lw=1.5, ls="--", label=f"+{lbl}")
         ax.set_xlabel("UHI Intensity (°C)")
         ax.set_ylabel("Density")
@@ -390,7 +394,7 @@ class UHIAnalyzer:
         cdf = np.arange(1, len(sorted_uhi) + 1) / len(sorted_uhi)
         ax.plot(sorted_uhi, cdf, color="#4393c3", lw=2)
         for thr, col in [(0, "#99d594"), (2, "#fee08b"),
-                         (4, "#fc8d59"), (6, "#d53e4f")]:
+                         (4, "#fc8d59"), (6, "#d53e4f"), (8, "#800026")]:
             ax.axvline(thr, color=col, lw=1.2, ls="--")
             pct_above = 100 * (1 - np.interp(thr, sorted_uhi, cdf))
             ax.text(thr + 0.05, 0.05, f"{pct_above:.1f}%\nabove",
@@ -402,7 +406,7 @@ class UHIAnalyzer:
 
         # ── [1,1] Box-plot per UHI category ──────────────────────────────────
         ax = fig.add_subplot(gs[1, 1])
-        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 99)]
+        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 8), (8, 99)]
         box_data   = []
         for lo, hi in boundaries:
             mask = (uhi >= lo) & (uhi < hi) if hi != 99 else uhi >= lo
@@ -413,7 +417,7 @@ class UHIAnalyzer:
         for patch, col in zip(bp["boxes"], _UHI_CAT_COLORS):
             patch.set_facecolor(col)
             patch.set_alpha(0.7)
-        short_labels = ["≤0", "0–2", "2–4", "4–6", "≥6"]
+        short_labels = ["≤0", "0–2", "2–4", "4–6", "6–8", "≥8"]
         ax.set_xticklabels(short_labels)
         ax.set_xlabel("UHI Category (°C)")
         ax.set_ylabel("UHI Intensity (°C)")
@@ -474,13 +478,13 @@ class UHIAnalyzer:
         # ── left: spatial ─────────────────────────────────────────────────────
         ax = axes[0]
         cmap_cls = mcolors.ListedColormap(_UHI_CAT_COLORS)
-        norm_cls = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap_cls.N)
+        norm_cls = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5], cmap_cls.N)
         im       = ax.imshow(classified, cmap=cmap_cls, norm=norm_cls,
                              interpolation="nearest", aspect="auto")
         cbar     = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                                boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
-                                ticks=[0, 1, 2, 3, 4])
-        cbar.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(>6)"],
+                                boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+                                ticks=[0, 1, 2, 3, 4, 5])
+        cbar.ax.set_yticklabels(["No UHI", "Weak\n(0–2)", "Mod.\n(2–4)", "Strong\n(4–6)", "V.Strong\n(6–8)", "Extreme\n(>8)"],
                                 fontsize=8)
         ax.set_title("Classification Map")
         ax.set_xlabel("X")
@@ -509,7 +513,7 @@ class UHIAnalyzer:
 
         # ── right: per-category mean ± std ────────────────────────────────────
         ax = axes[2]
-        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 99)]
+        boundaries = [(-99, 0), (0, 2), (2, 4), (4, 6), (6, 8), (8, 99)]
         means, stds, counts = [], [], []
         for lo, hi in boundaries:
             mask  = (self.uhi_map >= lo) & (self.uhi_map < hi) if hi != 99 else self.uhi_map >= lo
@@ -517,7 +521,7 @@ class UHIAnalyzer:
             means.append(vals.mean() if len(vals) else 0)
             stds.append(vals.std()   if len(vals) else 0)
             counts.append(len(vals))
-        short_labels = ["≤0", "0–2", "2–4", "4–6", "≥6"]
+        short_labels = ["≤0", "0–2", "2–4", "4–6", "6–8", "≥8"]
         x = np.arange(len(short_labels))
         bars = ax.bar(x, means, yerr=stds, color=_UHI_CAT_COLORS,
                       alpha=0.8, capsize=5, edgecolor="black", lw=0.8)
@@ -1505,7 +1509,8 @@ class AnalysisDiagnosticsPlotter:
                     f"mean={np.nanmean(flat):.2f}°C\nstd={np.nanstd(flat):.2f}°C\n"
                     f"% > 0°C: {(flat > 0).mean()*100:.1f}%\n"
                     f"% > 4°C: {(flat > 4).mean()*100:.1f}%\n"
-                    f"% > 6°C: {(flat > 6).mean()*100:.1f}%",
+                    f"% > 6°C: {(flat > 6).mean()*100:.1f}%\n"
+                    f"% > 8°C: {(flat > 8).mean()*100:.1f}%",
                     transform=ax.transAxes, fontsize=8, ha="right", va="top",
                     bbox=dict(boxstyle="round,pad=0.3", alpha=0.15))
 
@@ -1525,7 +1530,8 @@ class AnalysisDiagnosticsPlotter:
             cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
             ax.plot(sorted_vals, cdf * 100, color="#5E35B1", lw=1.8)
             for threshold, color, ls in [(0, "gray", "--"), (2, "orange", "-."),
-                                         (4, "coral", "-."), (6, "red", ":")]:
+                                         (4, "coral", "-."), (6, "red", ":"),
+                                         (8, "#800026", ":")]:
                 pct = float((flat <= threshold).mean() * 100)
                 ax.axvline(threshold, color=color, ls=ls, lw=1.0,
                            label=f"{threshold}°C → {pct:.0f}%ile")
@@ -1558,7 +1564,8 @@ class AnalysisDiagnosticsPlotter:
             classified[(uhi_map >= 0) & (uhi_map < 2)]        = 1
             classified[(uhi_map >= 2) & (uhi_map < 4)]        = 2
             classified[(uhi_map >= 4) & (uhi_map < 6)]        = 3
-            classified[uhi_map >= 6]                           = 4
+            classified[(uhi_map >= 6) & (uhi_map < 8)]        = 4
+            classified[uhi_map >= 8]                           = 5
 
             counts = [int((classified == i).sum()) for i in range(5)]
             labels = _UHI_CAT_LABELS
@@ -1580,10 +1587,10 @@ class AnalysisDiagnosticsPlotter:
             ax = axes[1]
             from matplotlib.colors import ListedColormap, BoundaryNorm as BN
             cmap_cls = ListedColormap(colors)
-            bnorm    = BN([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap_cls.N)
+            bnorm    = BN([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5], cmap_cls.N)
             im = ax.imshow(classified, cmap=cmap_cls, norm=bnorm,
                            interpolation="nearest")
-            cbar = plt.colorbar(im, ax=ax, ticks=[0, 1, 2, 3, 4], shrink=0.85)
+            cbar = plt.colorbar(im, ax=ax, ticks=[0, 1, 2, 3, 4, 5], shrink=0.85)
             cbar.ax.set_yticklabels(labels, fontsize=7)
             ax.set_title("UHI Classification Map"); ax.axis("off")
 

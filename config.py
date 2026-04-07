@@ -29,9 +29,9 @@ for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, MODEL_DIR, OUTPUT_D
 STUDY_AREA = {
     "name": "Jakarta Metropolitan Area (DKI Jakarta)",
     "bounds": {
-        "min_lon": 106.65,   # Western edge (Jakarta Barat coast)
-        "max_lon": 107.00,   # Eastern edge (Jakarta Timur boundary)
-        "min_lat": -6.40,    # Southern edge (Jakarta Selatan border)
+        "min_lon": 106.40,   # Western edge (Jakarta Barat coast)
+        "max_lon": 107.20,   # Eastern edge (Jakarta Timur boundary)
+        "min_lat": -6.70,    # Southern edge (Jakarta Selatan border)
         "max_lat": -6.00,    # Northern edge (includes Kepulauan Seribu waters)
     },
     # NOTE: Kepulauan Seribu extends far north (~-5.4°), but including the full
