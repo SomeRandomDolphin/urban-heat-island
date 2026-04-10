@@ -1180,11 +1180,52 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
     # 10b. Uncertainty ────────────────────────────────────────────────────────
     unc_key = results.get("_unc_key", "uncertainty")
     uncertainty = results.get(unc_key)
+    # ── Shared epoch-collapse helper ─────────────────────────────────────────
+    # _mosaic_patches may return a tall vertically-stacked multi-epoch canvas
+    # (height = n_epochs × single_epoch_height).  Collapse it to a single
+    # temporal-mean map using the same logic as stage_postprocess so that
+    # all downstream visualizations receive a 2-D (H × W) array and don't
+    # hold n_epochs copies of the full mosaic in RAM simultaneously.
+    _gs_vis = _load_patch_grid_shape(Path(args.test_data))
+    _stride_vis      = _gs_vis[4] if _gs_vis is not None else None
+    _all_grid_rows_v = _gs_vis[5] if _gs_vis is not None else None
+
+    def _mosaic_and_collapse(patches: np.ndarray) -> np.ndarray:
+        """Build mosaic then collapse multi-epoch vertical stack → temporal mean."""
+        mosaic = _mosaic_patches(patches, grid_cols=_resolved_grid_cols,
+                                 patch_positions=_patch_positions,
+                                 stride=_stride_vis,
+                                 all_grid_rows=_all_grid_rows_v)
+        H_p = patches.shape[1] if patches.ndim == 3 else 1
+        needs_collapse = (
+            _stride_vis is not None
+            and _stride_vis > 0
+            and _stride_vis != H_p
+            and _all_grid_rows_v is not None
+            and len(_all_grid_rows_v) > 1
+        )
+        if not needs_collapse:
+            return mosaic
+        ep_h_list = [max(1, (int(r) - 1) * _stride_vis + H_p)
+                     for r in _all_grid_rows_v]
+        max_ep_h  = max(ep_h_list)
+        n_ep      = len(_all_grid_rows_v)
+        slices, cursor = [], 0
+        for _ in range(n_ep):
+            end = cursor + max_ep_h
+            if end <= mosaic.shape[0]:
+                slices.append(mosaic[cursor:end, :])
+            cursor += max_ep_h
+        if slices:
+            collapsed = np.nanmean(np.stack(slices, axis=0), axis=0).astype(patches.dtype)
+            logger.info(f"  _mosaic_and_collapse: {n_ep} epochs → temporal mean {collapsed.shape}")
+            return collapsed
+        return mosaic
+
     if uncertainty is not None:
         # Mosaic uncertainty patches to match the full lst_processed mosaic
         if uncertainty.ndim == 3:
-            unc_mosaic = _mosaic_patches(uncertainty, grid_cols=_resolved_grid_cols,
-                                         patch_positions=_patch_positions)
+            unc_mosaic = _mosaic_and_collapse(uncertainty)
         else:
             unc_mosaic = uncertainty
         _try("Uncertainty map",
@@ -1193,8 +1234,7 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
              title="Prediction Uncertainty (σ)")
 
         # Use ensemble mosaic for uncertainty analysis plot
-        ens_mosaic = _mosaic_patches(results["ensemble"], grid_cols=_resolved_grid_cols,
-                                     patch_positions=_patch_positions)
+        ens_mosaic = _mosaic_and_collapse(results["ensemble"])
         _try("Uncertainty analysis plot",
              vis.create_uncertainty_analysis_plot,
              ens_mosaic, unc_mosaic,
@@ -1229,20 +1269,19 @@ def stage_visualizations(args, lst_processed, uhi_ctx, hotspot_ctx,
          maps_dir / "urban_rural_comparison.png")
 
     # 10f. Model comparison (CNN / GBM / Ensemble) ────────────────────────────
-    # Build per-model mosaics so the comparison shows the full area
+    # Build per-model mosaics so the comparison shows the full area.
+    # Each mosaic is epoch-collapsed to a 2-D temporal mean to keep RAM low.
     model_results = {}
     for k in ("cnn", "gbm", "ensemble"):
         if k in results:
             arr = results[k]
-            if arr.ndim == 3:          # (N, H, W)
-                model_results[k] = _mosaic_patches(arr, grid_cols=_resolved_grid_cols,
-                                                   patch_positions=_patch_positions)
+            if arr.ndim == 3:          # (N, H, W) patches
+                model_results[k] = _mosaic_and_collapse(arr)
             elif arr.ndim == 1:        # GBM patch-average scalar per patch
-                # Broadcast each scalar to a patch-sized tile, then mosaic
+                # Broadcast each scalar to a patch-sized tile, then mosaic+collapse
                 H, W = results["ensemble"].shape[1], results["ensemble"].shape[2]
                 tiles = np.stack([np.full((H, W), v) for v in arr])
-                model_results[k] = _mosaic_patches(tiles, grid_cols=_resolved_grid_cols,
-                                                   patch_positions=_patch_positions)
+                model_results[k] = _mosaic_and_collapse(tiles)
     if model_results:
         _try("Model comparison plot",
              vis.create_model_comparison_plot,

@@ -124,6 +124,10 @@ class UHIVisualizer:
                         cold land surfaces and not mistaken for UHI signal.
         """
         logger.info(f"Creating LST map: {title}")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if lst_data.ndim == 3:
+            logger.info(f"  create_lst_map: collapsing {lst_data.shape[0]} temporal frames → nanmean")
+            lst_data = np.nanmean(lst_data, axis=0)
         # Compute vmin/vmax from land pixels only so the colour scale is not
         # anchored to the much colder sea temperature.
         if vmin is None or vmax is None:
@@ -168,6 +172,10 @@ class UHIVisualizer:
                         "No UHI / Cooling" land class.
         """
         logger.info(f"Creating UHI intensity map: {title}")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if uhi_data.ndim == 3:
+            logger.info(f"  create_uhi_intensity_map: collapsing {uhi_data.shape[0]} temporal frames → nanmean")
+            uhi_data = np.nanmean(uhi_data, axis=0)
         fig, ax = plt.subplots(figsize=self.figsize)
 
         # Determine water pixels: explicit mask OR NaN cells in uhi_data
@@ -218,6 +226,12 @@ class UHIVisualizer:
                            gi_star: np.ndarray, output_path: Path,
                            title: str = "UHI Hotspot Map"):
         logger.info(f"Creating hotspot map: {title}")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if lst_data.ndim == 3:
+            logger.info(f"  create_hotspot_map: collapsing {lst_data.shape[0]} temporal frames → nanmean")
+            lst_data = np.nanmean(lst_data, axis=0)
+        if gi_star.ndim == 3:
+            gi_star = np.nanmean(gi_star, axis=0)
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         ax = axes[0]
         im1 = ax.imshow(lst_data, cmap=_THERMAL_CMAP, alpha=0.8,
@@ -252,6 +266,12 @@ class UHIVisualizer:
                                output_path: Path,
                                title: str = "Prediction Uncertainty Map"):
         logger.info(f"Creating uncertainty map: {title}")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if lst_data.ndim == 3:
+            logger.info(f"  create_uncertainty_map: collapsing {lst_data.shape[0]} temporal frames → nanmean")
+            lst_data = np.nanmean(lst_data, axis=0)
+        if uncertainty.ndim == 3:
+            uncertainty = np.nanmean(uncertainty, axis=0)
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         ax = axes[0]
         im1 = ax.imshow(lst_data, cmap=_THERMAL_CMAP,
@@ -374,10 +394,10 @@ class UHIVisualizer:
             logger.warning("  No model keys found in results — skipping model comparison")
             return
 
-        # Force to 2-D single patch if needed
+        # Collapse to 2-D temporal mean (preserves all frames, not just the first)
         def _to_2d(arr):
             if arr.ndim == 3:
-                return arr[0]
+                return np.nanmean(arr, axis=0)
             return arr
 
         maps = {k: _to_2d(results[k]) for k in all_keys}
@@ -495,6 +515,15 @@ class UHIVisualizer:
           - σ gradient exposes the boundary artefact visible in image 1
         """
         logger.info("Creating uncertainty analysis plot...")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if predictions.ndim == 3:
+            logger.info(f"  create_uncertainty_analysis_plot: collapsing predictions {predictions.shape[0]} frames → nanmean")
+            predictions = np.nanmean(predictions, axis=0)
+        if uncertainty.ndim == 3:
+            logger.info(f"  create_uncertainty_analysis_plot: collapsing uncertainty {uncertainty.shape[0]} frames → nanmean")
+            uncertainty = np.nanmean(uncertainty, axis=0)
+        if ground_truth is not None and ground_truth.ndim == 3:
+            ground_truth = np.nanmean(ground_truth, axis=0)
 
         fig, axes = plt.subplots(3, 2, figsize=(14, 16))
         fig.suptitle("Prediction Uncertainty Analysis", fontsize=15, fontweight="bold")
@@ -810,6 +839,10 @@ class UHIVisualizer:
           [bottom centre] KDE overlay
         """
         logger.info("Creating urban vs rural comparison plot...")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if lst_map.ndim == 3:
+            logger.info(f"  create_urban_rural_comparison_plot: collapsing lst_map {lst_map.shape[0]} frames → nanmean")
+            lst_map = np.nanmean(lst_map, axis=0)
         u_vals = lst_map[urban_mask].ravel()
         r_vals = lst_map[rural_mask].ravel()
 
@@ -1027,10 +1060,11 @@ class UHIVisualizer:
         logger.info("Creating spatial error heatmap...")
 
         def _to_2d(arr):
-            return arr[0] if arr.ndim == 3 else arr
+            # Collapse temporal axis to mean so RAM usage stays constant
+            return np.nanmean(arr, axis=0) if arr.ndim == 3 else arr
 
-        pred_mean = _to_2d(predictions) if predictions.ndim <= 3 else predictions.mean(0)
-        gt_mean   = _to_2d(ground_truth) if ground_truth.ndim <= 3 else ground_truth.mean(0)
+        pred_mean = _to_2d(predictions) if predictions.ndim <= 3 else np.nanmean(predictions, axis=0)
+        gt_mean   = _to_2d(ground_truth) if ground_truth.ndim <= 3 else np.nanmean(ground_truth, axis=0)
 
         # Align shapes if needed
         hmin = min(pred_mean.shape[0], gt_mean.shape[0])
@@ -1212,6 +1246,16 @@ class UHIVisualizer:
             uncertainty    : optional (H, W) prediction uncertainty
         """
         logger.info("Creating comprehensive dashboard...")
+        # Collapse temporal axis to a mean map so multi-epoch inputs don't spike RAM
+        if lst_map.ndim == 3:
+            logger.info(f"  create_comprehensive_dashboard: collapsing lst_map {lst_map.shape[0]} frames → nanmean")
+            lst_map = np.nanmean(lst_map, axis=0)
+        if uhi_map.ndim == 3:
+            uhi_map = np.nanmean(uhi_map, axis=0)
+        if gi_star.ndim == 3:
+            gi_star = np.nanmean(gi_star, axis=0)
+        if uncertainty is not None and uncertainty.ndim == 3:
+            uncertainty = np.nanmean(uncertainty, axis=0)
         fig = plt.figure(figsize=(24, 18))
         gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.40, wspace=0.32)
         fig.suptitle("Urban Heat Island — Comprehensive Analysis Dashboard",

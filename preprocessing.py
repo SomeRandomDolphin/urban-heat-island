@@ -724,8 +724,11 @@ class PreprocessingDiagnostics:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         def _plot_channel_stats(ax, X, label_prefix, color):
-            means = [X[:, :, :, c].mean() for c in range(n_channels)]
-            stds  = [X[:, :, :, c].std()  for c in range(n_channels)]
+            # Single vectorised pass — no per-channel temporary slices
+            flat = X.reshape(-1, n_channels)
+            means = flat.mean(axis=0)
+            stds  = flat.std(axis=0)
+            del flat
             x_pos = np.arange(n_channels)
             ax.bar(x_pos, means, yerr=stds, color=color, alpha=0.7, capsize=3,
                    label="mean ± std")
@@ -2962,7 +2965,7 @@ logger = logging.getLogger(__name__)
 def _to_f32(arr: np.ndarray) -> np.ndarray:
     """Return a float32 array; reuse memory if already float32."""
     if arr.dtype == np.float32:
-        return arr.copy()
+        return arr  # return view — no copy needed
     return arr.astype(np.float32)
 
 
@@ -3736,7 +3739,13 @@ class FeatureEngineer:
         Returns:
             Impervious surface fraction (0-1)
         """
-        isf = (ndbi + (1 - ndvi) + (1 - mndwi)) / 3
+        isf = np.empty_like(ndvi, dtype=np.float32)
+        np.subtract(1.0, ndvi, out=isf)   # 1 - ndvi
+        isf += ndbi
+        tmp = np.subtract(1.0, mndwi)
+        isf += tmp
+        del tmp
+        isf /= 3.0
         return np.clip(isf, 0, 1)
     
     @staticmethod
@@ -3762,10 +3771,12 @@ class FeatureEngineer:
             # Mean
             context[f"mean_{prefix}"] = uniform_filter(arr, size=ws, mode='reflect')
             
-            # Standard deviation
-            arr_sq = arr ** 2
+            # Standard deviation — keep float32 and free arr_sq immediately
+            arr_sq = np.multiply(arr, arr, dtype=np.float32)
             mean_sq = uniform_filter(arr_sq, size=ws, mode='reflect')
+            del arr_sq
             context[f"std_{prefix}"] = np.sqrt(np.maximum(mean_sq - context[f"mean_{prefix}"] ** 2, 0))
+            del mean_sq
         
         return context
     
@@ -4292,10 +4303,11 @@ class DatasetCreator:
 
         return X, y
     
-    def verify_no_data_leakage(self, X_train, y_train, X_val, y_val, X_test, y_test,
+    def verify_no_data_leakage(self, y_train, y_val, y_test,
                             norm_stats: Dict):
         """
-        Verify normalization stats only come from training data
+        Verify normalization stats only come from training data.
+        Only y arrays are needed — X is not held in memory during this check.
         """
         logger.info("\n" + "="*70)
         logger.info("DATA LEAKAGE CHECK")
@@ -4337,12 +4349,12 @@ class DatasetCreator:
         logger.info(f"  Val: mean={val_mean:.4f}, std={y_val.std():.4f}")
         logger.info(f"  Test: mean={test_mean:.4f}, std={y_test.std():.4f}")
         
-        # Check 3: Verify no sample overlap
+        # Check 3: Sample counts
         logger.info(f"\nSample overlap check:")
-        logger.info(f"  Train samples: {len(X_train)}")
-        logger.info(f"  Val samples: {len(X_val)}")
-        logger.info(f"  Test samples: {len(X_test)}")
-        logger.info(f"  Total: {len(X_train) + len(X_val) + len(X_test)}")
+        logger.info(f"  Train samples: {len(y_train)}")
+        logger.info(f"  Val samples: {len(y_val)}")
+        logger.info(f"  Test samples: {len(y_test)}")
+        logger.info(f"  Total: {len(y_train) + len(y_val) + len(y_test)}")
         
         logger.info("="*70)
         
@@ -4724,10 +4736,9 @@ class EnhancedDatasetCreator(DatasetCreator):
         logger.info(f"CREATING {n_splits}-FOLD TEMPORAL CV SPLITS")
         logger.info("="*70)
         
-        # Sort by date
+        # Sort by date — only materialise the cheap date/index arrays.
+        # X and y are sliced per-fold on demand to avoid two full copies in memory.
         sort_idx = np.argsort(dates)
-        X_sorted = X[sort_idx]
-        y_sorted = y[sort_idx]
         dates_sorted = dates[sort_idx]
         
         n_samples = len(X)
@@ -4752,11 +4763,11 @@ class EnhancedDatasetCreator(DatasetCreator):
             val_indices = np.arange(val_start, val_end)
             
             split = {
-                "X_train": X_sorted[train_indices],
-                "y_train": y_sorted[train_indices],
+                "X_train": X[sort_idx[train_indices]],
+                "y_train": y[sort_idx[train_indices]],
                 "dates_train": dates_sorted[train_indices],
-                "X_val": X_sorted[val_indices],
-                "y_val": y_sorted[val_indices],
+                "X_val": X[sort_idx[val_indices]],
+                "y_val": y[sort_idx[val_indices]],
                 "dates_val": dates_sorted[val_indices],
                 "fold": fold
             }
@@ -5476,9 +5487,9 @@ def main():
     logger.info("="*70)
 
     dataset_creator.verify_no_data_leakage(
-        splits['X_train'], splits['y_train'],
-        splits['X_val'], splits['y_val'],
-        splits['X_test'], splits['y_test'],
+        splits['y_train'],
+        splits['y_val'],
+        splits['y_test'],
         norm_stats
     )
 
@@ -5604,7 +5615,12 @@ def main():
         bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)
         rw = 1.0 / bc[bids]
         train_weights = rw / rw.mean()
+
         weights_path = output_dataset_dir / "train" / "weights_train.npy"
+
+        # ✅ FIX: ensure directory exists before saving
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+
         np.save(weights_path, train_weights.astype(np.float32))
         logger.info(f"✅ Saved sample weights → {weights_path}")
         logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]")

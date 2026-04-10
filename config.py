@@ -174,7 +174,7 @@ PREPROCESSING_CONFIG = {
     # At float32 each pixel costs 4 bytes:
     #   10_000_000 px → ~38 MiB/band → ~343 MiB for 9 Landsat bands
     # Can also be overridden at runtime via: export UHI_MAX_PIXELS=<int>
-    "max_pixels_default":       10_000_000,
+    "max_pixels_default":       20_000_000,
     # Minimum allowed downsample factor (never go below 5% of native resolution)
     "min_downsample_factor":     0.05,
     # RAM budget fraction used when psutil is available (0.40 = 40% of free RAM)
