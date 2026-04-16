@@ -15,6 +15,9 @@ pyogrio==0.12.1
 # ===== Google Earth Engine =====
 earthengine-api==1.7.21
 
+# ===== Hyperparameter Optimization =====
+optuna==4.8.0
+
 # ===== Optional but commonly required =====
 affine==2.4.0
 cligj==0.7.2

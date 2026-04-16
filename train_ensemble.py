@@ -18,6 +18,7 @@ from tqdm import tqdm
 import lightgbm as lgb
 import joblib
 from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend — safe for headless/Windows runs
 import matplotlib.pyplot as plt
@@ -54,6 +55,7 @@ from config import (
     DIAGNOSTICS_CONFIG,
     MONITORING_CONFIG,
     LOGGING_CONFIG,
+    HYPERPARAM_TUNING_CONFIG,
 )
 from models import UNet, ProgressiveLSTLoss, EarlyStopping, initialize_weights, count_parameters
 
@@ -63,13 +65,20 @@ sys.stderr.reconfigure(encoding="utf-8")
 logging.basicConfig(**LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
-def load_normalization_stats() -> Optional[Dict]:
+def load_normalization_stats(dataset_dir: Path = None) -> Optional[Dict]:
     """Load normalization statistics for denormalization during evaluation.
+
+    Args:
+        dataset_dir: Path to the dataset directory containing
+            normalization_stats.json.  Defaults to
+            PROCESSED_DATA_DIR / "cnn_dataset" for backward compatibility.
 
     Returns:
         Normalization statistics dictionary, or None if not found.
     """
-    stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
+    if dataset_dir is None:
+        dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
+    stats_path = Path(dataset_dir) / "normalization_stats.json"
 
     if not stats_path.exists():
         logger.warning("⚠️ Normalization stats not found - predictions will remain in normalized space")
@@ -1056,6 +1065,586 @@ class GBMTrainer:
             logger.warning(f"⚠️ Best model not found at {best_path}, loading final model")
             self.load(path)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HYPERPARAMETER TUNING  (Optuna-based)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HyperparameterTuner:
+    """
+    Optuna-based hyperparameter search for both GBM and CNN components.
+
+    Usage
+    -----
+    tuner = HyperparameterTuner(X_train_gbm, y_train_gbm, X_val_gbm, y_val_gbm,
+                                 X_train_raw, y_train_raw, X_val_raw, y_val_raw,
+                                 device, study_dir)
+    best_gbm_params = tuner.tune_gbm()
+    best_cnn_params = tuner.tune_cnn()
+    """
+
+    def __init__(
+        self,
+        X_train_gbm: pd.DataFrame,
+        y_train_gbm: np.ndarray,
+        X_val_gbm: pd.DataFrame,
+        y_val_gbm: np.ndarray,
+        X_train_raw: np.ndarray,
+        y_train_raw: np.ndarray,
+        X_val_raw: np.ndarray,
+        y_val_raw: np.ndarray,
+        device,
+        study_dir: Path,
+        config: dict = None,
+    ):
+        self.X_train_gbm  = X_train_gbm
+        self.y_train_gbm  = y_train_gbm
+        self.X_val_gbm    = X_val_gbm
+        self.y_val_gbm    = y_val_gbm
+        self.X_train_raw  = X_train_raw
+        self.y_train_raw  = y_train_raw
+        self.X_val_raw    = X_val_raw
+        self.y_val_raw    = y_val_raw
+        self.device       = device
+        self.study_dir    = Path(study_dir)
+        self.study_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg          = config or HYPERPARAM_TUNING_CONFIG
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_sampler(self):
+        """Return an Optuna sampler based on config."""
+        try:
+            import optuna
+        except ImportError:
+            raise RuntimeError("optuna is required for hyperparameter tuning. "
+                               "Install it with: pip install optuna")
+        seed = self.cfg.get("seed", 42)
+        if self.cfg.get("sampler", "tpe") == "random":
+            return optuna.samplers.RandomSampler(seed=seed)
+        return optuna.samplers.TPESampler(seed=seed)
+
+    def _suggest_gbm_params(self, trial) -> dict:
+        """Map Optuna trial suggestions to a GBM params dict."""
+        ss  = self.cfg["gbm_search_space"]
+        base = dict(GBM_CONFIG["params"])          # copy defaults
+
+        def _suggest(name, spec):
+            t = spec["type"]
+            if t == "int":
+                kw = {}
+                if "step" in spec:
+                    kw["step"] = spec["step"]
+                return trial.suggest_int(name, spec["low"], spec["high"], **kw)
+            elif t == "float":
+                return trial.suggest_float(name, spec["low"], spec["high"],
+                                           log=spec.get("log", False))
+            elif t == "categorical":
+                return trial.suggest_categorical(name, spec["choices"])
+            raise ValueError(f"Unknown type {t!r} for {name!r}")
+
+        for param_name, spec in ss.items():
+            base[param_name] = _suggest(param_name, spec)
+
+        # Keep non-tunable GBM internals
+        base.setdefault("objective", "regression")
+        base.setdefault("metric", "rmse")
+        base.setdefault("boosting_type", "gbdt")
+        base.setdefault("verbose", -1)
+        base.setdefault("early_stopping_rounds", 100)
+        base.setdefault("min_child_weight", 1e-3)
+        base.setdefault("min_split_gain", 0.01)
+        base.setdefault("subsample_freq", 1)
+        return base
+
+    # ── GBM tuning ────────────────────────────────────────────────────────────
+
+    def tune_gbm(self) -> dict:
+        """
+        Run Optuna study for GBM hyperparameters.
+
+        Returns
+        -------
+        dict
+            Best GBM params found by Optuna (merged with non-tunable defaults).
+        """
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            logger.warning("optuna not installed — skipping GBM tuning, using defaults")
+            return GBM_CONFIG["params"]
+
+        logger.info("\n" + "="*60)
+        logger.info("GBM HYPERPARAMETER TUNING (Optuna)")
+        logger.info(f"  Trials : {self.cfg['gbm_n_trials']}")
+        logger.info(f"  Sampler: {self.cfg['sampler'].upper()}")
+        logger.info("="*60)
+
+        pruner = (optuna.pruners.MedianPruner(
+                      n_startup_trials=self.cfg["pruning_warmup_steps"])
+                  if self.cfg.get("pruning_enabled") else optuna.pruners.NopPruner())
+
+        study = optuna.create_study(
+            direction=self.cfg["primary_metric_mode"],
+            sampler=self._make_sampler(),
+            pruner=pruner,
+            study_name="gbm_tuning",
+        )
+
+        def _objective(trial):
+            params = self._suggest_gbm_params(trial)
+            train_data = lgb.Dataset(self.X_train_gbm, label=self.y_train_gbm)
+            val_data   = lgb.Dataset(self.X_val_gbm,   label=self.y_val_gbm,
+                                     reference=train_data)
+            n_est = params.pop("n_estimators", 3000)
+            callbacks = [
+                lgb.early_stopping(stopping_rounds=params.get("early_stopping_rounds", 100),
+                                   verbose=False),
+                lgb.log_evaluation(period=-1),
+            ]
+            bst = lgb.train(
+                params,
+                train_data,
+                num_boost_round=n_est,
+                valid_sets=[val_data],
+                callbacks=callbacks,
+            )
+            preds = bst.predict(self.X_val_gbm,
+                                num_iteration=bst.best_iteration)
+            metric = self.cfg["primary_metric"]
+            if metric == "rmse":
+                score = float(np.sqrt(mean_squared_error(self.y_val_gbm, preds)))
+            elif metric == "r2":
+                score = float(r2_score(self.y_val_gbm, preds))
+            else:
+                score = float(mean_absolute_error(self.y_val_gbm, preds))
+
+            # Report intermediate values for pruning
+            trial.report(score, step=bst.best_iteration)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+            return score
+
+        study.optimize(
+            _objective,
+            n_trials=self.cfg["gbm_n_trials"],
+            timeout=self.cfg.get("timeout_seconds"),
+            show_progress_bar=False,
+        )
+
+        best_trial = study.best_trial
+        best_params = self._suggest_from_frozen(best_trial.params)
+
+        logger.info(f"\n✅ GBM tuning complete — best {self.cfg['primary_metric']}: "
+                    f"{best_trial.value:.6f}")
+        logger.info(f"   Best params: {best_params}")
+
+        # Persist best params
+        results_path = self.study_dir / "best_gbm_params.json"
+        with open(results_path, "w") as f:
+            json.dump({"best_value": best_trial.value,
+                       "best_params": best_params}, f, indent=2)
+        logger.info(f"   Saved → {results_path}")
+
+        return best_params
+
+    def _suggest_from_frozen(self, frozen_params: dict) -> dict:
+        """Re-merge best Optuna params with non-tunable GBM defaults."""
+        base = dict(GBM_CONFIG["params"])
+        base.update(frozen_params)
+        return base
+
+    # ── CNN tuning ────────────────────────────────────────────────────────────
+
+    def tune_cnn(self, n_channels: int) -> dict:
+        """
+        Run a lightweight Optuna study for CNN training hyperparameters.
+
+        To keep tuning tractable the CNN is trained for a small number of
+        epochs per trial.  The best config is then used for the full run.
+
+        Returns
+        -------
+        dict
+            Updated TRAINING_CONFIG-compatible dict with best CNN hypers.
+        """
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            logger.warning("optuna not installed — skipping CNN tuning, using defaults")
+            return dict(TRAINING_CONFIG), TRAINING_CONFIG.get("dropout_rate", 0.3)
+
+        PROBE_EPOCHS = 20   # short probe to rank configs
+
+        logger.info("\n" + "="*60)
+        logger.info("CNN HYPERPARAMETER TUNING (Optuna — short probes)")
+        logger.info(f"  Trials       : {self.cfg['cnn_n_trials']}")
+        logger.info(f"  Probe epochs : {PROBE_EPOCHS}")
+        logger.info("="*60)
+
+        ss = self.cfg["cnn_search_space"]
+
+        def _objective(trial):
+            lr           = trial.suggest_float("initial_lr",   ss["initial_lr"]["low"],
+                                               ss["initial_lr"]["high"],
+                                               log=ss["initial_lr"].get("log", True))
+            wd           = trial.suggest_float("weight_decay", ss["weight_decay"]["low"],
+                                               ss["weight_decay"]["high"],
+                                               log=ss["weight_decay"].get("log", True))
+            dropout_rate = trial.suggest_float("dropout_rate", ss["dropout_rate"]["low"],
+                                               ss["dropout_rate"]["high"])
+            batch_size   = trial.suggest_categorical("batch_size", ss["batch_size"]["choices"])
+
+            # Build a small CNN with the trial dropout rate
+            probe_cnn = UNet(in_channels=n_channels, out_channels=1)
+            # Patch dropout rates uniformly for the probe
+            for module in probe_cnn.modules():
+                if isinstance(module, (nn.Dropout2d, nn.Dropout)):
+                    module.p = dropout_rate
+            initialize_weights(probe_cnn)
+            probe_cnn = probe_cnn.to(self.device)
+
+            optimizer = optim.AdamW(probe_cnn.parameters(), lr=lr, weight_decay=wd)
+            criterion = ProgressiveLSTLoss()
+
+            train_dataset = UHIDataset(self.X_train_raw, self.y_train_raw, augment=False)
+            val_dataset   = UHIDataset(self.X_val_raw,   self.y_val_raw,   augment=False)
+            train_loader  = DataLoader(train_dataset, batch_size=batch_size,
+                                       shuffle=True, num_workers=0, pin_memory=False)
+            val_loader    = DataLoader(val_dataset,   batch_size=batch_size,
+                                       shuffle=False, num_workers=0, pin_memory=False)
+
+            best_val_r2 = -float("inf")
+            for epoch in range(PROBE_EPOCHS):
+                probe_cnn.train()
+                for data, target in train_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    optimizer.zero_grad()
+                    output = probe_cnn(data)
+                    loss, _ = criterion(output, target)
+                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(probe_cnn.parameters(), 1.0)
+                        optimizer.step()
+
+                probe_cnn.eval()
+                all_preds, all_tgts = [], []
+                with torch.no_grad():
+                    for data, target in val_loader:
+                        out = probe_cnn(data.to(self.device))
+                        all_preds.append(out.cpu().numpy().reshape(len(out), -1).mean(1))
+                        all_tgts.append(target.numpy().reshape(len(target), -1).mean(1))
+                preds_flat = np.concatenate(all_preds)
+                tgts_flat  = np.concatenate(all_tgts)
+                val_r2 = float(r2_score(tgts_flat, preds_flat))
+
+                trial.report(val_r2, step=epoch)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+                best_val_r2 = max(best_val_r2, val_r2)
+
+            del probe_cnn
+            return best_val_r2
+
+        pruner = (optuna.pruners.MedianPruner(
+                      n_startup_trials=self.cfg["pruning_warmup_steps"])
+                  if self.cfg.get("pruning_enabled") else optuna.pruners.NopPruner())
+
+        study = optuna.create_study(
+            direction="maximize",       # maximise R²
+            sampler=self._make_sampler(),
+            pruner=pruner,
+            study_name="cnn_tuning",
+        )
+        study.optimize(
+            _objective,
+            n_trials=self.cfg["cnn_n_trials"],
+            timeout=self.cfg.get("timeout_seconds"),
+            show_progress_bar=False,
+        )
+
+        best = study.best_trial
+        best_cnn_config = dict(TRAINING_CONFIG)
+        best_cnn_config["initial_lr"]   = best.params["initial_lr"]
+        best_cnn_config["weight_decay"] = best.params["weight_decay"]
+        best_cnn_config["batch_size"]   = best.params["batch_size"]
+
+        logger.info(f"\n✅ CNN tuning complete — best val R²: {best.value:.4f}")
+        logger.info(f"   Best params: {best.params}")
+
+        results_path = self.study_dir / "best_cnn_params.json"
+        with open(results_path, "w") as f:
+            json.dump({"best_r2": best.value, "best_params": best.params}, f, indent=2)
+        logger.info(f"   Saved → {results_path}")
+
+        return best_cnn_config, best.params.get("dropout_rate", 0.3)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL COMPARISON  (GBM-only · CNN-only · Ensemble · CNN-as-Residual)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModelComparator:
+    """
+    Evaluates and plots four modelling strategies on the same validation set:
+
+    1. GBM-only          — pure LightGBM on hand-crafted + bottleneck features
+    2. CNN-only          — UNet spatial predictions averaged to patch-level
+    3. Ensemble          — weighted average CNN + GBM  (current default)
+    4. CNN-as-Residual   — GBM predicts first; CNN corrects the residual
+
+    All metrics are returned in denormalized °C when norm_stats is available.
+    """
+
+    def __init__(self, cnn_model, gbm_model, ensemble_weights: dict,
+                 device, norm_stats: dict = None):
+        self.cnn_model        = cnn_model
+        self.gbm_model        = gbm_model
+        self.ensemble_weights = ensemble_weights
+        self.device           = device
+        self.norm_stats       = norm_stats
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _get_cnn_preds(self, X_torch: torch.Tensor) -> np.ndarray:
+        self.cnn_model.eval()
+        with torch.no_grad():
+            out = self.cnn_model(X_torch.to(self.device))
+        return out.cpu().numpy().reshape(len(X_torch), -1).mean(axis=1)
+
+    def _get_gbm_preds(self, X_gbm: pd.DataFrame) -> np.ndarray:
+        return self.gbm_model.predict(X_gbm,
+                                      num_iteration=self.gbm_model.best_iteration)
+
+    @staticmethod
+    def _metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
+        mask = np.isfinite(preds) & np.isfinite(targets)
+        p, t = preds[mask], targets[mask]
+        if len(p) < 2:
+            return dict(r2=float("nan"), rmse=float("nan"),
+                        mae=float("nan"), mbe=float("nan"),
+                        slope=float("nan"), std_ratio=float("nan"))
+        from scipy.stats import linregress as _lr
+        slope, intercept, *_ = _lr(t, p)
+        rmse = float(np.sqrt(mean_squared_error(t, p)))
+        pred_std   = float(np.std(p))
+        target_std = float(np.std(t))
+        std_ratio  = pred_std / target_std if target_std > 0 else float("nan")
+        return dict(
+            r2=float(r2_score(t, p)),
+            rmse=rmse,
+            mae=float(mean_absolute_error(t, p)),
+            mbe=float((p - t).mean()),
+            slope=float(slope),
+            intercept=float(intercept),
+            std_ratio=std_ratio,
+        )
+
+    def _denorm(self, arr: np.ndarray) -> np.ndarray:
+        if self.norm_stats is None or "target" not in self.norm_stats:
+            return arr
+        m = self.norm_stats["target"]["mean"]
+        s = self.norm_stats["target"]["std"]
+        return arr * s + m
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def compare(
+        self,
+        X_val_raw: np.ndarray,
+        y_val_raw: np.ndarray,
+        X_val_gbm: pd.DataFrame,
+    ) -> dict:
+        """
+        Run all four strategies and return a metrics dict keyed by strategy name.
+
+        CONSISTENCY FIX: previously this path blended raw normalized predictions
+        directly (ens_norm = w_cnn*cnn_norm + w_gbm*gbm_norm), while
+        evaluate_ensemble z-scored each stream to the target distribution before
+        blending.  These produce different numbers for the same data, causing
+        the two comparison tables to disagree.
+
+        Both paths now use the shared EnsembleTrainer._blend_normalized helper
+        (replicated inline here since ModelComparator is stateless) so the
+        Ensemble and CNN-Residual rows are identical in both tables.
+
+        Parameters
+        ----------
+        X_val_raw : (N, H, W, C) normalised numpy array — CNN input
+        y_val_raw : (N, H, W, 1) normalised numpy array — targets
+        X_val_gbm : pd.DataFrame                        — GBM features
+        """
+        # Targets: patch-mean in normalized space, then denormalised
+        y_patch_norm = y_val_raw.reshape(len(y_val_raw), -1).mean(axis=1)
+        y_patch_deg  = self._denorm(y_patch_norm)
+
+        # Convert to torch once
+        X_torch = torch.FloatTensor(
+            np.transpose(X_val_raw, (0, 3, 1, 2))
+            if X_val_raw.ndim == 4 and X_val_raw.shape[-1] < X_val_raw.shape[1]
+            else X_val_raw
+        )
+
+        results = {}
+
+        # ── 1. CNN-only ───────────────────────────────────────────────────────
+        cnn_norm = self._get_cnn_preds(X_torch)
+        cnn_deg  = self._denorm(cnn_norm)
+        results["CNN-only"] = self._metrics(cnn_deg, y_patch_deg)
+        results["CNN-only"]["preds"] = cnn_deg
+
+        # ── 2. GBM-only ───────────────────────────────────────────────────────
+        gbm_norm = self._get_gbm_preds(X_val_gbm)
+        gbm_deg  = self._denorm(gbm_norm)
+        results["GBM-only"] = self._metrics(gbm_deg, y_patch_deg)
+        results["GBM-only"]["preds"] = gbm_deg
+
+        # ── 3. Ensemble (weighted average) — unified blending ─────────────────
+        # Use the same z-score-then-rescale logic as evaluate_ensemble so both
+        # tables always report identical Ensemble scores.
+        w_cnn = self.ensemble_weights.get("cnn", 0.35)
+        w_gbm = self.ensemble_weights.get("gbm", 0.55)
+        w_sum = w_cnn + w_gbm + 1e-12
+
+        tgt_mean = float(y_patch_norm.mean())
+        tgt_std  = float(y_patch_norm.std()) + 1e-8
+        cnn_z    = (cnn_norm - cnn_norm.mean()) / (cnn_norm.std() + 1e-8)
+        gbm_z    = (gbm_norm - gbm_norm.mean()) / (gbm_norm.std() + 1e-8)
+        blend_z  = (w_cnn * cnn_z + w_gbm * gbm_z) / w_sum
+        ens_norm = blend_z * tgt_std + tgt_mean
+        ens_deg  = self._denorm(ens_norm)
+        results["Ensemble"] = self._metrics(ens_deg, y_patch_deg)
+        results["Ensemble"]["preds"] = ens_deg
+
+        # ── 4. CNN-as-Residual — unified with evaluate_ensemble ───────────────
+        # GBM anchors the prediction; CNN rescaled to target scale nudges it.
+        # Uses the same alpha=w_cnn/(w_cnn+w_gbm) weighting as Strategy C.
+        cnn_rescaled_norm = (cnn_z * tgt_std) + tgt_mean     # CNN in target scale
+        alpha = w_cnn / w_sum
+        residual_norm = gbm_norm + alpha * (cnn_rescaled_norm - gbm_norm)
+        residual_deg  = self._denorm(residual_norm)
+        results["CNN-Residual"] = self._metrics(residual_deg, y_patch_deg)
+        results["CNN-Residual"]["preds"] = residual_deg
+
+        return results, y_patch_deg
+
+    def log_comparison(self, results: dict):
+        """Pretty-print the four-way comparison table to the logger."""
+        logger.info("\n" + "="*84)
+        logger.info("MODEL COMPARISON — 4 STRATEGIES")
+        logger.info("="*84)
+        header = (f"{'Strategy':<18} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} "
+                  f"{'MBE(°C)':>9} {'Slope':>7} {'StdRat':>8}")
+        logger.info(header)
+        logger.info("-"*84)
+        for name, m in results.items():
+            logger.info(
+                f"{name:<18} {m['r2']:>7.4f} {m['rmse']:>10.4f} "
+                f"{m['mae']:>9.4f} {m.get('mbe', float('nan')):>9.4f} "
+                f"{m.get('slope', float('nan')):>7.3f} "
+                f"{m.get('std_ratio', float('nan')):>8.3f}"
+            )
+        logger.info("="*84)
+
+    def plot_comparison(self, results: dict, y_true: np.ndarray,
+                        save_dir: Path):
+        """
+        Generate a comprehensive 4-strategy comparison figure saved under save_dir.
+
+        Panels
+        ------
+        Row 1 : Bar charts for R², RMSE, MAE
+        Row 2 : Predicted-vs-actual scatter (one subplot per strategy)
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        strategies = list(results.keys())
+        colors     = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0"]
+        metrics    = [("r2", "R²", True), ("rmse", "RMSE (°C)", False),
+                      ("mae", "MAE (°C)", False), ("mbe", "MBE (°C)", False),
+                      ("slope", "Slope", True), ("std_ratio", "Std Ratio", True)]
+
+        fig = plt.figure(figsize=(24, 14))
+        gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.48, wspace=0.35)
+        fig.suptitle("4-Strategy Model Comparison", fontsize=15, fontweight="bold")
+
+        # ── Row 0–1: bar charts (6 metrics, 3 per row) ───────────────────────
+        for idx, (mkey, mlabel, higher_better) in enumerate(metrics):
+            row = idx // 3
+            col = idx % 3
+            ax   = fig.add_subplot(gs[row, col])
+            vals = [results[s].get(mkey, float("nan")) for s in strategies]
+            bars = ax.bar(strategies, vals, color=colors, edgecolor="white", width=0.5)
+            ax.set_title(mlabel, fontsize=10, fontweight="bold")
+            ax.set_ylabel(mlabel, fontsize=9)
+            ax.set_xticklabels(strategies, rotation=22, ha="right", fontsize=8)
+            for bar, v in zip(bars, vals):
+                if np.isfinite(v):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + max(abs(v) * 0.01, 0.001),
+                            f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+            if mkey == "r2":
+                ax.axhline(0.85, ls="--", color="gray", lw=0.9, label="Target 0.85")
+                ax.legend(fontsize=7)
+            elif mkey == "slope":
+                ax.axhline(1.0, ls="--", color="green", lw=0.9, label="Ideal (1.0)")
+                ax.legend(fontsize=7)
+            elif mkey == "std_ratio":
+                ax.axhline(1.0, ls="--", color="green", lw=0.9, label="Ideal (1.0)")
+                ax.legend(fontsize=7)
+            elif mkey == "mbe":
+                ax.axhline(0.0, ls="--", color="green", lw=0.9, label="Ideal (0)")
+                ax.legend(fontsize=7)
+
+        # Best-vs-worst summary in 4th cell of row 1
+        ax_txt = fig.add_subplot(gs[1, 3])
+        ax_txt.axis("off")
+        best_r2_strat  = max(strategies, key=lambda s: results[s].get("r2", -999))
+        best_rmse_strat = min(strategies, key=lambda s: results[s].get("rmse", 999))
+        summary = (
+            "SUMMARY\n"
+            "───────────────────────\n"
+            f"Best R²  : {best_r2_strat}\n"
+            f"  {results[best_r2_strat]['r2']:.4f}\n\n"
+            f"Best RMSE: {best_rmse_strat}\n"
+            f"  {results[best_rmse_strat]['rmse']:.4f} °C\n\n"
+            "Weights (Ensemble)\n"
+            f"  CNN={self.ensemble_weights.get('cnn',0.35):.2f}  "
+            f"GBM={self.ensemble_weights.get('gbm',0.55):.2f}"
+        )
+        ax_txt.text(0.05, 0.95, summary, transform=ax_txt.transAxes,
+                    fontsize=9, va="top", family="monospace",
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="#F5F5F5", alpha=0.8))
+
+        # ── Row 2: pred-vs-actual per strategy ───────────────────────────────
+        for col, (name, color) in enumerate(zip(strategies, colors)):
+            ax   = fig.add_subplot(gs[2, col])
+            preds = results[name].get("preds", np.array([]))
+            mask  = np.isfinite(preds) & np.isfinite(y_true)
+            p_m, t_m = preds[mask], y_true[mask]
+            if len(p_m) > 1:
+                ax.scatter(t_m, p_m, alpha=0.25, s=8, color=color)
+                lo = min(t_m.min(), p_m.min()); hi = max(t_m.max(), p_m.max())
+                ax.plot([lo, hi], [lo, hi], "k--", lw=1.0)
+                ax.set_xlabel("Actual (°C)", fontsize=8)
+                ax.set_ylabel("Predicted (°C)", fontsize=8)
+                r2 = results[name].get("r2", float("nan"))
+                rmse = results[name].get("rmse", float("nan"))
+                ax.set_title(f"{name}\nR²={r2:.3f}  RMSE={rmse:.3f}°C",
+                             fontsize=9, fontweight="bold")
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_title(name, fontsize=9)
+
+        out_path = save_dir / "model_comparison_4way.png"
+        fig.savefig(out_path, dpi=DIAGNOSTICS_CONFIG["save_dpi"], bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  ✅ 4-way comparison figure saved → {out_path}")
+
+
 def create_temperature_stratified_sampler(y_train):
     """
     Create a sampler that balances temperature ranges so the model sees equal
@@ -1198,10 +1787,33 @@ class CheckpointManager:
 class EnsembleTrainer:
     """Ensemble trainer combining CNN and GBM - Uses BEST models"""
     
-    def __init__(self, cnn_model, device, config=TRAINING_CONFIG):
+    def __init__(self, cnn_model, device, config=TRAINING_CONFIG,
+                 dataset_dir: Path = None, model_dir: Path = None):
+        """
+        Args:
+            cnn_model:   Initialised UNet instance.
+            device:      Torch device.
+            config:      Training hyper-parameters (default: TRAINING_CONFIG).
+            dataset_dir: Dataset root produced by preprocessing.py.  Determines
+                         where normalization_stats.json is read from and which
+                         input-channel count to expect.  Supported values:
+                           • PROCESSED_DATA_DIR / "cnn_dataset_landsat"  (Landsat-only)
+                           • PROCESSED_DATA_DIR / "cnn_dataset_fusion"   (fusion)
+                         Defaults to PROCESSED_DATA_DIR / "cnn_dataset" for
+                         backward compatibility.
+            model_dir:   Directory for checkpoints / diagnostics / saved models.
+                         Defaults to MODEL_DIR from config.py.  When training
+                         multiple variants pass separate dirs so artefacts don't
+                         overwrite each other, e.g. MODEL_DIR / "landsat_only" and
+                         MODEL_DIR / "fusion".
+        """
         self.cnn_model = cnn_model.to(device)
         self.device = device
         self.config = config
+        # Dataset and output directories — variant-aware
+        self.dataset_dir = Path(dataset_dir) if dataset_dir is not None else PROCESSED_DATA_DIR / "cnn_dataset"
+        self.model_dir   = Path(model_dir)   if model_dir   is not None else MODEL_DIR
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         
         # CNN components - IMPROVED LOSS FUNCTION
         self.criterion = ProgressiveLSTLoss()
@@ -1255,12 +1867,12 @@ class EnsembleTrainer:
         
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
-            save_dir=MODEL_DIR / "checkpoints",
+            save_dir=self.model_dir / "checkpoints",
             metrics=CHECKPOINT_CONFIG["metrics"],
         )
 
-        # Diagnostics plotter — saves all figures to MODEL_DIR/diagnostics/
-        self.plotter = DiagnosticsPlotter(save_dir=MODEL_DIR / "diagnostics")
+        # Diagnostics plotter — saves all figures to <model_dir>/diagnostics/
+        self.plotter = DiagnosticsPlotter(save_dir=self.model_dir / "diagnostics")
 
         # History
         self.history = {
@@ -1497,7 +2109,7 @@ class EnsembleTrainer:
             # Persist PCA so uhi_inference.py can apply the same projection
             _pca_path = getattr(self, '_save_dir', None)
             if _pca_path is None:
-                _pca_path = MODEL_DIR
+                _pca_path = self.model_dir
             try:
                 joblib.dump(pca, Path(_pca_path) / "bottleneck_pca.pkl")
                 logger.info(f"  💾 Saved bottleneck PCA → {Path(_pca_path) / 'bottleneck_pca.pkl'}")
@@ -1552,37 +2164,178 @@ class EnsembleTrainer:
 
         return val_metrics
     
-    def compute_optimal_weights(self, cnn_metrics, gbm_metrics):
+    # ── shared blend helper ───────────────────────────────────────────────────
+    @staticmethod
+    def _blend_normalized(
+        cnn_norm: np.ndarray,
+        gbm_norm: np.ndarray,
+        targets_norm: np.ndarray,
+        w_cnn: float,
+        w_gbm: float,
+    ) -> np.ndarray:
         """
-        Compute optimal weights based on model performance
-        Uses inverse RMSE weighting
+        Unified blending in normalized space — used by both evaluate_ensemble and
+        ModelComparator so the two comparison tables are always consistent.
+
+        Both inputs are z-score standardised to the TARGET distribution before
+        weighting so predictions from models with different scales are combined
+        fairly.  The result is rescaled back to the target distribution.
+
+        Parameters
+        ----------
+        cnn_norm    : (N,) CNN patch-mean predictions, already normalized
+        gbm_norm    : (N,) GBM predictions, already normalized
+        targets_norm: (N,) ground-truth targets, normalized (used only for scale)
+        w_cnn, w_gbm: raw (un-normalized) blend weights
+
+        Returns
+        -------
+        blend_norm  : (N,) blended predictions in the same normalized scale as targets
         """
-        cnn_rmse = cnn_metrics['rmse']
-        gbm_rmse = gbm_metrics['rmse']
-        
-        # If CNN is terrible (R² < 0.2), don't use it
+        tgt_mean = float(targets_norm.mean())
+        tgt_std  = float(targets_norm.std()) + 1e-8
+
+        # Z-score each stream independently then rescale to target distribution
+        cnn_z = (cnn_norm - cnn_norm.mean()) / (cnn_norm.std() + 1e-8)
+        gbm_z = (gbm_norm - gbm_norm.mean()) / (gbm_norm.std() + 1e-8)
+
+        w_sum = w_cnn + w_gbm + 1e-12
+        blend_z = (w_cnn * cnn_z + w_gbm * gbm_z) / w_sum
+        return blend_z * tgt_std + tgt_mean
+
+    # ── improved ensemble weighting ───────────────────────────────────────────
+    def compute_optimal_weights(
+        self,
+        cnn_metrics: dict,
+        gbm_metrics: dict,
+        cnn_preds_norm: np.ndarray = None,
+        gbm_preds_norm: np.ndarray = None,
+        targets_norm:   np.ndarray = None,
+    ) -> dict:
+        """
+        Compute optimal ensemble weights using ridge-regression stacking when
+        enough data are available, falling back to inverse-RMSE weighting otherwise.
+
+        Improvement over the old inverse-RMSE approach
+        -----------------------------------------------
+        Inverse-RMSE assigns weight proportional to 1/RMSE, which treats each
+        model as if it makes independent errors.  In practice the errors are
+        correlated (both models see the same input), so the optimal blend
+        coefficients depend on the cross-correlation between residuals, not just
+        the marginal RMSEs.
+
+        Ridge stacking fits:
+            blend = alpha_cnn * cnn_z + alpha_gbm * gbm_z
+        on the same validation set used for evaluation.  The ridge penalty
+        prevents one coefficient from collapsing to zero due to multicollinearity.
+        Weights are then derived from the fitted coefficients (clipped to [0,1]
+        and renormalized) so the ensemble remains a convex combination.
+
+        Uncertainty-aware fallback
+        --------------------------
+        If stacking is not possible (< 30 samples) we fall back to inverse-RMSE
+        weighting with a correlation discount:
+            effective_rmse = rmse * (1 + 0.5 * |corr(cnn_err, gbm_err)|)
+        This penalizes models whose errors are highly correlated with the other
+        model's errors, giving higher weight to the more independent predictor.
+
+        Parameters
+        ----------
+        cnn_metrics, gbm_metrics : metric dicts from _calculate_metrics
+        cnn_preds_norm  : (N,) CNN predictions in normalized space  [optional]
+        gbm_preds_norm  : (N,) GBM predictions in normalized space  [optional]
+        targets_norm    : (N,) ground-truth in normalized space      [optional]
+
+        Returns
+        -------
+        dict with keys 'cnn' and 'gbm' (floats, sum to 1)
+        """
+        # Fallback triggers
         if cnn_metrics['r2'] < 0.2:
             logger.warning("⚠️ CNN R² < 0.2, using GBM only")
             return {"cnn": 0.0, "gbm": 1.0}
-        
-        # If GBM is terrible (shouldn't happen), don't use it
         if gbm_metrics['r2'] < 0.2:
             logger.warning("⚠️ GBM R² < 0.2, using CNN only")
             return {"cnn": 1.0, "gbm": 0.0}
-        
-        # Inverse RMSE weighting
-        cnn_weight = (1 / cnn_rmse)
-        gbm_weight = (1 / gbm_rmse)
-        
-        total = cnn_weight + gbm_weight
-        cnn_weight = cnn_weight / total
-        gbm_weight = gbm_weight / total
-        
-        logger.info(f"Optimal weights computed:")
-        logger.info(f"  CNN: {cnn_weight:.4f} (RMSE: {cnn_rmse:.4f}°C, R²: {cnn_metrics['r2']:.4f})")
-        logger.info(f"  GBM: {gbm_weight:.4f} (RMSE: {gbm_rmse:.4f}°C, R²: {gbm_metrics['r2']:.4f})")
-        
-        return {"cnn": cnn_weight, "gbm": gbm_weight}
+
+        # ── Try ridge stacking ────────────────────────────────────────────────
+        MIN_STACK_SAMPLES = 30
+        if (cnn_preds_norm is not None and gbm_preds_norm is not None
+                and targets_norm is not None
+                and len(cnn_preds_norm) >= MIN_STACK_SAMPLES):
+            try:
+                # Z-score both streams to target scale (same as _blend_normalized)
+                tgt_std  = float(targets_norm.std()) + 1e-8
+                tgt_mean = float(targets_norm.mean())
+                cnn_z = (cnn_preds_norm - cnn_preds_norm.mean()) / (cnn_preds_norm.std() + 1e-8)
+                gbm_z = (gbm_preds_norm - gbm_preds_norm.mean()) / (gbm_preds_norm.std() + 1e-8)
+
+                X_stack = np.column_stack([cnn_z, gbm_z])   # (N, 2)
+                y_stack = (targets_norm - tgt_mean) / tgt_std  # z-scored targets
+
+                # Fit ridge with positive=False so coefficients can be negative
+                # (rare but valid when models are anti-correlated)
+                ridge = Ridge(alpha=1.0, fit_intercept=False)
+                ridge.fit(X_stack, y_stack)
+                coef = ridge.coef_   # [alpha_cnn, alpha_gbm]
+
+                # Clip negatives and renormalize to a convex combination
+                coef_pos = np.clip(coef, 0, None)
+                coef_sum = coef_pos.sum()
+
+                if coef_sum < 1e-6:
+                    # Ridge collapsed both to zero — fallback to inverse-RMSE
+                    raise ValueError("Ridge coefficients both non-positive; using fallback")
+
+                w_cnn = float(coef_pos[0] / coef_sum)
+                w_gbm = float(coef_pos[1] / coef_sum)
+
+                # Evaluate the stacked blend on the same val set
+                blend_z = (coef_pos[0] * cnn_z + coef_pos[1] * gbm_z) / coef_sum
+                blend   = blend_z * tgt_std + tgt_mean
+                stack_r2 = float(r2_score(targets_norm, blend))
+
+                logger.info("✅ Ridge-stacking weights computed:")
+                logger.info(f"   CNN coef={coef[0]:.4f}  GBM coef={coef[1]:.4f}  "
+                            f"(raw ridge, before clip+renorm)")
+                logger.info(f"   Final weights: CNN={w_cnn:.4f}  GBM={w_gbm:.4f}")
+                logger.info(f"   Stacked val R²={stack_r2:.4f}")
+
+                # Cache ridge model for persistence
+                self._stacking_ridge = ridge
+                return {"cnn": w_cnn, "gbm": w_gbm}
+
+            except Exception as _se:
+                logger.warning(f"⚠️ Ridge stacking failed ({_se}); falling back to "
+                               f"correlation-discounted inverse-RMSE")
+
+        # ── Fallback: correlation-discounted inverse-RMSE ─────────────────────
+        cnn_rmse = cnn_metrics['rmse'] + 1e-8
+        gbm_rmse = gbm_metrics['rmse'] + 1e-8
+
+        if (cnn_preds_norm is not None and gbm_preds_norm is not None
+                and targets_norm is not None):
+            cnn_err = cnn_preds_norm - targets_norm
+            gbm_err = gbm_preds_norm - targets_norm
+            corr = float(np.corrcoef(cnn_err, gbm_err)[0, 1])
+            discount = 1.0 + 0.5 * abs(corr)
+            cnn_eff = cnn_rmse * discount
+            gbm_eff = gbm_rmse * discount
+            logger.info(f"  Error correlation={corr:.3f}  discount={discount:.3f}")
+        else:
+            cnn_eff = cnn_rmse
+            gbm_eff = gbm_rmse
+
+        cnn_w_raw = 1.0 / cnn_eff
+        gbm_w_raw = 1.0 / gbm_eff
+        total     = cnn_w_raw + gbm_w_raw
+        w_cnn     = float(cnn_w_raw / total)
+        w_gbm     = float(gbm_w_raw / total)
+
+        logger.info("Inverse-RMSE (correlation-discounted) weights:")
+        logger.info(f"  CNN: {w_cnn:.4f}  (RMSE={cnn_rmse:.4f}°C  R²={cnn_metrics['r2']:.4f})")
+        logger.info(f"  GBM: {w_gbm:.4f}  (RMSE={gbm_rmse:.4f}°C  R²={gbm_metrics['r2']:.4f})")
+        return {"cnn": w_cnn, "gbm": w_gbm}
     
     def diagnose_cnn_issues(self):
         """
@@ -1694,26 +2447,49 @@ class EnsembleTrainer:
         logger.info(f"  GBM:          mean={gbm_preds.mean():.4f}  std={gbm_preds.std():.4f}")
 
         # ── Strategy C: Normalised weighted average ───────────────────────────
-        tgt_mean, tgt_std = y_val_gbm.mean(), y_val_gbm.std() + 1e-8
-        cnn_norm = (cnn_patch_mean - cnn_patch_mean.mean()) / (cnn_patch_mean.std() + 1e-8)
-        gbm_norm = (gbm_preds       - gbm_preds.mean())       / (gbm_preds.std()       + 1e-8)
-
-        opt_w    = self.compute_optimal_weights(cnn_metrics, gbm_metrics)
-        blend    = opt_w["cnn"] * cnn_norm + opt_w["gbm"] * gbm_norm
-        blend_sc = blend * tgt_std + tgt_mean                          # back to target scale
+        # Use the shared _blend_normalized helper so this path and ModelComparator
+        # produce identical scores for the same inputs (fixes the discrepancy
+        # between the two comparison tables).
+        opt_w = self.compute_optimal_weights(
+            cnn_metrics, gbm_metrics,
+            cnn_preds_norm=cnn_patch_mean,
+            gbm_preds_norm=gbm_preds,
+            targets_norm=y_val_gbm,
+        )
+        blend_sc = self._blend_normalized(
+            cnn_patch_mean, gbm_preds, y_val_gbm,
+            w_cnn=opt_w["cnn"], w_gbm=opt_w["gbm"],
+        )
         weighted_metrics = self._calculate_metrics(blend_sc, y_val_gbm, "Weighted Ensemble")
 
         # ── Strategy D: CNN-as-residual ───────────────────────────────────────
-        # GBM provides the patch-mean prediction; the CNN corrects the spatial
-        # deviation within each patch.  No granularity mismatch.
-        #   final(x,y) = gbm_patch_mean + (cnn_pixel(x,y) - cnn_patch_mean)
-        # We evaluate on patch means (same target as GBM).
-        cnn_deviation = cnn_preds_4d.reshape(cnn_preds_4d.shape[0], -1) \
-                        - cnn_patch_mean[:, np.newaxis]                 # (N, H*W)
-        # Residual patch-mean prediction = GBM + mean deviation (should be ~0, serves as sanity check)
-        residual_patch_mean = gbm_preds + cnn_deviation.mean(axis=1)
+        # GBM predicts the patch mean; CNN provides a correction term.
+        #
+        # BUG FIX (previous session): cnn_deviation.mean(axis=1) was identically
+        # zero (mean of deviations from mean), making CNN-Residual == GBM-only.
+        #
+        # Correct approach: z-score the CNN patch-mean predictions to the target
+        # distribution, then let CNN nudge GBM by alpha * (CNN_rescaled - GBM).
+        # alpha is opt_w["cnn"] so the same trust level applies here as in blend.
+        tgt_std  = float(y_val_gbm.std()) + 1e-8
+        tgt_mean = float(y_val_gbm.mean())
+        cnn_rescaled = (
+            (cnn_patch_mean - cnn_patch_mean.mean()) /
+            (cnn_patch_mean.std() + 1e-8)
+        ) * tgt_std + tgt_mean
+        alpha_residual = opt_w["cnn"]
+        residual_patch_mean = gbm_preds + alpha_residual * (cnn_rescaled - gbm_preds)
         residual_metrics = self._calculate_metrics(
             residual_patch_mean, y_val_gbm, "CNN-as-Residual")
+
+        # Persist stacking ridge coefficients if available
+        if hasattr(self, '_stacking_ridge'):
+            try:
+                joblib.dump(self._stacking_ridge,
+                            self.model_dir / "stacking_ridge.pkl")
+                logger.info("  💾 Stacking ridge model saved → stacking_ridge.pkl")
+            except Exception as _e:
+                logger.warning(f"  Could not save stacking ridge: {_e}")
 
         # ── Compare all strategies ────────────────────────────────────────────
         all_results = [
@@ -1723,16 +2499,17 @@ class EnsembleTrainer:
             ("CNN-as-Residual",   residual_metrics,  {"cnn": "residual", "gbm": 1.0}),
         ]
 
-        logger.info("\n" + "="*70)
+        logger.info("\n" + "="*84)
         logger.info("ENSEMBLE STRATEGY COMPARISON")
-        logger.info("="*70)
-        logger.info(f"{'Strategy':<22} {'R²':>8} {'RMSE(°C)':>10} {'MAE(°C)':>9} {'Slope':>7} {'StdRat':>8}")
-        logger.info("-"*70)
+        logger.info("="*84)
+        logger.info(f"{'Strategy':<22} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} {'MBE(°C)':>9} {'Slope':>7} {'StdRat':>8}")
+        logger.info("-"*84)
         for name, m, _ in all_results:
             logger.info(
-                f"{name:<22} {m['r2']:>8.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f} "
+                f"{name:<22} {m['r2']:>7.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f} "
+                f"{m.get('mbe', float('nan')):>9.4f} "
                 f"{m.get('slope', float('nan')):>7.3f} {m.get('std_ratio', float('nan')):>8.3f}")
-        logger.info("="*70)
+        logger.info("="*84)
 
         best_name, best_metrics, best_weights = max(
             all_results, key=lambda x: x[1]['r2'])
@@ -1767,7 +2544,9 @@ class EnsembleTrainer:
         Includes slope and std_ratio to detect range compression and variance collapse.
         """
         # Load normalization stats for denormalization
-        norm_stats = load_normalization_stats()
+        # Use the dataset_dir this trainer was initialised with so the correct
+        # stats file is used regardless of which variant is being trained.
+        norm_stats = load_normalization_stats(self.dataset_dir)
         
         # Denormalize predictions and targets to Celsius for metrics
         if norm_stats is not None:
@@ -1834,7 +2613,104 @@ class EnsembleTrainer:
         
         save_dir.mkdir(parents=True, exist_ok=True)
         self._save_dir = save_dir  # expose to train_gbm so PCA is saved alongside models
-        
+
+        # ── PHASE 0: Hyperparameter Tuning (optional) ─────────────────────────
+        tuning_cfg = HYPERPARAM_TUNING_CONFIG
+        if tuning_cfg.get("enabled", False):
+            logger.info("\n" + "="*60)
+            logger.info("PHASE 0: HYPERPARAMETER TUNING")
+            logger.info("="*60)
+
+            study_dir = self.model_dir / tuning_cfg.get("study_dir", "tuning")
+
+            # Prepare GBM features first so the tuner has them
+            logger.info("Extracting bottleneck features for tuning GBM search space…")
+            try:
+                _bot_tr = extract_cnn_bottleneck_features(
+                    X_train, self.cnn_model, device=str(self.device))
+                _bot_vl = extract_cnn_bottleneck_features(
+                    X_val,   self.cnn_model, device=str(self.device))
+                _pca_tune = PCA(
+                    n_components=GBM_CONFIG.get("bottleneck_pca_components", 32),
+                    random_state=42)
+                _bot_tr = _pca_tune.fit_transform(_bot_tr)
+                _bot_vl = _pca_tune.transform(_bot_vl)
+            except Exception as _te:
+                logger.warning(f"Bottleneck extraction for tuning failed ({_te}); "
+                               f"tuning will use hand-crafted GBM features only")
+                _bot_tr = _bot_vl = None
+
+            _X_tr_gbm, _y_tr_gbm = prepare_gbm_features(X_train, y_train, _bot_tr)
+            _X_vl_gbm, _y_vl_gbm = prepare_gbm_features(X_val,   y_val,   _bot_vl)
+
+            n_channels = X_train.shape[-1] if X_train.ndim == 4 else CNN_CONFIG["input_channels"]
+
+            tuner = HyperparameterTuner(
+                X_train_gbm=_X_tr_gbm, y_train_gbm=_y_tr_gbm,
+                X_val_gbm=_X_vl_gbm,   y_val_gbm=_y_vl_gbm,
+                X_train_raw=X_train,    y_train_raw=y_train,
+                X_val_raw=X_val,        y_val_raw=y_val,
+                device=self.device,
+                study_dir=study_dir,
+            )
+
+            # ── Tune GBM ──────────────────────────────────────────────────────
+            best_gbm_params = tuner.tune_gbm()
+            self.gbm_trainer = GBMTrainer(config=best_gbm_params)
+            logger.info("✅ GBM trainer updated with tuned params")
+
+            # ── Tune CNN ──────────────────────────────────────────────────────
+            best_cnn_config, best_dropout = tuner.tune_cnn(n_channels=n_channels)
+
+            # Apply tuned dropout to CNN model
+            for module in self.cnn_model.modules():
+                if isinstance(module, (nn.Dropout2d, nn.Dropout)):
+                    module.p = best_dropout
+
+            # Re-build optimizer and scheduler with tuned LR / WD
+            lwd = LAYERWISE_WEIGHT_DECAY
+            self.optimizer = optim.AdamW(
+                [
+                    {"params": self.cnn_model.enc1.parameters(),      "weight_decay": lwd["enc1"]},
+                    {"params": self.cnn_model.enc2.parameters(),      "weight_decay": lwd["enc2"]},
+                    {"params": self.cnn_model.enc3.parameters(),      "weight_decay": lwd["enc3"]},
+                    {"params": self.cnn_model.enc4.parameters(),      "weight_decay": lwd["enc4"]},
+                    {"params": self.cnn_model.bottleneck.parameters(),"weight_decay": lwd["bottleneck"]},
+                    {"params": self.cnn_model.dec4.parameters(),      "weight_decay": lwd["dec4"]},
+                    {"params": self.cnn_model.dec3.parameters(),      "weight_decay": lwd["dec3"]},
+                    {"params": self.cnn_model.dec2.parameters(),      "weight_decay": lwd["dec2"]},
+                    {"params": self.cnn_model.dec1.parameters(),      "weight_decay": lwd["dec1"]},
+                    {"params": self.cnn_model.output.parameters(),    "weight_decay": lwd["output"]},
+                ],
+                lr=best_cnn_config["initial_lr"],
+                weight_decay=best_cnn_config["weight_decay"],
+            )
+            self.scheduler  = self._create_scheduler()
+            self.config     = best_cnn_config   # update batch_size etc.
+
+            # Rebuild DataLoaders with tuned batch size if it changed
+            tuned_bs = best_cnn_config.get("batch_size", TRAINING_CONFIG["batch_size"])
+            if tuned_bs != TRAINING_CONFIG["batch_size"]:
+                logger.info(f"Re-building DataLoaders with tuned batch_size={tuned_bs}")
+                _tr_ds = train_loader.dataset
+                _vl_ds = val_loader.dataset
+                _sampler = create_temperature_stratified_sampler(y_train)
+                train_loader = DataLoader(
+                    _tr_ds, batch_size=tuned_bs, sampler=_sampler,
+                    num_workers=COMPUTE_CONFIG["num_workers"],
+                    pin_memory=COMPUTE_CONFIG["pin_memory"],
+                )
+                val_loader = DataLoader(
+                    _vl_ds, batch_size=tuned_bs, shuffle=False,
+                    num_workers=COMPUTE_CONFIG["num_workers"],
+                    pin_memory=COMPUTE_CONFIG["pin_memory"],
+                )
+
+            logger.info("="*60)
+            logger.info("PHASE 0 COMPLETE — proceeding with tuned hyperparameters")
+            logger.info("="*60)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Train GBM first (independent of CNN)
         gbm_metrics = self.train_gbm(X_train, y_train, X_val, y_val)
         self.history["gbm_metrics"].append(gbm_metrics)  # FIX 1: store so summary dashboard has GBM data
@@ -2060,6 +2936,57 @@ class EnsembleTrainer:
         logger.info("="*60)
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── PHASE FINAL: 4-Way Model Comparison ───────────────────────────────
+        logger.info("\n" + "="*60)
+        logger.info("PHASE FINAL: 4-WAY MODEL COMPARISON")
+        logger.info("  GBM-only · CNN-only · Ensemble · CNN-as-Residual")
+        logger.info("="*60)
+        try:
+            _norm_stats_cmp = load_normalization_stats(self.dataset_dir)
+            _gbm_model_cmp  = self.gbm_trainer.best_model or self.gbm_trainer.model
+            _X_vl_gbm_cmp   = getattr(self, '_X_val_gbm', None)
+
+            if _gbm_model_cmp is not None and _X_vl_gbm_cmp is not None:
+                comparator = ModelComparator(
+                    cnn_model=self.cnn_model,
+                    gbm_model=_gbm_model_cmp,
+                    ensemble_weights=self.ensemble_weights,
+                    device=self.device,
+                    norm_stats=_norm_stats_cmp,
+                )
+                comparison_results, y_true_deg = comparator.compare(
+                    X_val_raw=X_val,
+                    y_val_raw=y_val,
+                    X_val_gbm=_X_vl_gbm_cmp,
+                )
+                comparator.log_comparison(comparison_results)
+                comparator.plot_comparison(
+                    results=comparison_results,
+                    y_true=y_true_deg,
+                    save_dir=self.model_dir / "diagnostics",
+                )
+                # Persist comparison metrics to JSON for external analysis
+                _cmp_path = save_dir / "model_comparison_4way.json"
+                _cmp_serializable = {
+                    name: {k: float(v) for k, v in m.items() if k != "preds"}
+                    for name, m in comparison_results.items()
+                }
+                with open(_cmp_path, "w") as _f:
+                    json.dump(_cmp_serializable, _f, indent=2)
+                logger.info(f"✅ 4-way comparison metrics saved → {_cmp_path}")
+
+                # Surface the best strategy
+                best_strat = max(comparison_results, key=lambda s: comparison_results[s]["r2"])
+                logger.info(f"\n🏆 Best strategy overall: {best_strat}  "
+                            f"R²={comparison_results[best_strat]['r2']:.4f}  "
+                            f"RMSE={comparison_results[best_strat]['rmse']:.4f}°C")
+            else:
+                logger.warning("⚠️ 4-way comparison skipped: GBM model or val features not available")
+        except Exception as _cmp_err:
+            logger.warning(f"4-way comparison failed: {_cmp_err}")
+        logger.info("="*60)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Save models
         self._save_final_models(save_dir)
         self._save_history(save_dir)
@@ -2238,9 +3165,20 @@ def validate_data_quality(X: np.ndarray, y: np.ndarray, split: str) -> bool:
     return True
 
 
-def load_data(split: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load preprocessed data"""
-    data_dir = PROCESSED_DATA_DIR / "cnn_dataset" / split
+def load_data(split: str, dataset_dir: Path = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Load preprocessed data.
+
+    Args:
+        split:       One of "train", "val", or "test".
+        dataset_dir: Root dataset directory produced by preprocessing.py
+            (e.g. PROCESSED_DATA_DIR / "cnn_dataset_landsat" or
+            PROCESSED_DATA_DIR / "cnn_dataset_fusion").
+            Defaults to PROCESSED_DATA_DIR / "cnn_dataset" for backward
+            compatibility.
+    """
+    if dataset_dir is None:
+        dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
+    data_dir = Path(dataset_dir) / split
     
     if not data_dir.exists():
         raise FileNotFoundError(f"Missing data directory: {data_dir}")
@@ -2258,153 +3196,258 @@ def load_data(split: str) -> Tuple[np.ndarray, np.ndarray]:
     return X, y
 
 
-def main():
-    """Main training script with ensemble - BEST MODELS VERSION"""
-    logger.info("="*60)
-    logger.info("URBAN HEAT ISLAND - ENSEMBLE TRAINING (BEST MODELS)")
-    logger.info("="*60)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() and COMPUTE_CONFIG["use_gpu"] else "cpu")
-    logger.info(f"Using device: {device}")
-    
-    # Verify and load normalization statistics (single call via shared helper)
-    logger.info("\n" + "="*60)
-    logger.info("VERIFYING NORMALIZATION STATISTICS")
-    logger.info("="*60)
+def _train_one_variant(dataset_dir: Path, model_dir: Path, device, label: str):
+    """
+    Train the full CNN+GBM ensemble on one dataset variant and return the
+    final history dict.
 
-    stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
-    norm_stats = load_normalization_stats()
+    Args:
+        dataset_dir: Preprocessed dataset root (contains train/val/test splits
+                     and normalization_stats.json).
+        model_dir:   Output directory for checkpoints, diagnostics, and saved
+                     models.  Created if it does not exist.
+        device:      Torch device.
+        label:       Human-readable variant name used in log messages.
+    """
+    logger.info("\n" + "="*70)
+    logger.info(f"VARIANT: {label}")
+    logger.info(f"  dataset : {dataset_dir}")
+    logger.info(f"  model   : {model_dir}")
+    logger.info("="*70)
+
+    # ── Verify normalization stats ────────────────────────────────────────────
+    norm_stats = load_normalization_stats(dataset_dir)
     if norm_stats is None:
+        stats_path = dataset_dir / "normalization_stats.json"
         logger.error("❌ Normalization stats not found!")
         logger.error(f"   Expected: {stats_path}")
-        logger.error("   This file should be created during preprocessing.")
-        logger.error("   Run preprocessing.py to create normalized data with statistics.")
+        logger.error("   Run preprocessing.py to generate the dataset first.")
         raise FileNotFoundError(f"Missing normalization stats: {stats_path}")
 
-    logger.info(f"✅ Found normalization stats: {stats_path}")
+    logger.info(f"✅ Normalization stats loaded from {dataset_dir}")
     logger.info(f"   Features: {norm_stats.get('n_channels', 'N/A')} channels")
+    if "target" in norm_stats:
+        logger.info(f"   Target LST: mean={norm_stats['target']['mean']:.2f}°C, "
+                    f"std={norm_stats['target']['std']:.2f}°C")
 
-    if 'target' in norm_stats:
-        target_mean = norm_stats['target']['mean']
-        target_std  = norm_stats['target']['std']
-        logger.info(f"   Target LST: mean={target_mean:.2f}°C, std={target_std:.2f}°C")
-        logger.info(f"   (These are the ORIGINAL values before normalization)")
+    # ── Infer input-channel count from normalization stats ────────────────────
+    # normalization_stats.json stores n_channels; fall back to CNN_CONFIG default
+    # so the model is always sized correctly for the chosen dataset variant
+    # (Landsat-only has fewer channels than the fusion dataset).
+    n_channels = norm_stats.get("n_channels", CNN_CONFIG["input_channels"])
+    logger.info(f"   CNN input channels: {n_channels}")
 
-    logger.info("="*60)
-    
-    # Load data
+    # ── Load data ─────────────────────────────────────────────────────────────
     logger.info("\n" + "="*60)
-    logger.info("LOADING TRAINING DATA")
+    logger.info(f"LOADING DATA  [{label}]")
     logger.info("="*60)
-    X_train, y_train = load_data("train")
-    
-    logger.info("\n" + "="*60)
-    logger.info("LOADING VALIDATION DATA")
-    logger.info("="*60)
-    X_val, y_val = load_data("val")
-    
-    # Create datasets
+    X_train, y_train = load_data("train", dataset_dir)
+    X_val,   y_val   = load_data("val",   dataset_dir)
+
+    # ── DataLoaders ───────────────────────────────────────────────────────────
     train_dataset = UHIDataset(X_train, y_train, augment=True)
-    val_dataset = UHIDataset(X_val, y_val, augment=False)
-    
-    # Create stratified sampler for balanced temperature distribution
-    sampler = create_temperature_stratified_sampler(y_train)
+    val_dataset   = UHIDataset(X_val,   y_val,   augment=False)
+    sampler       = create_temperature_stratified_sampler(y_train)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=TRAINING_CONFIG["batch_size"],
         sampler=sampler,
         num_workers=COMPUTE_CONFIG["num_workers"],
-        pin_memory=COMPUTE_CONFIG["pin_memory"]
+        pin_memory=COMPUTE_CONFIG["pin_memory"],
     )
-    
     val_loader = DataLoader(
         val_dataset,
         batch_size=TRAINING_CONFIG["batch_size"],
         shuffle=False,
         num_workers=COMPUTE_CONFIG["num_workers"],
-        pin_memory=COMPUTE_CONFIG["pin_memory"]
+        pin_memory=COMPUTE_CONFIG["pin_memory"],
     )
-    
-    # Create CNN model
-    logger.info("\nInitializing CNN model...")
-    cnn_model = UNet(in_channels=CNN_CONFIG["input_channels"], out_channels=1)
+
+    # ── CNN model ─────────────────────────────────────────────────────────────
+    logger.info(f"\nInitializing CNN model  [{label}]  in_channels={n_channels}…")
+    cnn_model = UNet(in_channels=n_channels, out_channels=1)
     initialize_weights(cnn_model)
     logger.info(f"CNN parameters: {count_parameters(cnn_model):,}")
-    
-    # Create ensemble trainer
-    logger.info("\nInitializing ensemble trainer...")
-    ensemble_trainer = EnsembleTrainer(cnn_model, device)
+
+    # ── Ensemble trainer ──────────────────────────────────────────────────────
+    ensemble_trainer = EnsembleTrainer(
+        cnn_model,
+        device,
+        dataset_dir=dataset_dir,
+        model_dir=model_dir,
+    )
     logger.info(f"Initial ensemble weights: CNN={ENSEMBLE_WEIGHTS['cnn']}, GBM={ENSEMBLE_WEIGHTS['gbm']}")
-    logger.info("Note: Weights will be optimized based on BEST model performance")
-    
-    # Train ensemble
+
+    # ── Train ─────────────────────────────────────────────────────────────────
     logger.info("\n" + "="*60)
-    logger.info("STARTING ENSEMBLE TRAINING")
+    logger.info(f"STARTING ENSEMBLE TRAINING  [{label}]")
     logger.info("="*60)
-    
     try:
         history = ensemble_trainer.train(
             train_loader, val_loader,
             X_train, y_train, X_val, y_val,
-            MODEL_DIR
+            ensemble_trainer.model_dir,
         )
     except Exception as e:
-        logger.error(f"\n❌ Training failed: {e}")
+        logger.error(f"\n❌ Training failed [{label}]: {e}")
         traceback.print_exc()
         raise
-    
+
+    # ── Results summary ───────────────────────────────────────────────────────
     logger.info("\n" + "="*60)
-    logger.info("ENSEMBLE TRAINING COMPLETE")
+    logger.info(f"TRAINING COMPLETE  [{label}]")
     logger.info("="*60)
-    
-    # Print final metrics
+
     if "ensemble_metrics" in history and history["ensemble_metrics"]:
-        final_metrics = history["ensemble_metrics"]
-        logger.info("\nFINAL ENSEMBLE METRICS (Using BEST Models, Denormalized to °C):")
-        logger.info(f"  R² Score: {final_metrics['r2']:.4f} (target: ≥ {VALIDATION_CONFIG['targets']['r2']})")
-        logger.info(f"  RMSE: {final_metrics['rmse']:.4f}°C (target: ≤ {VALIDATION_CONFIG['targets']['rmse']}°C)")
-        logger.info(f"  MAE: {final_metrics['mae']:.4f}°C (target: ≤ {VALIDATION_CONFIG['targets']['mae']}°C)")
-        logger.info(f"  MBE: {final_metrics['mbe']:.4f}°C")
-        
-        logger.info("\nNote: Metrics calculated using BEST validation models:")
-        logger.info("      - CNN: Best R² checkpoint from training")
-        logger.info("      - GBM: Best RMSE iteration")
-        logger.info("      - Predictions denormalized before computing metrics")
-        
-        # Check if targets met
+        fm = history["ensemble_metrics"]
+        logger.info("\nFINAL ENSEMBLE METRICS (denormalized °C):")
+        logger.info(f"  R²:   {fm['r2']:.4f}  (target ≥ {VALIDATION_CONFIG['targets']['r2']})")
+        logger.info(f"  RMSE: {fm['rmse']:.4f}°C  (target ≤ {VALIDATION_CONFIG['targets']['rmse']}°C)")
+        logger.info(f"  MAE:  {fm['mae']:.4f}°C  (target ≤ {VALIDATION_CONFIG['targets']['mae']}°C)")
+        logger.info(f"  MBE:  {fm['mbe']:.4f}°C")
         targets_met = (
-            final_metrics['r2'] >= VALIDATION_CONFIG['targets']['r2'] and
-            final_metrics['rmse'] <= VALIDATION_CONFIG['targets']['rmse'] and
-            final_metrics['mae'] <= VALIDATION_CONFIG['targets']['mae']
+            fm['r2']   >= VALIDATION_CONFIG['targets']['r2']   and
+            fm['rmse'] <= VALIDATION_CONFIG['targets']['rmse'] and
+            fm['mae']  <= VALIDATION_CONFIG['targets']['mae']
         )
-        
-        if targets_met:
-            logger.info("\n✅ ALL PERFORMANCE TARGETS MET!")
-        else:
-            logger.warning("\n⚠️ Some performance targets not met")
-        
+        logger.info("\n✅ ALL PERFORMANCE TARGETS MET!" if targets_met
+                    else "\n⚠️ Some performance targets not met")
         logger.info("="*60)
-    
-    # Print comparison
+
     if history["cnn_metrics"]:
         cnn_final = history["cnn_metrics"][-1]
         logger.info("\nMODEL COMPARISON:")
-        logger.info(f"  CNN Best - R²: {cnn_final['r2']:.4f}, RMSE: {cnn_final['rmse']:.4f}°C")
+        logger.info(f"  CNN Best  R²={cnn_final['r2']:.4f}  RMSE={cnn_final['rmse']:.4f}°C")
         if "ensemble_metrics" in history and history["ensemble_metrics"]:
-            ens_final = history["ensemble_metrics"]
-            logger.info(f"  Ensemble - R²: {ens_final['r2']:.4f}, RMSE: {ens_final['rmse']:.4f}°C")
-            
+            ens = history["ensemble_metrics"]
+            logger.info(f"  Ensemble  R²={ens['r2']:.4f}  RMSE={ens['rmse']:.4f}°C")
             if cnn_final['r2'] > 0:
-                improvement = (ens_final['r2'] - cnn_final['r2']) / abs(cnn_final['r2']) * 100
+                improvement = (ens['r2'] - cnn_final['r2']) / abs(cnn_final['r2']) * 100
                 logger.info(f"  Improvement: {improvement:+.2f}%")
-        
-        # Print final weights
-        logger.info(f"\nFinal Ensemble Weights (Optimized):")
-        logger.info(f"  CNN: {ensemble_trainer.ensemble_weights['cnn']:.4f}")
-        logger.info(f"  GBM: {ensemble_trainer.ensemble_weights['gbm']:.4f}")
-        
+        logger.info(f"\nFinal ensemble weights:")
+        logger.info(f"  CNN={ensemble_trainer.ensemble_weights['cnn']:.4f}  "
+                    f"GBM={ensemble_trainer.ensemble_weights['gbm']:.4f}")
         logger.info("="*60)
+
+    return history
+
+
+def main():
+    """
+    Main entry point.
+
+    Usage examples
+    --------------
+    # Train on Landsat-only data (default):
+    python train_ensemble.py
+
+    # Train on fusion data only:
+    python train_ensemble.py --mode fusion
+
+    # Train on Landsat-only data, explicit path:
+    python train_ensemble.py --mode landsat
+
+    # Train BOTH variants back-to-back for comparison:
+    python train_ensemble.py --mode both
+
+    # Point at an arbitrary preprocessed dataset:
+    python train_ensemble.py --dataset /path/to/cnn_dataset_custom \
+                             --model-dir /path/to/models/custom
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="UHI ensemble training — supports Landsat-only, fusion, or both variants"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["landsat", "fusion", "both"],
+        default="landsat",
+        help=(
+            "Which preprocessed dataset variant to train on.\n"
+            "  landsat : PROCESSED_DATA_DIR/cnn_dataset_landsat  (default)\n"
+            "  fusion  : PROCESSED_DATA_DIR/cnn_dataset_fusion\n"
+            "  both    : train landsat first, then fusion (for comparison)"
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help=(
+            "Override dataset directory.  Ignored when --mode is 'both'.\n"
+            "Default: chosen automatically from --mode."
+        ),
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        dest="model_dir",
+        help=(
+            "Override model output directory.  Ignored when --mode is 'both'.\n"
+            "Default: MODEL_DIR/<mode> (e.g. MODEL_DIR/landsat)."
+        ),
+    )
+    args = parser.parse_args()
+
+    logger.info("="*60)
+    logger.info("URBAN HEAT ISLAND - ENSEMBLE TRAINING (BEST MODELS)")
+    logger.info("="*60)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and COMPUTE_CONFIG["use_gpu"] else "cpu"
+    )
+    logger.info(f"Using device: {device}")
+
+    # ── Resolve variant(s) to train ──────────────────────────────────────────
+    VARIANT_DATASET = {
+        "landsat": PROCESSED_DATA_DIR / "cnn_dataset_landsat",
+        "fusion":  PROCESSED_DATA_DIR / "cnn_dataset_fusion",
+    }
+    VARIANT_MODEL = {
+        "landsat": MODEL_DIR / "landsat",
+        "fusion":  MODEL_DIR / "fusion",
+    }
+
+    if args.mode == "both":
+        variants = [
+            ("landsat", VARIANT_DATASET["landsat"], VARIANT_MODEL["landsat"]),
+            ("fusion",  VARIANT_DATASET["fusion"],  VARIANT_MODEL["fusion"]),
+        ]
+    else:
+        dataset_dir = args.dataset if args.dataset else VARIANT_DATASET[args.mode]
+        model_dir   = args.model_dir if args.model_dir else VARIANT_MODEL[args.mode]
+        variants = [(args.mode, dataset_dir, model_dir)]
+
+    # ── Check disk space once using the first model dir ──────────────────────
+    if not check_disk_space(variants[0][2].parent):
+        logger.warning("⚠️ Low disk space — proceeding anyway")
+
+    # ── Train each variant ───────────────────────────────────────────────────
+    results = {}
+    for label, dataset_dir, model_dir in variants:
+        logger.info(f"\n{'#'*70}")
+        logger.info(f"# VARIANT: {label.upper()}")
+        logger.info(f"{'#'*70}")
+        results[label] = _train_one_variant(dataset_dir, model_dir, device, label)
+
+    # ── Cross-variant comparison (only when both were trained) ────────────────
+    if len(results) == 2:
+        logger.info("\n" + "="*70)
+        logger.info("CROSS-VARIANT COMPARISON")
+        logger.info("="*70)
+        logger.info(f"{'Variant':<12} {'R²':>8} {'RMSE(°C)':>10} {'MAE(°C)':>9}")
+        logger.info("-"*42)
+        for label, hist in results.items():
+            if "ensemble_metrics" in hist and hist["ensemble_metrics"]:
+                m = hist["ensemble_metrics"]
+                logger.info(f"{label:<12} {m['r2']:>8.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f}")
+        logger.info("="*70)
+        logger.info("To compare further, inspect diagnostics in:")
+        for label, _, model_dir in variants:
+            logger.info(f"  {label:8s}: {model_dir / 'diagnostics'}")
 
 
 if __name__ == "__main__":

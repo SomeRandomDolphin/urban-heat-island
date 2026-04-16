@@ -724,11 +724,8 @@ class PreprocessingDiagnostics:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         def _plot_channel_stats(ax, X, label_prefix, color):
-            # Single vectorised pass — no per-channel temporary slices
-            flat = X.reshape(-1, n_channels)
-            means = flat.mean(axis=0)
-            stds  = flat.std(axis=0)
-            del flat
+            means = [X[:, :, :, c].mean() for c in range(n_channels)]
+            stds  = [X[:, :, :, c].std()  for c in range(n_channels)]
             x_pos = np.arange(n_channels)
             ax.bar(x_pos, means, yerr=stds, color=color, alpha=0.7, capsize=3,
                    label="mean ± std")
@@ -1936,9 +1933,21 @@ class PreprocessingDiagnostics:
             logger.warning("[Diagnostics] plot_fusion_weight_map: no common index found.")
             return
 
-        # Re-compute the weights exactly as done in MultiSensorFusion.fuse_data
-        time_weight_s2 = 1.0 / (1.0 + time_diff / 16.0)
+        # Re-compute the quality-based weights used in MultiSensorFusion.fuse_data.
+        # The old time-based formula is not used anymore (time_diff is always 0
+        # for monthly composites, which made time_weight_s2 = 1.0 permanently).
+        # Here we compute the *average* weight across the index image so the
+        # diagnostic title stays informative.
+        ls_arr_tmp = landsat_data[index].astype(np.float32)
+        s2_arr_tmp = sentinel2_data[index].astype(np.float32)
+        _h = min(ls_arr_tmp.shape[0], s2_arr_tmp.shape[0])
+        _w = min(ls_arr_tmp.shape[1], s2_arr_tmp.shape[1])
+        valid_s2_diag = float(np.isfinite(s2_arr_tmp[:_h, :_w]).mean())
+        valid_ls_diag = float(np.isfinite(ls_arr_tmp[:_h, :_w]).mean())
+        _denom = valid_s2_diag + valid_ls_diag
+        time_weight_s2 = valid_s2_diag / _denom if _denom > 1e-6 else 0.5
         time_weight_ls = 1.0 - time_weight_s2
+        del ls_arr_tmp, s2_arr_tmp
 
         ls_arr = landsat_data[index].astype(np.float32)
         s2_arr = sentinel2_data[index].astype(np.float32)
@@ -2965,7 +2974,7 @@ logger = logging.getLogger(__name__)
 def _to_f32(arr: np.ndarray) -> np.ndarray:
     """Return a float32 array; reuse memory if already float32."""
     if arr.dtype == np.float32:
-        return arr  # return view — no copy needed
+        return arr.copy()
     return arr.astype(np.float32)
 
 
@@ -3580,50 +3589,72 @@ class MultiSensorFusion:
     def fuse_data(self, landsat_data: Dict[str, np.ndarray],
                 sentinel2_data: Dict[str, np.ndarray],
                 time_diff: int,
-                target_resolution: int = 30) -> Dict[str, np.ndarray]:
+                target_resolution: int = 30,
+                s2_weight: Optional[float] = None) -> Dict[str, np.ndarray]:
         """
-        Fuse Landsat and Sentinel-2 data
-        
+        Fuse Landsat and Sentinel-2 data.
+
         Strategy:
         - Use Landsat LST (only source with thermal data)
-        - Use Sentinel-2 for higher resolution spectral indices (10m → 30m)
-        - Weight by temporal proximity
-        - Use common resolution (30m for consistency with Landsat)
+        - Use Sentinel-2 for higher-resolution spectral indices (10 m → 30 m)
+        - Weight by per-index data quality (valid-pixel fraction) when
+          ``s2_weight`` is None (default).  Explicitly supply ``s2_weight``
+          (0.0–1.0) to override, e.g. for ablation experiments.
+        - Use common resolution (30 m for consistency with Landsat)
         - Match spatial extents by cropping to minimum overlap
-        
+
+        WHY NOT TIME-BASED WEIGHTING
+        ─────────────────────────────
+        The previous formula ``time_weight_s2 = 1 / (1 + Δt / 16)`` was
+        designed for scenes acquired on different days.  Because both sensors
+        are monthly median composites assigned ``day=15``, ``time_diff`` is
+        always 0, giving ``time_weight_s2 = 1.0`` and ``time_weight_ls = 0.0``
+        — Landsat spectral indices were silently discarded entirely.
+
+        QUALITY-BASED WEIGHTING (default)
+        ───────────────────────────────────
+        Instead we compute per-index weights proportional to the valid-pixel
+        fraction (1 − NaN_fraction) of each sensor's resampled array for that
+        index.  A sensor with more cloud-free coverage naturally gets a higher
+        weight; when both sensors have the same coverage the weight is 0.5/0.5.
+
+          w_s2 = valid_s2 / (valid_s2 + valid_ls)
+          w_ls = 1 − w_s2
+          fused[idx] = w_s2 * s2 + w_ls * ls
+
         Args:
-            landsat_data: Landsat processed data
-            sentinel2_data: Sentinel-2 processed data
-            time_diff: Time difference in days
-            target_resolution: Target resolution in meters
-            
+            landsat_data:    Landsat processed data
+            sentinel2_data:  Sentinel-2 processed data
+            time_diff:       Time difference in days (kept for API compatibility
+                             and logging; not used for weighting)
+            target_resolution: Target resolution in metres
+            s2_weight:       If provided, use this fixed weight for Sentinel-2
+                             (0.0 = Landsat-only blend, 1.0 = S2-only blend).
+                             None (default) = quality-based weighting.
+
         Returns:
             Fused data dictionary
         """
         fused = {}
-        
+
         # Get reference shape from Landsat LST (this defines our target extent)
         if "LST" not in landsat_data:
             logger.error("No LST in Landsat data - cannot fuse")
             return fused
-        
+
         reference_shape = landsat_data["LST"].shape
         logger.debug(f"  Reference shape (Landsat LST): {reference_shape}")
-        
+
         # Start with Landsat LST (only source with thermal data)
         fused["LST"] = landsat_data["LST"].copy()
-        
+
         # Use Sentinel-2 for spectral indices (higher native resolution)
         spectral_indices = ["NDVI", "NDBI", "MNDWI", "BSI", "UI", "albedo"]
-        
-        # Calculate temporal weight (closer in time = higher weight for Sentinel-2)
-        time_weight_s2 = 1.0 / (1.0 + time_diff / 16.0)
-        time_weight_ls = 1.0 - time_weight_s2
-        
+
         for idx in spectral_indices:
             has_s2 = idx in sentinel2_data
             has_ls = idx in landsat_data
-            
+
             if has_s2 and has_ls:
                 # Resample Sentinel-2 (10m) to target resolution (30m)
                 s2_resampled = self.sentinel2_preprocessor.resample_band(
@@ -3632,23 +3663,60 @@ class MultiSensorFusion:
                     target_resolution=target_resolution,
                     method='bilinear'
                 )
-                
+
                 ls_data = landsat_data[idx]
-                
+
                 # Determine the minimum common extent
                 min_height = min(s2_resampled.shape[0], ls_data.shape[0], reference_shape[0])
-                min_width = min(s2_resampled.shape[1], ls_data.shape[1], reference_shape[1])
-                
+                min_width  = min(s2_resampled.shape[1], ls_data.shape[1], reference_shape[1])
+
                 # Crop to common extent
-                s2_cropped = s2_resampled[:min_height, :min_width]
-                ls_cropped = ls_data[:min_height, :min_width]
-                
-                # Weighted fusion
-                fused[idx] = (time_weight_s2 * s2_cropped + 
-                            time_weight_ls * ls_cropped)
-                
-                logger.debug(f"  {idx}: fused (S2 weight={time_weight_s2:.2f}, shape={fused[idx].shape})")
-                
+                s2_cropped = s2_resampled[:min_height, :min_width].astype(np.float32)
+                ls_cropped = ls_data[:min_height, :min_width].astype(np.float32)
+
+                # ── Determine per-index fusion weight ──────────────────────────
+                if s2_weight is not None:
+                    # Explicit override (e.g. ablation study)
+                    tw_s2 = float(np.clip(s2_weight, 0.0, 1.0))
+                    tw_ls = 1.0 - tw_s2
+                    weight_source = f"fixed s2_weight={tw_s2:.2f}"
+                else:
+                    # Quality-based: weight proportional to valid-pixel fraction.
+                    # NaN pixels are those that failed cloud masking or were
+                    # tile-edge fill — more NaNs → less reliable → lower weight.
+                    valid_s2 = float(np.isfinite(s2_cropped).mean())
+                    valid_ls = float(np.isfinite(ls_cropped).mean())
+                    denom = valid_s2 + valid_ls
+                    if denom < 1e-6:
+                        tw_s2 = 0.5
+                    else:
+                        tw_s2 = valid_s2 / denom
+                    tw_ls = 1.0 - tw_s2
+                    weight_source = (
+                        f"quality-based (valid_s2={valid_s2:.3f}, "
+                        f"valid_ls={valid_ls:.3f})"
+                    )
+
+                # Weighted fusion — NaN-aware: if one sensor is NaN at a pixel,
+                # fall back to the other sensor rather than propagating NaN.
+                both_valid  = np.isfinite(s2_cropped) & np.isfinite(ls_cropped)
+                s2_only     = np.isfinite(s2_cropped) & ~np.isfinite(ls_cropped)
+                ls_only     = ~np.isfinite(s2_cropped) & np.isfinite(ls_cropped)
+
+                result = np.full_like(s2_cropped, np.nan)
+                result[both_valid] = (tw_s2 * s2_cropped[both_valid] +
+                                      tw_ls * ls_cropped[both_valid])
+                result[s2_only]    = s2_cropped[s2_only]
+                result[ls_only]    = ls_cropped[ls_only]
+
+                fused[idx] = result
+
+                logger.debug(
+                    f"  {idx}: fused ({weight_source}, "
+                    f"S2w={tw_s2:.2f}, LSw={tw_ls:.2f}, "
+                    f"shape={fused[idx].shape})"
+                )
+
             elif has_s2:
                 # Only Sentinel-2 available
                 s2_resampled = self.sentinel2_preprocessor.resample_band(
@@ -3739,13 +3807,7 @@ class FeatureEngineer:
         Returns:
             Impervious surface fraction (0-1)
         """
-        isf = np.empty_like(ndvi, dtype=np.float32)
-        np.subtract(1.0, ndvi, out=isf)   # 1 - ndvi
-        isf += ndbi
-        tmp = np.subtract(1.0, mndwi)
-        isf += tmp
-        del tmp
-        isf /= 3.0
+        isf = (ndbi + (1 - ndvi) + (1 - mndwi)) / 3
         return np.clip(isf, 0, 1)
     
     @staticmethod
@@ -3771,12 +3833,10 @@ class FeatureEngineer:
             # Mean
             context[f"mean_{prefix}"] = uniform_filter(arr, size=ws, mode='reflect')
             
-            # Standard deviation — keep float32 and free arr_sq immediately
-            arr_sq = np.multiply(arr, arr, dtype=np.float32)
+            # Standard deviation
+            arr_sq = arr ** 2
             mean_sq = uniform_filter(arr_sq, size=ws, mode='reflect')
-            del arr_sq
             context[f"std_{prefix}"] = np.sqrt(np.maximum(mean_sq - context[f"mean_{prefix}"] ** 2, 0))
-            del mean_sq
         
         return context
     
@@ -4303,11 +4363,10 @@ class DatasetCreator:
 
         return X, y
     
-    def verify_no_data_leakage(self, y_train, y_val, y_test,
+    def verify_no_data_leakage(self, X_train, y_train, X_val, y_val, X_test, y_test,
                             norm_stats: Dict):
         """
-        Verify normalization stats only come from training data.
-        Only y arrays are needed — X is not held in memory during this check.
+        Verify normalization stats only come from training data
         """
         logger.info("\n" + "="*70)
         logger.info("DATA LEAKAGE CHECK")
@@ -4349,12 +4408,12 @@ class DatasetCreator:
         logger.info(f"  Val: mean={val_mean:.4f}, std={y_val.std():.4f}")
         logger.info(f"  Test: mean={test_mean:.4f}, std={y_test.std():.4f}")
         
-        # Check 3: Sample counts
+        # Check 3: Verify no sample overlap
         logger.info(f"\nSample overlap check:")
-        logger.info(f"  Train samples: {len(y_train)}")
-        logger.info(f"  Val samples: {len(y_val)}")
-        logger.info(f"  Test samples: {len(y_test)}")
-        logger.info(f"  Total: {len(y_train) + len(y_val) + len(y_test)}")
+        logger.info(f"  Train samples: {len(X_train)}")
+        logger.info(f"  Val samples: {len(X_val)}")
+        logger.info(f"  Test samples: {len(X_test)}")
+        logger.info(f"  Total: {len(X_train) + len(X_val) + len(X_test)}")
         
         logger.info("="*70)
         
@@ -4736,9 +4795,10 @@ class EnhancedDatasetCreator(DatasetCreator):
         logger.info(f"CREATING {n_splits}-FOLD TEMPORAL CV SPLITS")
         logger.info("="*70)
         
-        # Sort by date — only materialise the cheap date/index arrays.
-        # X and y are sliced per-fold on demand to avoid two full copies in memory.
+        # Sort by date
         sort_idx = np.argsort(dates)
+        X_sorted = X[sort_idx]
+        y_sorted = y[sort_idx]
         dates_sorted = dates[sort_idx]
         
         n_samples = len(X)
@@ -4763,11 +4823,11 @@ class EnhancedDatasetCreator(DatasetCreator):
             val_indices = np.arange(val_start, val_end)
             
             split = {
-                "X_train": X[sort_idx[train_indices]],
-                "y_train": y[sort_idx[train_indices]],
+                "X_train": X_sorted[train_indices],
+                "y_train": y_sorted[train_indices],
                 "dates_train": dates_sorted[train_indices],
-                "X_val": X[sort_idx[val_indices]],
-                "y_val": y[sort_idx[val_indices]],
+                "X_val": X_sorted[val_indices],
+                "y_val": y_sorted[val_indices],
                 "dates_val": dates_sorted[val_indices],
                 "fold": fold
             }
@@ -4782,55 +4842,701 @@ class EnhancedDatasetCreator(DatasetCreator):
         
         return cv_splits
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LAZY FILE REGISTRY
+# ──────────────────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field as _field
+from typing import Callable as _Callable
+
+@dataclass
+class _SceneRecord:
+    """
+    Lightweight stand-in for a processed raster dict.
+
+    Stored in ``landsat_records`` / ``sentinel2_records`` instead of the full
+    band arrays, so Step 1 never accumulates more than one raster in RAM at a
+    time.  The actual arrays are materialised on demand via ``load()``.
+    """
+    timestamp: pd.Timestamp
+    path: Path
+    satellite_type: str          # "landsat" | "sentinel2"
+    # Scene-level QC stats (computed during Step 1, used for filtering)
+    lst_std: float = 0.0
+    lst_valid_ratio: float = 0.0
+    # Cached result — filled the first time load() is called, then cleared
+    # after the consumer is done so memory is freed immediately.
+    _cache: Optional[Dict] = _field(default=None, repr=False)
+
+    def load(self) -> Optional[Dict]:
+        """Process the raw file and cache the result."""
+        if self._cache is not None:
+            return self._cache
+        preprocessor = SatellitePreprocessor(satellite_type=self.satellite_type)
+        result = preprocessor.process_raw_file(
+            self.path,
+            calculate_lst=(self.satellite_type == "landsat"),
+        )
+        self._cache = result
+        return result
+
+    def evict(self) -> None:
+        """Drop the cached arrays to free RAM."""
+        self._cache = None
+        gc.collect()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PER-VARIANT PIPELINE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_pipeline_variant(
+        landsat_records: List["_SceneRecord"],
+        sentinel2_records: List["_SceneRecord"],
+        has_landsat: bool,
+        has_sentinel2: bool,
+        output_dataset_dir: Path,
+        diag: "PreprocessingDiagnostics",
+        variant_label: str,
+        force_landsat_only: bool = False,
+) -> None:
+    """
+    Run the fusion → patch-extraction → split → normalise → save pipeline for
+    a single dataset variant (Landsat-only or Landsat+Sentinel-2 fusion).
+
+    Memory design
+    ─────────────
+    Previous design kept ALL raster dicts live simultaneously:
+      • landsat_processed  – all N months in RAM (e.g. 120 dicts × ~80 MiB)
+      • sentinel2_processed – ditto
+      • all_rasters        – references to every fused dict until X/y fill
+      • deepcopy of both lists for the second variant run
+
+    New design — one raster in RAM at a time:
+      • Records hold only file paths + QC stats; arrays load on demand.
+      • Each scene is loaded → fused/processed → patches extracted →
+        written directly into a memory-mapped X/y on disk → evicted.
+      • The memmap means X/y never live in process RAM as a whole.
+      • After all epochs the memmap is QC-filtered and saved as .npy
+        one split at a time, immediately freeing each chunk.
+      • _all_lst_rasters keeps only one LST snapshot at a time by
+        writing each to a separate temp file; the diagnostic loader
+        reads them back sequentially rather than holding all in RAM.
+    """
+    import tempfile, mmap as _mmap
+
+    logger.info("\n" + "#"*70)
+    logger.info(f"  DATASET VARIANT: {variant_label}")
+    logger.info("#"*70)
+
+    fusion          = MultiSensorFusion()
+    feature_engineer = FeatureEngineer()
+    dataset_creator  = DatasetCreator()
+
+    use_fusion = (
+        has_landsat and has_sentinel2
+        and len(landsat_records) > 0 and len(sentinel2_records) > 0
+        and not force_landsat_only
+    )
+
+    channel_order = PREPROCESSING_CONFIG["channel_order"]
+    n_channels    = len(channel_order)
+    patch_size    = PREPROCESSING_CONFIG["patch_size"]
+
+    # ── Build temporal match list (index pairs only — no data loaded yet) ──
+    if use_fusion:
+        # temporal_match needs the actual data dicts to exist for the match
+        # step — but we only need dates, not arrays.  Build lightweight proxy
+        # tuples (timestamp, {}) for matching, then use the indices to load.
+        ls_date_map  = {rec.timestamp: rec for rec in landsat_records}
+        s2_date_map  = {rec.timestamp: rec for rec in sentinel2_records}
+
+        # Reuse MultiSensorFusion.temporal_match by passing empty dicts —
+        # the method only inspects the date element of each tuple.
+        ls_proxy = [(rec.timestamp, {}) for rec in landsat_records]
+        s2_proxy = [(rec.timestamp, {}) for rec in sentinel2_records]
+        match_tuples = fusion.temporal_match(
+            ls_proxy, s2_proxy,
+            max_time_diff_days=PREPROCESSING_CONFIG["max_time_diff_days"],
+        )
+        # Resolve back to record pairs
+        epoch_plan: List[Tuple] = []
+        for avg_date, ls_empty, s2_empty, time_diff in match_tuples:
+            # Find the Landsat record whose timestamp produced this match.
+            # temporal_match preserves the order of landsat_dates so we can
+            # match by the avg_date heuristic; use closest timestamp instead.
+            best_ls = min(landsat_records,
+                          key=lambda r: abs((r.timestamp - avg_date).total_seconds()))
+            best_s2 = min(sentinel2_records,
+                          key=lambda r: abs((r.timestamp - avg_date).total_seconds()))
+            epoch_plan.append((avg_date, best_ls, best_s2, time_diff))
+    else:
+        epoch_plan = [(rec.timestamp, rec, None, 0) for rec in landsat_records]
+
+    n_epochs_plan = len(epoch_plan)
+    logger.info(f"  Epoch plan: {n_epochs_plan} epochs to process")
+
+    # ── Pass 1: scan all epochs to count total valid patches ──────────────
+    # We do a lightweight dry-run (load → extract positions → evict) so we
+    # know the exact patch count before allocating the memmap.
+    logger.info("\n" + "="*70)
+    logger.info(f"PASS 1 [{variant_label}]: Count patches (dry-run, no memmap yet)")
+    logger.info("="*70)
+
+    patch_census: List[Dict] = []   # list of {epoch_idx, date, patches, grid_rows, grid_cols}
+    _all_grid_rows: List[int] = []
+    _all_grid_cols: List[int] = []
+    first_fused_diag = True
+
+    for ep_idx, (avg_date, ls_rec, s2_rec, time_diff) in enumerate(epoch_plan):
+        label = f"Epoch {ep_idx+1}/{n_epochs_plan}"
+        logger.info(f"\n{label}: loading…")
+
+        # Load this epoch's raster(s)
+        if use_fusion:
+            ls_data = ls_rec.load()
+            s2_data = s2_rec.load()
+            if ls_data is None or s2_data is None:
+                logger.warning(f"  {label}: load failed, skipping")
+                ls_rec.evict(); s2_rec.evict()
+                continue
+
+            fused_data = fusion.fuse_data(
+                ls_data, s2_data, time_diff,
+                target_resolution=PREPROCESSING_CONFIG["fusion_target_resolution"],
+            )
+            ls_rec.evict(); s2_rec.evict()
+        else:
+            ls_data = ls_rec.load()
+            if ls_data is None:
+                logger.warning(f"  {label}: load failed, skipping")
+                ls_rec.evict()
+                continue
+            fused_data = ls_data
+
+        if all(k in fused_data for k in ("NDVI", "NDBI", "MNDWI")):
+            fused_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                fused_data["NDVI"], fused_data["NDBI"], fused_data["MNDWI"]
+            )
+
+        # Diagnostic plots on the very first epoch only
+        if first_fused_diag and use_fusion:
+            try:
+                ls_data_diag = ls_rec.load()   # re-load briefly for plot
+                s2_data_diag = s2_rec.load()
+                diag.plot_fusion_comparison(ls_data_diag, s2_data_diag, fused_data,
+                                            index="NDVI",
+                                            filename=f"09_fusion_comparison_NDVI_{variant_label}.png")
+                diag.plot_fusion_comparison(ls_data_diag, s2_data_diag, fused_data,
+                                            index="NDBI",
+                                            filename=f"09b_fusion_comparison_NDBI_{variant_label}.png")
+                diag.plot_fusion_weight_map(ls_data_diag, s2_data_diag, fused_data,
+                                            time_diff=time_diff,
+                                            filename=f"s2_11_fusion_weights_{variant_label}.png")
+                diag.plot_impervious_surface_analysis(fused_data,
+                                                      filename=f"s2_12_impervious_surface_{variant_label}.png")
+                ls_rec.evict(); s2_rec.evict()
+            except Exception as _e:
+                logger.warning(f"[Diagnostics] fusion plots failed: {_e}")
+            first_fused_diag = False
+
+        result = dataset_creator.extract_patches(
+            fused_data,
+            patch_size=patch_size,
+            stride=PREPROCESSING_CONFIG["patch_stride"],
+            min_valid_ratio=PREPROCESSING_CONFIG["patch_min_valid_ratio"],
+            min_variance=PREPROCESSING_CONFIG["patch_min_variance"],
+            min_temp=PREPROCESSING_CONFIG["lst_min_patch_temp"],
+            max_temp=PREPROCESSING_CONFIG["lst_max_patch_temp"],
+        )
+        patches = result.patches
+
+        if not patches:
+            logger.warning(f"  {label}: 0 patches — epoch skipped")
+            fused_data.clear()
+            # Same cache-poisoning guard as the normal exit path: evict so
+            # Pass 2 reloads from disk rather than returning the cleared {}.
+            if not use_fusion:
+                ls_rec = epoch_plan[ep_idx][1]
+                ls_rec.evict()
+            gc.collect()
+            continue
+
+        # Snapshot LST for pre-patching diagnostic — store path, not array
+        _lst_raw = fused_data.get("LST")
+
+        prior_rows = sum(_all_grid_rows)
+        _all_grid_rows.append(result.grid_rows)
+        _all_grid_cols.append(result.grid_cols)
+
+        for p in patches:
+            p["date"]      = avg_date
+            p["epoch_idx"] = ep_idx
+            if p.get("_grid_row", -1) >= 0:
+                p["_grid_row"] = p["_grid_row"] + prior_rows
+
+        patch_census.append({
+            "epoch_idx":  ep_idx,
+            "date":       avg_date,
+            "patches":    patches,
+            "grid_rows":  result.grid_rows,
+            "grid_cols":  result.grid_cols,
+            "lst_snap":   _lst_raw.copy() if _lst_raw is not None and np.any(np.isfinite(_lst_raw)) else None,
+            "label":      label,
+        })
+
+        logger.info(f"  {label}: {len(patches)} patches "
+                    f"(grid {result.grid_rows}r×{result.grid_cols}c, "
+                    f"running total: {sum(len(e['patches']) for e in patch_census)})")
+
+        fused_data.clear()
+        # Evict the _SceneRecord cache after clearing fused_data.
+        # For the landsat-only branch fused_data IS ls_data (same dict object),
+        # so fused_data.clear() empties ls_rec._cache in-place (because they share
+        # the same reference).  Without eviction, Pass 2's ls_rec.load() sees a
+        # non-None but empty dict, skips the actual file reload, and returns {}.
+        # That causes every patch's LST to be written as zero, which fails the
+        # QC temperature gate, leaving pos_mm filled with -1 and triggering the
+        # "no valid patch positions found" warning in plot_lst_mosaic_reconstruction.
+        if not use_fusion:
+            ls_rec = epoch_plan[ep_idx][1]
+            ls_rec.evict()
+        gc.collect()
+
+    if not patch_census:
+        logger.error(f"[{variant_label}] No patches extracted in any epoch")
+        return
+
+    n_total = sum(len(e["patches"]) for e in patch_census)
+    logger.info(f"\n  Total patches across all epochs: {n_total:,}")
+
+    # Collect all patch dicts and dates for diagnostics
+    all_patches_flat = [p for e in patch_census for p in e["patches"]]
+    all_dates_flat   = [p["date"] for p in all_patches_flat]
+
+    # Patch quality diagnostic (uses patch metadata only — no arrays needed)
+    try:
+        diag.plot_patch_diagnostics(
+            all_patches_flat,
+            raster_data=None,
+            filename=f"05_patch_diagnostics_{variant_label}.png",
+        )
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] patch plot failed: {_e}")
+
+    # Pre-patching LST overview — pass snapshots from census
+    try:
+        lst_snap_list = [(e["label"], e["lst_snap"])
+                         for e in patch_census if e["lst_snap"] is not None]
+        if lst_snap_list:
+            diag.plot_lst_pre_patching(
+                lst_rasters = lst_snap_list,
+                geo_bounds  = STUDY_AREA.get("bounds"),
+                filename    = f"P_mosaic_lst_pre_patching_{variant_label}.png",
+            )
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] LST pre-patching plot failed: {_e}")
+    # Free LST snapshots — no longer needed
+    for e in patch_census:
+        e["lst_snap"] = None
+    gc.collect()
+
+    # ── Pass 2: allocate memmap X/y, then re-load each epoch and fill ─────
+    logger.info("\n" + "="*70)
+    logger.info(f"PASS 2 [{variant_label}]: Fill memmap X/y (one epoch at a time)")
+    logger.info("="*70)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="uhi_preproc_"))
+    X_path  = tmp_dir / "X.dat"
+    y_path  = tmp_dir / "y.dat"
+    pos_path = tmp_dir / "pos.dat"
+
+    X_mm   = np.memmap(X_path,   dtype=np.float32, mode="w+",
+                       shape=(n_total, patch_size, patch_size, n_channels))
+    y_mm   = np.memmap(y_path,   dtype=np.float32, mode="w+",
+                       shape=(n_total, patch_size, patch_size, 1))
+    pos_mm = np.memmap(pos_path, dtype=np.int32,   mode="w+",
+                       shape=(n_total, 2))
+    pos_mm[:] = -1
+
+    write_ptr = 0
+
+    for ep_entry in patch_census:
+        ep_idx    = ep_entry["epoch_idx"]
+        avg_date  = ep_entry["date"]
+        patches   = ep_entry["patches"]
+        label_ep  = ep_entry["label"]
+
+        if not patches:
+            continue
+
+        logger.info(f"  Filling {len(patches)} patches for {label_ep}…")
+
+        # Re-materialise this epoch's raster
+        if use_fusion:
+            ls_rec = epoch_plan[ep_idx][1]
+            s2_rec = epoch_plan[ep_idx][2]
+            ls_data = ls_rec.load()
+            s2_data = s2_rec.load()
+            if ls_data is None or s2_data is None:
+                logger.warning(f"  {label_ep}: reload failed — filling zeros")
+                write_ptr += len(patches)
+                ls_rec.evict(); s2_rec.evict()
+                continue
+            raster_data = fusion.fuse_data(
+                ls_data, s2_data,
+                epoch_plan[ep_idx][3],
+                target_resolution=PREPROCESSING_CONFIG["fusion_target_resolution"],
+            )
+            if all(k in raster_data for k in ("NDVI", "NDBI", "MNDWI")):
+                raster_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                    raster_data["NDVI"], raster_data["NDBI"], raster_data["MNDWI"]
+                )
+            ls_rec.evict(); s2_rec.evict()
+        else:
+            ls_rec = epoch_plan[ep_idx][1]
+            raster_data = ls_rec.load()
+            if raster_data is None:
+                logger.warning(f"  {label_ep}: reload failed — filling zeros")
+                write_ptr += len(patches)
+                ls_rec.evict()
+                continue
+            if all(k in raster_data for k in ("NDVI", "NDBI", "MNDWI")):
+                raster_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
+                    raster_data["NDVI"], raster_data["NDBI"], raster_data["MNDWI"]
+                )
+
+        for p in patches:
+            r, c = p["position"]
+            for ch_idx, feat in enumerate(channel_order):
+                arr = raster_data.get(feat)
+                if arr is not None:
+                    X_mm[write_ptr, :, :, ch_idx] = arr[r:r+patch_size, c:c+patch_size]
+            lst_arr = raster_data.get("LST")
+            if lst_arr is not None:
+                y_mm[write_ptr, :, :, 0] = lst_arr[r:r+patch_size, c:c+patch_size]
+            pos_mm[write_ptr, 0] = p.get("_grid_row", -1)
+            pos_mm[write_ptr, 1] = p.get("_grid_col", -1)
+            write_ptr += 1
+
+        # Flush and free the raster immediately
+        X_mm.flush(); y_mm.flush(); pos_mm.flush()
+        raster_data.clear()
+        # Evict the _SceneRecord cache after clearing raster_data.
+        # For the landsat-only branch raster_data IS ls_rec._cache (same dict
+        # object), so raster_data.clear() empties the cache in-place without
+        # setting it to None.  On the next call to ls_rec.load() the guard
+        # `if self._cache is not None` sees {} and returns it directly, so the
+        # fusion variant (which reuses the same _SceneRecord objects) receives
+        # an empty dict with no LST — causing fuse_data() to fail with
+        # "No LST in Landsat data".  Evicting here sets _cache = None so the
+        # next load() reprocesses from disk correctly.
+        if not use_fusion:
+            _ep_idx_pass2 = ep_entry["epoch_idx"]
+            epoch_plan[_ep_idx_pass2][1].evict()
+        gc.collect()
+
+    logger.info(f"  Memmap fill complete ({write_ptr:,} patches written)")
+
+    # Free the census patch dicts — positions are now in pos_mm
+    del all_patches_flat, patch_census
+    gc.collect()
+
+    # ── QC pass on memmap — build valid_mask without loading full X/y ─────
+    logger.info(f"  Running QC pass on memmap…")
+    _qc_min_valid = PREPROCESSING_CONFIG["patch_min_valid_ratio"]
+    _qc_t_lo      = PREPROCESSING_CONFIG["lst_min_pixel_temp"]
+    _qc_t_hi      = PREPROCESSING_CONFIG["lst_max_pixel_temp"]
+
+    valid_mask = np.ones(n_total, dtype=bool)
+    for s in range(n_total):
+        lst_p = y_mm[s, :, :, 0]
+        fin   = np.isfinite(lst_p)
+        if fin.mean() < _qc_min_valid:
+            valid_mask[s] = False
+            continue
+        lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
+        if not (_qc_t_lo <= lst_mean <= _qc_t_hi):
+            valid_mask[s] = False
+
+    n_dropped = int((~valid_mask).sum())
+    if n_dropped:
+        logger.info(f"  QC dropped {n_dropped}/{n_total} patches")
+
+    n_samples    = int(valid_mask.sum())
+    valid_indices = np.where(valid_mask)[0]
+    dates_all    = np.array(all_dates_flat)[valid_mask]
+    del all_dates_flat, valid_mask
+    gc.collect()
+
+    # ── NaN fill + safety clip — in-place on memmap ───────────────────────
+    logger.info(f"  NaN fill + safety clip on {n_samples:,} kept patches…")
+    for s_out, s_in in enumerate(valid_indices):
+        for ch in range(n_channels):
+            sl = X_mm[s_in, :, :, ch]
+            nm = ~np.isfinite(sl)
+            if nm.any():
+                sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
+        sl = y_mm[s_in, :, :, 0]
+        nm = ~np.isfinite(sl)
+        if nm.any():
+            sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
+    np.clip(y_mm, _qc_t_lo, _qc_t_hi, out=y_mm)
+    X_mm.flush(); y_mm.flush()
+
+    # ── LST mosaic diagnostic ─────────────────────────────────────────────
+    _mosaic_cols = (Counter(_all_grid_cols).most_common(1)[0][0]
+                    if _all_grid_cols else int(np.ceil(np.sqrt(n_samples))))
+    try:
+        diag.plot_lst_mosaic_reconstruction(
+            y               = y_mm[valid_indices],
+            positions_all   = pos_mm[valid_indices],
+            patch_grid_cols = _mosaic_cols,
+            all_grid_rows   = _all_grid_rows,
+            stride          = PREPROCESSING_CONFIG["patch_stride"],
+            geo_bounds      = STUDY_AREA.get("bounds"),
+            filename        = f"P_mosaic_lst_reconstruction_{variant_label}.png",
+        )
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] LST mosaic reconstruction plot failed: {_e}")
+
+    # ── Patch grid shape metadata ─────────────────────────────────────────
+    if _all_grid_cols:
+        col_counts = Counter(_all_grid_cols)
+        patch_grid_cols = col_counts.most_common(1)[0][0]
+        patch_grid_rows = sum(_all_grid_rows)
+        _obs_max_col = (int(pos_mm[valid_indices[pos_mm[valid_indices, 1] >= 0], 1].max()) + 1
+                        if np.any(pos_mm[valid_indices, 1] >= 0) else 0)
+        if _obs_max_col > patch_grid_cols:
+            patch_grid_cols = _obs_max_col
+    else:
+        patch_grid_cols = patch_grid_rows = None
+
+    # ── Sample weights (computed from y memmap — no full RAM load) ────────
+    patch_means   = y_mm[valid_indices, :, :, 0].reshape(n_samples, -1).mean(axis=1)
+    n_wb          = PREPROCESSING_CONFIG["sample_weight_n_bins"]
+    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
+    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
+    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
+    sample_weights = (1.0 / bc_[bids_])
+    sample_weights /= sample_weights.mean()
+
+    temporal_features = feature_engineer.encode_temporal_features(
+        pd.Timestamp(dates_all[0])
+    )
+
+    metadata = {
+        "n_samples":        n_samples,
+        "patch_size":       patch_size,
+        "n_channels":       n_channels,
+        "channel_order":    channel_order,
+        "temporal_features": temporal_features,
+        "temperature_range": {
+            "min":  float(np.nanmin(y_mm[valid_indices])),
+            "max":  float(np.nanmax(y_mm[valid_indices])),
+            "mean": float(np.nanmean(y_mm[valid_indices])),
+            "std":  float(np.nanstd(y_mm[valid_indices])),
+        },
+        "sample_weights":   sample_weights,
+        "patch_grid_rows":  patch_grid_rows,
+        "patch_grid_cols":  patch_grid_cols,
+        "patch_stride":     PREPROCESSING_CONFIG["patch_stride"],
+        "patch_grid_rows_per_epoch": int(_all_grid_rows[0]) if _all_grid_rows else None,
+        "patch_grid_rows_per_epoch_list": [int(r) for r in _all_grid_rows] if _all_grid_rows else [],
+        "n_epochs":         int(len(_all_grid_rows)) if _all_grid_rows else 1,
+        "patch_positions":  pos_mm[valid_indices],
+        "dataset_variant":  variant_label,
+    }
+
+    logger.info(f"  X shape: ({n_samples}, {patch_size}, {patch_size}, {n_channels})")
+    logger.info(f"  Temp range: [{metadata['temperature_range']['min']:.2f}, "
+                f"{metadata['temperature_range']['max']:.2f}]°C")
+
+    # ── Step 6: Stratified split ──────────────────────────────────────────
+    logger.info("\n" + "="*70)
+    logger.info(f"STEP 6 [{variant_label}]: Create train/val/test splits")
+    logger.info("="*70)
+
+    dataset_creator_enh = EnhancedDatasetCreator()
+
+    # Load the kept slice into RAM for splitting — this is the one unavoidable
+    # full-load moment, but it is now the *filtered* set (no rejected patches).
+    X_kept = np.array(X_mm[valid_indices], dtype=np.float32)
+    y_kept = np.array(y_mm[valid_indices], dtype=np.float32)
+    positions_kept = np.array(pos_mm[valid_indices], dtype=np.int32)
+
+    # Close and delete memmaps — X_kept/y_kept are the only copies now
+    del X_mm, y_mm, pos_mm, valid_indices
+    X_path.unlink(missing_ok=True)
+    y_path.unlink(missing_ok=True)
+    pos_path.unlink(missing_ok=True)
+    try:
+        tmp_dir.rmdir()
+    except OSError:
+        pass
+    gc.collect()
+
+    splits = dataset_creator_enh.create_stratified_split(
+        X_kept, y_kept, dates_all,
+        split_ratios=(
+            DATE_RANGE["train_ratio"],
+            DATE_RANGE["val_ratio"],
+            DATE_RANGE["test_ratio"],
+        ),
+        random_seed=PREPROCESSING_CONFIG["split_random_seed"],
+        patch_positions=positions_kept,
+    )
+    # create_stratified_split deletes X_kept/y_kept internally after slicing
+    del X_kept, y_kept, positions_kept
+    gc.collect()
+
+    # ── Step 6.5: Normalisation stats ────────────────────────────────────
+    logger.info("\n" + "="*70)
+    logger.info(f"STEP 6.5 [{variant_label}]: Compute normalization statistics")
+    logger.info("="*70)
+
+    output_dataset_dir.mkdir(parents=True, exist_ok=True)
+    norm_stats = dataset_creator_enh.compute_and_save_normalization_stats(
+        splits['X_train'], splits['y_train'], output_dataset_dir,
+    )
+
+    dataset_creator_enh.verify_no_data_leakage(
+        splits['X_train'], splits['y_train'],
+        splits['X_val'],   splits['y_val'],
+        splits['X_test'],  splits['y_test'],
+        norm_stats,
+    )
+
+    # ── Step 6.6: Normalise all splits (in-place) ─────────────────────────
+    logger.info("Normalizing training data…")
+    splits['X_train'], splits['y_train'] = dataset_creator_enh.normalize_data(
+        splits['X_train'], splits['y_train'], norm_stats)
+    logger.info("Normalizing validation data…")
+    splits['X_val'], splits['y_val'] = dataset_creator_enh.normalize_data(
+        splits['X_val'], splits['y_val'], norm_stats)
+    logger.info("Normalizing test data…")
+    splits['X_test'], splits['y_test'] = dataset_creator_enh.normalize_data(
+        splits['X_test'], splits['y_test'], norm_stats)
+
+    # ── Diagnostics ───────────────────────────────────────────────────────
+    channel_names = metadata.get("channel_order", None)
+    try:
+        diag.plot_split_distributions(splits,
+                                      filename=f"06_split_distributions_{variant_label}.png")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
+    try:
+        diag.plot_channel_correlation(splits.get("X_train"), channel_names=channel_names,
+                                      filename=f"08_channel_correlation_{variant_label}.png")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] channel correlation plot failed: {_e}")
+    try:
+        diag.plot_pipeline_summary(splits, metadata,
+                                   filename=f"10_pipeline_summary_{variant_label}.png")
+    except Exception as _e:
+        logger.warning(f"[Diagnostics] pipeline summary plot failed: {_e}")
+
+    # ── Step 6.7: Finalise metadata ───────────────────────────────────────
+    fusion_strategy = "multi-sensor" if use_fusion else "landsat-only"
+    metadata['fusion_info'] = {
+        'fusion_strategy':     fusion_strategy,
+        'landsat_available':   has_landsat,
+        'sentinel2_available': has_sentinel2,
+        'total_samples':       metadata["n_samples"],
+        'dataset_variant':     variant_label,
+    }
+
+    # Sample weights for training split
+    sample_weights_meta = metadata.pop("sample_weights", None)
+    if sample_weights_meta is not None:
+        y_tr = splits['y_train']
+        pm_tr = y_tr[:, :, :, 0].reshape(len(y_tr), -1).mean(axis=1)
+        n_wb  = PREPROCESSING_CONFIG["sample_weight_n_bins"]
+        be    = np.linspace(pm_tr.min(), pm_tr.max() + 1e-6, n_wb + 1)
+        bids  = np.clip(np.digitize(pm_tr, be) - 1, 0, n_wb - 1)
+        bc    = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)
+        rw    = 1.0 / bc[bids]
+        train_weights = rw / rw.mean()
+        weights_path = output_dataset_dir / "train" / "weights_train.npy"
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(weights_path, train_weights.astype(np.float32))
+        logger.info(f"✅ Saved sample weights → {weights_path}")
+
+    # save_dataset streams splits one at a time and deletes each from dict
+    dataset_creator_enh.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
+
+    logger.info("\n" + "="*70)
+    logger.info(f"✓ VARIANT COMPLETE: {variant_label}")
+    logger.info("="*70)
+    logger.info(f"  Fusion strategy:  {fusion_strategy}")
+    logger.info(f"  Total samples:    {metadata['n_samples']}")
+    logger.info(f"  Output directory: {output_dataset_dir}")
+    logger.info(f"  Patch grid:       {metadata.get('patch_grid_rows','?')} rows "
+                f"× {metadata.get('patch_grid_cols','?')} cols")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
-    """Main preprocessing pipeline - processes and fuses multi-sensor data"""
+    """
+    Main preprocessing pipeline.
+
+    Produces TWO independent datasets for model comparison:
+
+      1. cnn_dataset_landsat/   — Landsat bands + indices only (baseline)
+      2. cnn_dataset_fusion/    — Landsat LST + quality-weighted
+                                  Landsat/Sentinel-2 spectral indices
+
+    Memory design
+    ─────────────
+    Step 1 (file scanning) stores only _SceneRecord objects (path + QC stats).
+    No band arrays are kept in RAM between processing runs.  Each variant
+    re-loads files one at a time inside _run_pipeline_variant, writes patches
+    directly into a disk-backed memmap, then loads only the QC-filtered
+    subset for splitting.  Peak RSS is therefore bounded by a single
+    epoch's worth of raster data plus the final normalised split arrays.
+    """
     logger.info("="*70)
-    logger.info("MULTI-SENSOR PREPROCESSING PIPELINE")
+    logger.info("MULTI-SENSOR PREPROCESSING PIPELINE  (dual-dataset / low-RAM mode)")
     logger.info("="*70)
-    
-    # Define input directories
-    raw_data_dir = RAW_DATA_DIR
-    landsat_dir = raw_data_dir / "landsat"
+
+    raw_data_dir  = RAW_DATA_DIR
+    landsat_dir   = raw_data_dir / "landsat"
     sentinel2_dir = raw_data_dir / "sentinel2"
-    
-    # Check what data is available
-    has_landsat = landsat_dir.exists()
+
+    has_landsat   = landsat_dir.exists()
     has_sentinel2 = sentinel2_dir.exists()
-    
+
     if not has_landsat and not has_sentinel2:
         logger.error(f"No raw data found in {raw_data_dir}")
         logger.error("Please run earth_engine_loader.py first to download data")
         return
-    
-    logger.info(f"Data availability:")
-    logger.info(f"  Landsat: {'✓' if has_landsat else '✗'}")
-    logger.info(f"  Sentinel-2: {'✓' if has_sentinel2 else '✗'}")
-    
-    # Initialize components
-    landsat_preprocessor = SatellitePreprocessor(satellite_type="landsat")
-    sentinel2_preprocessor = SatellitePreprocessor(satellite_type="sentinel2")
-    fusion = MultiSensorFusion()
-    dataset_creator = DatasetCreator()
-    feature_engineer = FeatureEngineer()
 
-    # ── DIAGNOSTICS: initialise visualisation helper ────────────────────────
-    output_dataset_dir_early = PROCESSED_DATA_DIR / "cnn_dataset"
-    diag = PreprocessingDiagnostics(output_dir=output_dataset_dir_early)
-    logger.info("[Diagnostics] Diagnostics module initialised")
-    
-    # Step 1: Process Landsat data
-    landsat_processed = []
+    logger.info(f"Data availability:")
+    logger.info(f"  Landsat:    {'✓' if has_landsat else '✗'}")
+    logger.info(f"  Sentinel-2: {'✓' if has_sentinel2 else '✗'}")
+    logger.info(f"  Mode: {'dual (landsat-only + fusion)' if has_sentinel2 else 'landsat-only'}")
+
+    # Shared diagnostics — plots land in cnn_dataset_landsat/diagnostics
+    diag_base_dir = PROCESSED_DATA_DIR / "cnn_dataset_landsat"
+    diag = PreprocessingDiagnostics(output_dir=diag_base_dir)
+
+    # ── STEP 1A: Scan Landsat files — store records, don't hold arrays ────
+    landsat_records: List[_SceneRecord] = []
     if has_landsat:
         logger.info("\n" + "="*70)
-        logger.info("STEP 1A: Process Landsat data")
+        logger.info("STEP 1A: Scan Landsat files (lazy — no band arrays yet)")
         logger.info("="*70)
-        
+
+        landsat_preprocessor = SatellitePreprocessor(satellite_type="landsat")
         landsat_files = sorted(
-            list(landsat_dir.glob("Landsat_*.tif")) +   # GEE export (new)
-            list(landsat_dir.glob("landsat_*.tif"))     # lower-case variant
+            list(landsat_dir.glob("Landsat_*.tif")) +
+            list(landsat_dir.glob("landsat_*.tif"))
         )
         logger.info(f"Found {len(landsat_files)} Landsat files")
-        
+
         for raw_file in landsat_files:
             parts = raw_file.stem.split('_')
             try:
@@ -4840,85 +5546,78 @@ def main():
                 logger.warning(f"  Cannot parse date from {raw_file.name}, skipping")
                 continue
             timestamp = pd.Timestamp(year=year, month=month, day=15)
-            
-            # Process the file
-            processed = landsat_preprocessor.process_raw_file(raw_file, calculate_lst=True)
-            
-            if processed is None:
-                continue
-            
-            # Validate LST
-            if "LST" not in processed:
-                logger.warning(f"  No LST in {raw_file.name}, skipping")
-                continue
-            
-            lst_finite = processed["LST"][np.isfinite(processed["LST"])]
-            lst_std = float(np.nanstd(lst_finite)) if lst_finite.size > 1 else 0.0
-            lst_valid_ratio = lst_finite.size / processed["LST"].size
-            
-            if lst_std < PREPROCESSING_CONFIG["scene_min_lst_std"]:
-                logger.warning(f"  LST variance too low ({lst_std:.2f}°C), skipping")
-                continue
-            
-            if lst_valid_ratio < PREPROCESSING_CONFIG["scene_min_valid_ratio"]:
-                logger.warning(f"  LST valid ratio too low ({lst_valid_ratio*100:.1f}%), skipping")
-                continue
-            
-            landsat_processed.append((timestamp, processed))
-            logger.info(f"  ✓ {raw_file.name}")
 
-            # ── DIAGNOSTIC PLOTS (first file only) ────────────────────
-            if len(landsat_processed) == 1:
+            # Quick QC scan — load once, check LST, then evict
+            processed = landsat_preprocessor.process_raw_file(raw_file, calculate_lst=True)
+            if processed is None or "LST" not in processed:
+                logger.warning(f"  {raw_file.name}: no LST, skipping")
+                continue
+
+            lst_finite      = processed["LST"][np.isfinite(processed["LST"])]
+            lst_std         = float(np.nanstd(lst_finite)) if lst_finite.size > 1 else 0.0
+            lst_valid_ratio = lst_finite.size / processed["LST"].size
+
+            if lst_std < PREPROCESSING_CONFIG["scene_min_lst_std"]:
+                logger.warning(f"  {raw_file.name}: LST variance too low ({lst_std:.2f}°C), skipping")
+                del processed; gc.collect()
+                continue
+            if lst_valid_ratio < PREPROCESSING_CONFIG["scene_min_valid_ratio"]:
+                logger.warning(f"  {raw_file.name}: LST valid ratio too low ({lst_valid_ratio*100:.1f}%), skipping")
+                del processed; gc.collect()
+                continue
+
+            # Generate diagnostics for the first file while data is still in RAM
+            if not landsat_records:
                 try:
                     raw_data_for_plot = load_tif_as_bands(raw_file) or {}
-                    diag.plot_raw_bands(
-                        raw_data_for_plot,
-                        title=f"Raw Bands – {raw_file.name}",
-                        filename="01_raw_bands_landsat.png",
-                    )
-                    diag.plot_spectral_indices(
-                        processed,
-                        filename="02_spectral_indices_landsat.png",
-                    )
-                    # LST validation plot (raw vs clean already computed above)
-                    if "LST" in processed:
-                        raw_lst = raw_data_for_plot.get("ST_B10")
-                        if raw_lst is not None:
-                            ndvi_tmp = processed.get("NDVI", np.zeros_like(raw_lst, dtype=float))
-                            lst_raw_calc = landsat_preprocessor.calculate_lst_from_thermal(
-                                raw_lst, ndvi_tmp
-                            )
-                            if lst_raw_calc is not None:
-                                _, tmp_stats = landsat_preprocessor.validate_lst(lst_raw_calc)
-                                diag.plot_lst_validation(
-                                    lst_raw_calc,
-                                    processed["LST"],
-                                    tmp_stats,
-                                    filename="03_lst_validation.png",
-                                )
-                        diag.plot_lst_vs_indices(
-                            processed,
-                            filename="04_lst_vs_indices_landsat.png",
-                        )
+                    diag.plot_raw_bands(raw_data_for_plot, title=f"Raw Bands – {raw_file.name}",
+                                        filename="01_raw_bands_landsat.png")
+                    diag.plot_spectral_indices(processed, filename="02_spectral_indices_landsat.png")
+                    raw_lst = raw_data_for_plot.get("ST_B10")
+                    if raw_lst is not None:
+                        ndvi_tmp = processed.get("NDVI", np.zeros_like(raw_lst, dtype=float))
+                        lst_raw_calc = landsat_preprocessor.calculate_lst_from_thermal(raw_lst, ndvi_tmp)
+                        if lst_raw_calc is not None:
+                            _, tmp_stats = landsat_preprocessor.validate_lst(lst_raw_calc)
+                            diag.plot_lst_validation(lst_raw_calc, processed["LST"], tmp_stats,
+                                                     filename="03_lst_validation.png")
+                    diag.plot_lst_vs_indices(processed, filename="04_lst_vs_indices_landsat.png")
+                    del raw_data_for_plot, lst_raw_calc
                 except Exception as _e:
-                    logger.warning(f"[Diagnostics] plot failed for {raw_file.name}: {_e}")
-            # ──────────────────────────────────────────────────────────
-        
-        logger.info(f"\n✓ Processed {len(landsat_processed)} Landsat files")
-    
-    # Step 2: Process Sentinel-2 data
-    sentinel2_processed = []
+                    logger.warning(f"[Diagnostics] LS plot failed: {_e}")
+
+            # Evict arrays — only path + stats are kept
+            del processed; gc.collect()
+
+            rec = _SceneRecord(
+                timestamp=timestamp, path=raw_file,
+                satellite_type="landsat",
+                lst_std=lst_std, lst_valid_ratio=lst_valid_ratio,
+            )
+            landsat_records.append(rec)
+            logger.info(f"  ✓ {raw_file.name}  (LST std={lst_std:.2f}°C, "
+                        f"valid={lst_valid_ratio*100:.1f}%)")
+
+        logger.info(f"\n✓ Registered {len(landsat_records)} Landsat scenes")
+
+    # ── STEP 1B: Scan Sentinel-2 files ────────────────────────────────────
+    sentinel2_records: List[_SceneRecord] = []
     if has_sentinel2:
         logger.info("\n" + "="*70)
-        logger.info("STEP 1B: Process Sentinel-2 data")
+        logger.info("STEP 1B: Scan Sentinel-2 files (lazy)")
         logger.info("="*70)
-        
+
+        sentinel2_preprocessor = SatellitePreprocessor(satellite_type="sentinel2")
         sentinel2_files = sorted(
-            list(sentinel2_dir.glob("Sentinel2_*.tif")) +   # GEE export (new)
-            list(sentinel2_dir.glob("sentinel2_*.tif"))     # lower-case variant
+            list(sentinel2_dir.glob("Sentinel2_*.tif")) +
+            list(sentinel2_dir.glob("sentinel2_*.tif"))
         )
         logger.info(f"Found {len(sentinel2_files)} Sentinel-2 files")
-        
+
+        # Keep first processed result briefly for cross-sensor diagnostics
+        first_s2_processed = None
+        first_s2_raw       = None
+
         for raw_file in sentinel2_files:
             parts = raw_file.stem.split('_')
             try:
@@ -4928,729 +5627,113 @@ def main():
                 logger.warning(f"  Cannot parse date from {raw_file.name}, skipping")
                 continue
             timestamp = pd.Timestamp(year=year, month=month, day=15)
-            
-            # Process the file
+
             processed = sentinel2_preprocessor.process_raw_file(raw_file, calculate_lst=False)
-            
             if processed is None:
                 continue
-            
-            # Check if we have essential indices
-            required = ["NDVI", "NDBI", "MNDWI"]
-            if not all(idx in processed for idx in required):
-                logger.warning(f"  Missing required indices in {raw_file.name}, skipping")
+            if not all(k in processed for k in ("NDVI", "NDBI", "MNDWI")):
+                logger.warning(f"  {raw_file.name}: missing required indices, skipping")
+                del processed; gc.collect()
                 continue
-            
-            sentinel2_processed.append((timestamp, processed))
-            logger.info(f"  ✓ {raw_file.name}")
 
-            # ── DIAGNOSTIC PLOTS (first S2 file only) ─────────────────
-            if len(sentinel2_processed) == 1:
+            if not sentinel2_records:
+                # First S2 file — generate S2-specific diagnostics now
                 try:
                     raw_s2_data = load_tif_as_bands(raw_file) or {}
-                    diag.plot_s2_raw_bands(
-                        raw_s2_data,
-                        filename="s2_01_raw_bands.png",
-                    )
-                    diag.plot_s2_spectral_indices(
-                        processed,
-                        filename="s2_02_spectral_indices.png",
-                    )
-                    diag.plot_s2_band_statistics(
-                        raw_s2_data,
-                        filename="s2_03_band_statistics.png",
-                    )
-                    diag.plot_s2_data_quality(
-                        raw_s2_data,
-                        filename="s2_04_data_quality.png",
-                    )
-                    diag.plot_s2_band_ratios(
-                        raw_s2_data,
-                        filename="s2_05_band_ratios.png",
-                    )
-                    diag.plot_s2_landcover_proxy(
-                        processed,
-                        filename="s2_06_landcover_proxy.png",
-                    )
+                    diag.plot_s2_raw_bands(raw_s2_data,        filename="s2_01_raw_bands.png")
+                    diag.plot_s2_spectral_indices(processed,   filename="s2_02_spectral_indices.png")
+                    diag.plot_s2_band_statistics(raw_s2_data,  filename="s2_03_band_statistics.png")
+                    diag.plot_s2_data_quality(raw_s2_data,     filename="s2_04_data_quality.png")
+                    diag.plot_s2_band_ratios(raw_s2_data,      filename="s2_05_band_ratios.png")
+                    diag.plot_s2_landcover_proxy(processed,    filename="s2_06_landcover_proxy.png")
+                    del raw_s2_data
                 except Exception as _e:
-                    logger.warning(f"[Diagnostics] S2 plots failed for {raw_file.name}: {_e}")
-            # ──────────────────────────────────────────────────────────
-        
-        logger.info(f"\n✓ Processed {len(sentinel2_processed)} Sentinel-2 files")
+                    logger.warning(f"[Diagnostics] S2 plot failed: {_e}")
+                # Cache for cross-sensor plot once Landsat is available
+                first_s2_processed = processed
+                first_s2_raw       = raw_file
 
-        # ── DIAGNOSTIC: S2 temporal trends & resolution comparison ────
-        try:
-            if len(sentinel2_processed) >= 2:
-                diag.plot_s2_temporal_trends(
-                    sentinel2_processed,
-                    filename="s2_07_temporal_trends.png",
-                )
-            if len(sentinel2_processed) >= 1 and len(landsat_processed) >= 1:
-                diag.plot_sensor_agreement(
-                    landsat_processed[0][1],
-                    sentinel2_processed[0][1],
-                    filename="s2_08_sensor_agreement.png",
-                )
-                diag.plot_resolution_comparison(
-                    sentinel2_processed[0][1],
-                    landsat_processed[0][1],
-                    index="NDVI",
-                    filename="s2_09_resolution_comparison.png",
-                )
-            if len(sentinel2_processed) >= 2:
-                diag.plot_s2_scene_variability(
-                    sentinel2_processed,
-                    filename="s2_10_scene_variability.png",
-                )
-        except Exception as _e:
-            logger.warning(f"[Diagnostics] S2 multi-scene plots failed: {_e}")
-        # ──────────────────────────────────────────────────────────────
-    
-    # Steps 2 + 3 (combined): fuse and immediately extract patches,
-    # freeing each raster as soon as its patches are done.
-    # Previously all_fused_data held every raster in RAM before patch
-    # extraction even began — for 10 years of monthly data this was several GB.
-    logger.info("\n" + "="*70)
-    logger.info("STEP 2+3: Fuse data and extract patches (streaming)")
-    logger.info("="*70)
+            rec = _SceneRecord(timestamp=timestamp, path=raw_file, satellite_type="sentinel2")
+            sentinel2_records.append(rec)
+            logger.info(f"  ✓ {raw_file.name}")
 
-    all_patches: List[Dict] = []
-    all_dates:   List       = []
-    all_rasters: List       = []   # (raster_dict, [position_patches]) pairs
+            # Evict unless it's the first file still needed for cross-sensor plot
+            if len(sentinel2_records) > 1:
+                del processed; gc.collect()
 
-    # ── Patch grid shape tracking ─────────────────────────────────────────────
-    # We record the grid dimensions from every raster and take the most common
-    # value (mode) so a single anomalous raster doesn't pollute the metadata.
-    # For a well-configured pipeline all rasters share the same spatial extent
-    # and therefore the same grid shape; the mode is just a safety net.
-    _all_grid_rows: List[int] = []
-    _all_grid_cols: List[int] = []
+        logger.info(f"\n✓ Registered {len(sentinel2_records)} Sentinel-2 scenes")
 
-    # ── Pre-patching LST snapshots — used for the pre-vs-post diagnostic plot.
-    # Each entry is (date_label, lst_2d_array) for one epoch BEFORE patch QC.
-    _all_lst_rasters: List = []
-
-    # ── Epoch counter — used to give each temporal epoch a unique row-offset
-    # in the combined patch_positions array.  Without this, patches from
-    # different dates share the same (grid_row, grid_col) values and overwrite
-    # each other in the mosaic assembler, creating a checkerboard artefact.
-    # Epoch N's patches are placed at rows [N * grid_rows ... (N+1)*grid_rows - 1].
-    _epoch_index: List[int] = []   # epoch number for each entry in all_rasters
-
-    first_fused_diag = True
-
-    def _fuse_extract_free(fused_data: Dict, date, label: str) -> None:
-        """Extract position-only patches, store raster ref, free bands later."""
-        # ── Snapshot the raw LST before any patch QC ──────────────────────────
-        # We store a lightweight copy here so plot_lst_pre_patching can compare
-        # the full-raster LST (cloud gaps, ocean fill, etc.) against the
-        # post-patching mosaic reconstruction produced later in main().
-        _lst_raw = fused_data.get("LST")
-        if _lst_raw is not None and np.any(np.isfinite(_lst_raw)):
-            _all_lst_rasters.append(
-                (str(label), _lst_raw.copy())
-            )
-        # ─────────────────────────────────────────────────────────────────────
-        result = dataset_creator.extract_patches(
-            fused_data,
-            patch_size=64, stride=24, min_valid_ratio=0.95,
-            min_variance=0.3, min_temp=10.0, max_temp=65.0,
-        )
-        # extract_patches now returns a named PatchResult(patches, grid_rows, grid_cols)
-        patches = result.patches
-
-        # FIX: Skip entirely-cloud-covered / all-NaN epochs (zero valid patches).
-        # Previously an epoch that passed LST-std/valid-ratio checks at the scene
-        # level but yielded 0 acceptable patches (e.g. Epoch 31 = 100% cloud) was
-        # still appended to _all_grid_rows, inflating the cumulative row offset for
-        # every subsequent epoch and misaligning their mosaic slices.  By returning
-        # early we keep _all_grid_rows in sync with the epochs that actually have
-        # canvas rows, so the slicer boundaries remain correct.
-        if not patches:
-            logger.warning(
-                f"  {label}: 0 patches extracted "
-                f"(grid {result.grid_rows}r×{result.grid_cols}c) — "
-                f"epoch skipped (all-cloud or all-NaN scene)."
-            )
-            # Still record the raster so it can be freed, but mark it as empty.
-            all_rasters.append((fused_data, []))
-            all_dates.append(date)
-            return
-
-        _all_grid_rows.append(result.grid_rows)
-        _all_grid_cols.append(result.grid_cols)
-
-        # ── Offset grid_row by epoch index so patches from different dates
-        # never share the same grid position.  The epoch's row-offset equals
-        # the cumulative row count of all preceding (non-empty) epochs.
-        epoch_idx = len(_epoch_index)
-        _epoch_index.append(epoch_idx)
-        prior_rows = sum(_all_grid_rows[:-1])   # total rows from previous epochs
-        for p in patches:
-            p["date"] = date
-            # Shift _grid_row by the epoch offset so each epoch occupies its own
-            # row band in the combined grid.  _grid_col stays unchanged.
-            if p.get("_grid_row", -1) >= 0:
-                p["_grid_row"] = p["_grid_row"] + prior_rows
-
-        all_patches.extend(patches)
-        all_dates.append(date)
-        # Keep a reference to the raster alongside its patches so
-        # create_training_samples can slice from it without re-loading.
-        all_rasters.append((fused_data, patches))
-        logger.info(f"  {label}: {len(patches)} patches "
-                    f"(grid {result.grid_rows}r×{result.grid_cols}c, "
-                    f"epoch row-offset={prior_rows}, "
-                    f"running total: {len(all_patches)})")
-
-    if has_landsat and has_sentinel2 and len(landsat_processed) > 0 and len(sentinel2_processed) > 0:
-        logger.info("Performing multi-sensor fusion (streaming)...")
-        matches = fusion.temporal_match(
-            landsat_processed, sentinel2_processed,
-            max_time_diff_days=PREPROCESSING_CONFIG["max_time_diff_days"],
-        )
-        del landsat_processed, sentinel2_processed
-        gc.collect()
-
-        for mi, (avg_date, ls_data, s2_data, time_diff) in enumerate(matches):
-            logger.info(f"\nFusing pair {mi+1}/{len(matches)} (Δt={time_diff}d):")
-            fused_data = fusion.fuse_data(ls_data, s2_data, time_diff,
-                                         target_resolution=PREPROCESSING_CONFIG["fusion_target_resolution"])
-
-            if all(k in fused_data for k in ("NDVI", "NDBI", "MNDWI")):
-                fused_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
-                    fused_data["NDVI"], fused_data["NDBI"], fused_data["MNDWI"]
-                )
-
-            if first_fused_diag:
-                try:
-                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
-                                                index="NDVI",
-                                                filename="09_fusion_comparison_NDVI.png")
-                    diag.plot_fusion_comparison(ls_data, s2_data, fused_data,
-                                                index="NDBI",
-                                                filename="09b_fusion_comparison_NDBI.png")
-                    diag.plot_fusion_weight_map(ls_data, s2_data, fused_data,
-                                                time_diff=time_diff,
-                                                filename="s2_11_fusion_weights.png")
-                    diag.plot_impervious_surface_analysis(fused_data,
-                                                          filename="s2_12_impervious_surface.png")
-                except Exception as _e:
-                    logger.warning(f"[Diagnostics] fusion plots failed: {_e}")
-                first_fused_diag = False
-
-            del ls_data, s2_data
+        # Cross-sensor diagnostics (needs one LS + one S2 result simultaneously)
+        if first_s2_processed is not None and landsat_records:
+            try:
+                ls0_data = landsat_records[0].load()
+                if ls0_data:
+                    diag.plot_sensor_agreement(ls0_data, first_s2_processed,
+                                               filename="s2_08_sensor_agreement.png")
+                    diag.plot_resolution_comparison(first_s2_processed, ls0_data,
+                                                    index="NDVI",
+                                                    filename="s2_09_resolution_comparison.png")
+                landsat_records[0].evict()
+            except Exception as _e:
+                logger.warning(f"[Diagnostics] cross-sensor plots failed: {_e}")
+            del first_s2_processed, first_s2_raw
             gc.collect()
 
-            _fuse_extract_free(fused_data, avg_date, f"Pair {mi+1}/{len(matches)}")
-
-        logger.info(f"\n✓ Processed {len(matches)} fused pairs, "
-                    f"{len(all_patches)} total patches")
-
-    elif has_landsat and len(landsat_processed) > 0:
-        logger.info("Using Landsat data only (no Sentinel-2 available)")
-        n_ls = len(landsat_processed)
-        for li, (timestamp, ls_data) in enumerate(landsat_processed):
-            if all(k in ls_data for k in ("NDVI", "NDBI", "MNDWI")):
-                ls_data["impervious_surface"] = feature_engineer.calculate_impervious_surface(
-                    ls_data["NDVI"], ls_data["NDBI"], ls_data["MNDWI"]
-                )
-            _fuse_extract_free(ls_data, timestamp, f"Landsat {li+1}/{n_ls}")
-        del landsat_processed
-        gc.collect()
-
-    else:
-        logger.error("No valid data available for training")
+    if not landsat_records:
+        logger.error("No valid Landsat scenes — cannot continue.")
         return
 
-    if not all_patches:
-        logger.error("No patches extracted")
-        return
-    
-    # Patch quality diagnostic (before patches are freed)
-    # Pass the first raster's LST to enable visual patch thumbnails.
-    # This lets the plot reveal NaN-fill artefacts (flat cyan blobs) directly.
-    try:
-        _diag_raster = all_rasters[0][0] if all_rasters else None
-        diag.plot_patch_diagnostics(
-            all_patches,
-            raster_data=_diag_raster,
-            filename="05_patch_diagnostics.png",
-        )
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] patch plot failed: {_e}")
-
-    # Step 4: Create training samples (streaming — one raster at a time)
+    # ══════════════════════════════════════════════════════════════════════
+    # VARIANT 1: LANDSAT-ONLY
+    # ══════════════════════════════════════════════════════════════════════
     logger.info("\n" + "="*70)
-    logger.info("STEP 4: Create training samples")
+    logger.info("PRODUCING DATASET VARIANT 1/2: LANDSAT-ONLY")
     logger.info("="*70)
+    _run_pipeline_variant(
+        landsat_records    = landsat_records,
+        sentinel2_records  = sentinel2_records,
+        has_landsat        = has_landsat,
+        has_sentinel2      = has_sentinel2,
+        output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset_landsat",
+        diag               = diag,
+        variant_label      = "landsat_only",
+        force_landsat_only = True,
+    )
+    gc.collect()
 
-    temporal_features = feature_engineer.encode_temporal_features(all_dates[0])
-    dates_all = np.array([patch["date"] for patch in all_patches])
-
-    # Build X/y by streaming through each (raster, patches) pair, freeing
-    # the raster dict immediately after its patches are written into X/y.
-    channel_order = PREPROCESSING_CONFIG["channel_order"]
-    n_channels = len(channel_order)
-    patch_size = PREPROCESSING_CONFIG["patch_size"]
-    n_total    = len(all_patches)
-
-    X = np.zeros((n_total, patch_size, patch_size, n_channels), dtype=np.float32)
-    y = np.zeros((n_total, patch_size, patch_size, 1),           dtype=np.float32)
-    # Per-patch spatial grid positions — (grid_row, grid_col) — needed by the
-    # mosaic assembler to place each patch at its correct canvas cell even after
-    # QC filtering removes some patches from the full scan grid.
-    positions_all = np.full((n_total, 2), -1, dtype=np.int32)
-
-    write_idx = 0
-    for raster_data, raster_patches in all_rasters:
-        for p in raster_patches:
-            r, c = p["position"]
-            for ch_idx, feat in enumerate(channel_order):
-                arr = raster_data.get(feat)
-                if arr is not None:
-                    X[write_idx, :, :, ch_idx] = arr[r:r+patch_size, c:c+patch_size]
-            lst_arr = raster_data.get("LST")
-            if lst_arr is not None:
-                y[write_idx, :, :, 0] = lst_arr[r:r+patch_size, c:c+patch_size]
-            positions_all[write_idx, 0] = p.get("_grid_row", -1)
-            positions_all[write_idx, 1] = p.get("_grid_col", -1)
-            write_idx += 1
-        # Free this raster immediately — its data is now in X/y
-        raster_data.clear()
+    # ══════════════════════════════════════════════════════════════════════
+    # VARIANT 2: FUSION  (only if S2 data exists)
+    # ══════════════════════════════════════════════════════════════════════
+    if has_sentinel2 and sentinel2_records:
+        logger.info("\n" + "="*70)
+        logger.info("PRODUCING DATASET VARIANT 2/2: LANDSAT + SENTINEL-2 FUSION")
+        logger.info("="*70)
+        _run_pipeline_variant(
+            landsat_records    = landsat_records,
+            sentinel2_records  = sentinel2_records,
+            has_landsat        = has_landsat,
+            has_sentinel2      = has_sentinel2,
+            output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset_fusion",
+            diag               = diag,
+            variant_label      = "fusion",
+            force_landsat_only = False,
+        )
         gc.collect()
 
-    del all_rasters
-    gc.collect()
-
-    # Free the patch list — no longer needed once X/y are filled
-    del all_patches
-    gc.collect()
-    logger.info("  Freed rasters and patch list from memory")
-
-    # QC + NaN fill + safety clip
-    # Temperature bounds aligned with validate_lst (Tier-1 pixel gate: 10–65 °C).
-    valid_mask = np.ones(n_total, dtype=bool)
-    _qc_min_valid = PREPROCESSING_CONFIG["patch_min_valid_ratio"]
-    _qc_t_lo = PREPROCESSING_CONFIG["lst_min_pixel_temp"]
-    _qc_t_hi = PREPROCESSING_CONFIG["lst_max_pixel_temp"]
-    for s in range(n_total):
-        lst_p = y[s, :, :, 0]
-        fin   = np.isfinite(lst_p)
-        if fin.mean() < _qc_min_valid:
-            valid_mask[s] = False; continue
-        lst_mean = float(lst_p[fin].mean()) if fin.any() else 0.0
-        if not (_qc_t_lo <= lst_mean <= _qc_t_hi):
-            valid_mask[s] = False
-
-    if not valid_mask.all():
-        dropped = int((~valid_mask).sum())
-        logger.info(f"  QC dropped {dropped}/{n_total} samples")
-        X             = X[valid_mask]
-        y             = y[valid_mask]
-        dates_all     = dates_all[valid_mask]
-        positions_all = positions_all[valid_mask]
-
-    n_samples = len(X)
-
-    # ── Resolve the canonical patch grid shape ───────────────────────────────
-    # _all_grid_rows / _all_grid_cols were populated by _fuse_extract_free.
-    # grid_rows = TOTAL stacked rows across all epochs.
-    # grid_cols = the authoritative column count from extract_patches().
-    #
-    # ROOT CAUSE OF EAST/SOUTH CUTOFF BUG
-    # ─────────────────────────────────────
-    # Previously patch_grid_cols was derived from:
-    #   positions_all[:, 1].max() + 1   (max observed _grid_col + 1)
-    #
-    # This is WRONG when QC filtering removes ALL patches from the easternmost
-    # (or southernmost) grid columns.  In the Jakarta AOI the east edge contains
-    # water/bay pixels (Jakarta Bay, Java Sea) which fail both the variance test
-    # (flat water temperature → std < 0.3°C) and the valid-ratio test (ocean has
-    # no LST → NaN ratio > 5%).  All patches in grid_cols 39–44 are rejected,
-    # so max(_grid_col) = 38, giving patch_grid_cols = 39 instead of 45.
-    #
-    # A canvas built with 39 cols has width = (39-1)*24+64 = 976 px.
-    # The raster is 1126 px wide → 150 missing columns = ~5 km of east Jakarta
-    # (Cilincing, Marunda, Segaramakmur).  Exactly what the user observed.
-    #
-    # FIX: use the AUTHORITATIVE grid_cols stored in _all_grid_cols by
-    # extract_patches() (which counts ALL candidate positions, before QC).
-    # Use the MODE across epochs so a single anomalous raster doesn't dominate.
-    # Fall back to max(positions_all col) + 1 only if _all_grid_cols is empty.
-    if _all_grid_cols:
-        patch_grid_rows = int(sum(_all_grid_rows))
-
-        # FIX: use the authoritative col count from extract_patches() (pre-QC),
-        # not the max observed _grid_col which is truncated by QC rejection at
-        # the east/south edges (water, cloud, low-variance coastal pixels).
-        _col_counts = Counter(_all_grid_cols)
-        patch_grid_cols = int(_col_counts.most_common(1)[0][0])
-
-        # Cross-check: if some epochs had different raster widths (e.g. one epoch
-        # was downsampled differently), take the maximum so the canvas is large
-        # enough to hold all epochs, then warn.
-        _max_recorded_cols = max(_all_grid_cols)
-        if _max_recorded_cols > patch_grid_cols:
-            logger.warning(
-                f"  ⚠ grid_cols mode={patch_grid_cols} < max={_max_recorded_cols}. "
-                f"Using max to avoid east-edge truncation."
-            )
-            patch_grid_cols = _max_recorded_cols
-
-        # Sanity check against observed positions: if a patch somehow has a col
-        # index beyond the recorded grid_cols (shouldn't happen, but guard it),
-        # extend the canvas to fit.
-        if np.any(positions_all[:, 1] >= 0):
-            _obs_max_col = int(positions_all[positions_all[:, 1] >= 0, 1].max()) + 1
-            if _obs_max_col > patch_grid_cols:
-                logger.warning(
-                    f"  ⚠ Observed max col index {_obs_max_col - 1} exceeds "
-                    f"recorded grid_cols={patch_grid_cols}. Extending to {_obs_max_col}."
-                )
-                patch_grid_cols = _obs_max_col
-
-        logger.info(
-            f"  Patch grid shape (stacked across {len(_all_grid_rows)} epochs): "
-            f"{patch_grid_rows} total rows × {patch_grid_cols} cols"
-        )
-        logger.info(
-            f"  Per-epoch row counts: {_all_grid_rows}"
-        )
-        logger.info(
-            f"  Per-epoch col counts (authoritative, pre-QC): {_all_grid_cols}"
-        )
-        if len(set(_all_grid_cols)) > 1:
-            logger.warning(
-                f"  ⚠ Rasters have different grid widths: {sorted(set(_all_grid_cols))}. "
-                f"patch_grid_cols resolved as mode={patch_grid_cols} (authoritative pre-QC count)."
-            )
+        logger.info("\n" + "="*70)
+        logger.info("✓ BOTH DATASET VARIANTS COMPLETE")
+        logger.info("="*70)
+        logger.info("  cnn_dataset_landsat/  — Landsat-only baseline")
+        logger.info("  cnn_dataset_fusion/   — Landsat + Sentinel-2 quality-weighted fusion")
+        logger.info("")
+        logger.info("To compare model performance, train two separate model runs:")
+        logger.info("  python train.py --data processed/cnn_dataset_landsat")
+        logger.info("  python train.py --data processed/cnn_dataset_fusion")
     else:
-        # Fallback: estimate from positions_all when _all_grid_cols is empty.
-        # (all_rasters is already freed at this point, so we cannot re-read it.)
-        # NOTE: this path still has the truncation risk if eastern patches are
-        # all rejected by QC.  It is only reached when _fuse_extract_free never
-        # populated _all_grid_cols (i.e. 0 non-empty epochs), which is already
-        # a fatal pipeline failure caught below.
-        if np.any(positions_all >= 0):
-            valid_pos = positions_all[positions_all[:, 1] >= 0]
-            patch_grid_cols = int(valid_pos[:, 1].max()) + 1
-            patch_grid_rows = int(positions_all[positions_all[:, 0] >= 0, 0].max()) + 1
-        else:
-            patch_grid_cols = patch_grid_rows = None
-        logger.warning("  ⚠ _all_grid_cols is empty — patch grid shape estimated from positions_all.")
-
-    # ── DIAGNOSTIC: LST raw rasters overview (PRE-patching) ─────────────────
-    # Mirrors the post-patching mosaic plot so you can compare the full raw
-    # LST (with cloud/ocean gaps, no patch QC applied) against the cleaned
-    # mosaic produced from the surviving patches.
-    try:
-        if _all_lst_rasters:
-            diag.plot_lst_pre_patching(
-                lst_rasters = _all_lst_rasters,
-                geo_bounds  = STUDY_AREA.get("bounds"),
-                filename    = "P_mosaic_lst_pre_patching.png",
-            )
-            logger.info(
-                f"[Diagnostics] LST pre-patching overview: "
-                f"{len(_all_lst_rasters)} epochs."
-            )
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] LST pre-patching plot failed: {_e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── DIAGNOSTIC: LST mosaic reconstruction ────────────────────────────────
-    # IMPORTANT: called here, BEFORE the NaN-fill loop below, so that ocean/cloud
-    # pixels still carry their true NaN values.  If called after NaN fill, those
-    # pixels get replaced with the patch mean (a warm land temperature for coastal
-    # patches), which places spuriously-warm values at ocean grid cells and creates
-    # a red stripe along the coastline in the temporal mean panel.
-    # The mosaic function has its own gap-fill that interpolates NaN holes from
-    # spatially neighbouring valid pixels, which is geographically correct.
-    _mosaic_cols = patch_grid_cols if patch_grid_cols else int(np.ceil(np.sqrt(n_samples)))
-    try:
-        diag.plot_lst_mosaic_reconstruction(
-            y               = y,
-            positions_all   = positions_all,
-            patch_grid_cols = _mosaic_cols,
-            all_grid_rows   = _all_grid_rows,
-            stride          = PREPROCESSING_CONFIG["patch_stride"],
-            geo_bounds      = STUDY_AREA.get("bounds"),
-            filename        = "P_mosaic_lst_reconstruction.png",
-        )
-        logger.info(
-            f"[Diagnostics] LST mosaic reconstruction: "
-            f"{len(_all_grid_rows)} non-empty epochs, "
-            f"grid_cols={_mosaic_cols}, "
-            f"n_patches={len(y)}"
-        )
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] LST mosaic reconstruction plot failed: {_e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # NaN fill + safety clip (runs AFTER mosaic so the diagnostic sees raw NaN)
-    for s in range(n_samples):
-        for ch in range(n_channels):
-            sl = X[s, :, :, ch]; nm = ~np.isfinite(sl)
-            if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 0.0
-        sl = y[s, :, :, 0]; nm = ~np.isfinite(sl)
-        if nm.any(): sl[nm] = float(sl[~nm].mean()) if (~nm).any() else 35.0
-
-    np.clip(y, PREPROCESSING_CONFIG["lst_min_pixel_temp"],
-            PREPROCESSING_CONFIG["lst_max_pixel_temp"], out=y)
-
-    # Sample weights
-    patch_means   = y[:, :, :, 0].reshape(n_samples, -1).mean(axis=1)
-    n_wb          = PREPROCESSING_CONFIG["sample_weight_n_bins"]
-    be_           = np.linspace(patch_means.min(), patch_means.max() + 1e-6, n_wb + 1)
-    bids_         = np.clip(np.digitize(patch_means, be_) - 1, 0, n_wb - 1)
-    bc_           = np.maximum(np.bincount(bids_, minlength=n_wb).astype(np.float32), 1)
-    rw_           = 1.0 / bc_[bids_]
-    sample_weights = rw_ / rw_.mean()
-
-    metadata = {
-        "n_samples":        n_samples,
-        "patch_size":       patch_size,
-        "n_channels":       n_channels,
-        "channel_order":    channel_order,
-        "temporal_features": temporal_features,
-        "temperature_range": {
-            "min": float(np.min(y)), "max": float(np.max(y)),
-            "mean": float(np.mean(y)), "std": float(np.std(y)),
-        },
-        "sample_weights": sample_weights,
-        # ── Patch grid shape — consumed by uhi_pipeline_manager._mosaic_patches
-        # to reconstruct the spatially-correct full-area mosaic at inference time.
-        "patch_grid_rows": patch_grid_rows,
-        "patch_grid_cols": patch_grid_cols,
-        "patch_stride":    PREPROCESSING_CONFIG["patch_stride"],
-        # ── Per-epoch grid dimensions — required for correct multi-epoch collapse.
-        # patch_grid_rows is the TOTAL stacked rows (sum of all per-epoch rows).
-        # The inference mosaic uses the full per-epoch list to slice correctly,
-        # because epochs may have different row counts when raster extents vary.
-        #
-        # FIX: Store the complete list of per-epoch row counts instead of only
-        # _all_grid_rows[0].  The old single-value assumption caused the inference
-        # plotter to use a fixed stride that drifted when epochs had different
-        # heights, producing the same blocky mis-slice seen in preprocessing.
-        "patch_grid_rows_per_epoch": int(_all_grid_rows[0]) if _all_grid_rows else None,
-        "patch_grid_rows_per_epoch_list": [int(r) for r in _all_grid_rows] if _all_grid_rows else [],
-        "n_epochs": int(len(_all_grid_rows)) if _all_grid_rows else 1,
-        # ── Per-patch (grid_row, grid_col) positions — shape (N, 2) int32.
-        # Stored here so create_stratified_split can propagate them into the
-        # splits dict alongside X/y, letting save_dataset write
-        # patch_positions.npy per split directory.
-        "patch_positions": positions_all,
-    }
-
-    logger.info(f"  Created X={X.shape}, y={y.shape}")
-    logger.info(f"  Temp range: [{metadata['temperature_range']['min']:.2f}, "
-                f"{metadata['temperature_range']['max']:.2f}]°C")
-
-    dates = dates_all[:n_samples]
-
-    # Step 6: Create splits
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6: Create train/val/test splits")
-    logger.info("="*70)
-    
-    # Use enhanced dataset creator
-    dataset_creator = EnhancedDatasetCreator()
-    
-    # Stratified split with spatial-temporal distribution
-    # NEW: 65% train, 15% val, 20% test (was 70/15/15)
-    splits = dataset_creator.create_stratified_split(
-        X, y, dates,
-        split_ratios=(
-            DATE_RANGE["train_ratio"],
-            DATE_RANGE["val_ratio"],
-            DATE_RANGE["test_ratio"],
-        ),
-        random_seed=PREPROCESSING_CONFIG["split_random_seed"],
-        patch_positions=metadata.get("patch_positions"),
-    )
-
-    # Step 6.5: Compute normalization statistics from training data
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6.5: Compute normalization statistics")
-    logger.info("="*70)
-
-    output_dataset_dir = PROCESSED_DATA_DIR / "cnn_dataset"
-    norm_stats = dataset_creator.compute_and_save_normalization_stats(
-        splits['X_train'], 
-        splits['y_train'],
-        output_dataset_dir
-    )
-
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6.5.1: Verify no data leakage (RAW)")
-    logger.info("="*70)
-
-    dataset_creator.verify_no_data_leakage(
-        splits['y_train'],
-        splits['y_val'],
-        splits['y_test'],
-        norm_stats
-    )
-
-    # Step 6.6: Normalize all splits
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6.6: Normalize data")
-    logger.info("="*70)
-
-    # Snapshot a small raw sample before normalisation for the diagnostics plot.
-    # 200 patches is negligible memory cost and avoids the approximate
-    # un-normalisation reconstruction that was used previously.
-    _snap_size = min(200, splits['X_train'].shape[0])
-    X_raw_snap = splits['X_train'][:_snap_size].copy()
-    y_raw_snap = splits['y_train'][:_snap_size].copy()
-
-    logger.info("Normalizing training data...")
-    splits['X_train'], splits['y_train'] = dataset_creator.normalize_data(
-        splits['X_train'], splits['y_train'], norm_stats
-    )
-
-    logger.info("Normalizing validation data...")
-    splits['X_val'], splits['y_val'] = dataset_creator.normalize_data(
-        splits['X_val'], splits['y_val'], norm_stats
-    )
-
-    logger.info("Normalizing test data...")
-    splits['X_test'], splits['y_test'] = dataset_creator.normalize_data(
-        splits['X_test'], splits['y_test'], norm_stats
-    )
-
-    # Verify normalization on training data
-    logger.info("\n" + "="*70)
-    logger.info("NORMALIZATION VERIFICATION")
-    logger.info("="*70)
-    logger.info("Training data after normalization:")
-    logger.info(f"  X_train: mean={splits['X_train'].mean():.4f}, std={splits['X_train'].std():.4f}")
-    logger.info(f"  y_train: mean={splits['y_train'].mean():.4f}, std={splits['y_train'].std():.4f}")
-
-    _nm_tol = PREPROCESSING_CONFIG["norm_mean_tolerance"]
-    _ns_lo  = PREPROCESSING_CONFIG["norm_std_low"]
-    _ns_hi  = PREPROCESSING_CONFIG["norm_std_high"]
-    if not (-_nm_tol < splits['X_train'].mean() < _nm_tol):
-        logger.warning("⚠️ X_train mean is not close to 0!")
-    if not (_ns_lo < splits['X_train'].std() < _ns_hi):
-        logger.warning("⚠️ X_train std is not close to 1!")
-    if not (-_nm_tol < splits['y_train'].mean() < _nm_tol):
-        logger.warning("⚠️ y_train mean is not close to 0!")
-    if not (_ns_lo < splits['y_train'].std() < _ns_hi):
-        logger.warning("⚠️ y_train std is not close to 1!")
-
-    logger.info("="*70)
-
-    # ── DIAGNOSTIC PLOTS: splits, normalisation, channel correlation ───────
-    try:
-        channel_names = metadata.get("channel_order", None)
-
-        diag.plot_split_distributions(splits, filename="06_split_distributions.png")
-        logger.info("[Diagnostics] Split distribution plot saved.")
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] split distribution plot failed: {_e}")
-
-    # ── Normalisation diagnostics — uses the pre-norm snapshot taken above ──
-    try:
-        X_train_norm = splits.get("X_train")
-        y_train_norm = splits.get("y_train")
-        if X_train_norm is not None and y_train_norm is not None:
-            snap_size = X_raw_snap.shape[0]
-            diag.plot_normalization_diagnostics(
-                X_raw_snap, X_train_norm[:snap_size],
-                y_raw_snap, y_train_norm[:snap_size],
-                channel_names=channel_names,
-                filename="07_normalization.png",
-            )
-            logger.info("[Diagnostics] Normalisation diagnostics plot saved.")
-            del X_raw_snap, y_raw_snap
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] normalisation plot failed: {_e}")
-
-    try:
-        X_train_norm = splits.get("X_train")
-        if X_train_norm is not None:
-            diag.plot_channel_correlation(
-                X_train_norm,
-                channel_names=channel_names,
-                filename="08_channel_correlation.png",
-            )
-            logger.info("[Diagnostics] Channel correlation plot saved.")
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] channel correlation plot failed: {_e}")
-
-    try:
-        diag.plot_pipeline_summary(splits, metadata, filename="10_pipeline_summary.png")
-        logger.info("[Diagnostics] Pipeline summary dashboard saved.")
-    except Exception as _e:
-        logger.warning(f"[Diagnostics] pipeline summary plot failed: {_e}")
-    # ──────────────────────────────────────────────────────────────────────
-
-
-    # Step 6.7: Update metadata with fusion info
-    logger.info("\n" + "="*70)
-    logger.info("STEP 6.7: Update metadata")
-    logger.info("="*70)
-
-    fusion_strategy = (
-        'multi-sensor' if (has_landsat and has_sentinel2)
-        else 'landsat-only'
-    )
-    metadata['fusion_info'] = {
-        'fusion_strategy': fusion_strategy,
-        'landsat_available':   has_landsat,
-        'sentinel2_available': has_sentinel2,
-        'total_samples':       metadata["n_samples"],
-    }
-
-    # Save sample weights for the training split
-    sample_weights = metadata.pop("sample_weights", None)
-    if sample_weights is not None:
-        y_train_raw = splits['y_train']
-        patch_means_train = y_train_raw[:, :, :, 0].reshape(len(y_train_raw), -1).mean(axis=1)
-        n_wb = PREPROCESSING_CONFIG["sample_weight_n_bins"]
-        be = np.linspace(patch_means_train.min(), patch_means_train.max() + 1e-6, n_wb + 1)
-        bids = np.clip(np.digitize(patch_means_train, be) - 1, 0, n_wb - 1)
-        bc = np.maximum(np.bincount(bids, minlength=n_wb).astype(np.float32), 1)
-        rw = 1.0 / bc[bids]
-        train_weights = rw / rw.mean()
-
-        weights_path = output_dataset_dir / "train" / "weights_train.npy"
-
-        # ✅ FIX: ensure directory exists before saving
-        weights_path.parent.mkdir(parents=True, exist_ok=True)
-
-        np.save(weights_path, train_weights.astype(np.float32))
-        logger.info(f"✅ Saved sample weights → {weights_path}")
-        logger.info(f"   Weight range: [{train_weights.min():.3f}, {train_weights.max():.3f}]")
-
-    # save_dataset streams one split at a time, deleting each from `splits` after saving
-    dataset_creator.save_dataset(splits, output_dataset_dir, metadata, norm_stats)
-
-    # ── Final summary (splits dict is now empty — use metadata) ─────────────
-    logger.info("\n" + "="*70)
-    logger.info("✓ MULTI-SENSOR PREPROCESSING COMPLETE")
-    logger.info("="*70)
-    logger.info(f"Data sources:")
-    logger.info(f"  Landsat available:    {has_landsat}")
-    logger.info(f"  Sentinel-2 available: {has_sentinel2}")
-    logger.info(f"  Fusion strategy:      {fusion_strategy}")
-    logger.info(f"Training data:")
-    logger.info(f"  Total samples (after QC): {metadata['n_samples']}")
-    logger.info(f"Output:")
-    logger.info(f"  Dataset saved to: {output_dataset_dir}")
-    _pgr = metadata.get("patch_grid_rows", "unknown")
-    _pgc = metadata.get("patch_grid_cols", "unknown")
-    logger.info(f"  Patch grid shape: {_pgr} rows × {_pgc} cols")
-    logger.info(f"    → patch_grid_shape.npy saved in dataset root + all split dirs")
-    logger.info(f"    → inference mosaic will reconstruct full area automatically")
-    logger.info(f"Normalization:")
-    logger.info(f"  Stats saved: ✅")
-    logger.info(f"  All splits normalized in-place: ✅")
-    logger.info("="*70)
-    logger.info("\nNext step: Run model training")
-    logger.info(f"  (mosaic grid: {_pgr}r × {_pgc}c — no --patch-grid-cols flag needed)")
+        logger.info("\n" + "="*70)
+        logger.info("✓ LANDSAT-ONLY DATASET COMPLETE")
+        logger.info("  (No Sentinel-2 data found — fusion dataset skipped)")
+        logger.info("="*70)
 
 
 if __name__ == "__main__":

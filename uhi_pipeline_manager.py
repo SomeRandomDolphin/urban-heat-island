@@ -118,11 +118,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Paths
     p.add_argument("--model-dir",   default="models",
-                   help="Directory containing trained models")
+                   help="Directory containing trained models (single-model mode). "
+                        "Ignored when --models is provided.")
+    p.add_argument("--models", nargs="+", default=None, metavar="DIR",
+                   help="One or more model directories to run and compare. "
+                        "Example: --models models/landsat models/fusion  "
+                        "When supplied, the pipeline runs each model in sequence "
+                        "then generates a cross-model comparison report.")
+    p.add_argument("--model-labels", nargs="+", default=None, metavar="LABEL",
+                   help="Human-readable label for each entry in --models. "
+                        "Must match the number of --models entries. "
+                        "Defaults to the directory base-name of each model.")
     p.add_argument("--output-dir",  default="outputs",
                    help="Root directory for all output products")
     p.add_argument("--test-data",   default="data/processed/cnn_dataset/test",
-                   help="Directory containing NORMALIZED test data (X.npy [, y.npy])")
+                   help="Test data directory for single-model mode, OR the shared "
+                        "fallback used when --test-data-dirs is not given in multi-model mode. "
+                        "Must contain X.npy and optionally y.npy.")
+    p.add_argument("--test-data-dirs", nargs="+", default=None, metavar="DIR",
+                   help="Per-model test data directories, one per entry in --models. "
+                        "Example: --test-data-dirs data/processed/cnn_dataset_landsat/test "
+                        "                          data/processed/cnn_dataset_fusion/test  "
+                        "When omitted the pipeline auto-detects by looking for a sibling "
+                        "dataset directory next to each model dir, then falls back to "
+                        "--test-data for all models.")
 
     # Inference
     p.add_argument("--batch-size",  type=int, default=8)
@@ -1451,6 +1470,296 @@ def print_summary(args, uhi_ctx, hotspot_ctx, val_ctx,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Multi-model comparison stage
+# ══════════════════════════════════════════════════════════════════════════════
+
+def stage_model_comparison(model_results: dict, output_dir: Path) -> None:
+    """
+    Cross-model comparison: metrics table, LST/UHI overlay plots, difference
+    maps, and KDE distribution overlays.  Called after all per-model runs.
+
+    Parameters
+    ----------
+    model_results : dict  keyed by model label.  Each value has keys:
+        lst_processed, uhi_map, uhi_stats, val_metrics, hotspots_df
+    output_dir    : Path  root output dir; artefacts go to output_dir/model_comparison/
+    """
+    _section("CROSS-MODEL COMPARISON")
+    if len(model_results) < 2:
+        logger.info("  Only one model — skipping cross-model comparison")
+        return
+
+    from matplotlib.colors import TwoSlopeNorm as _TwoSlopeNorm
+    cmp_dir = output_dir / "model_comparison"
+    cmp_dir.mkdir(parents=True, exist_ok=True)
+
+    labels = list(model_results.keys())
+    n      = len(labels)
+    colors = plt.cm.tab10(np.linspace(0, 0.9, n))
+
+    # ── 1. Metrics summary table ──────────────────────────────────────────────
+    rows = []
+    for label in labels:
+        s = model_results[label]["uhi_stats"]
+        v = model_results[label].get("val_metrics") or {}
+        h = model_results[label].get("hotspots_df")
+        n_hot = len(h) if h is not None and len(h) > 0 else 0
+        rows.append({
+            "model":          label,
+            "uhi_mean_C":     round(s.get("mean_intensity",     float("nan")), 3),
+            "uhi_max_C":      round(s.get("max_intensity",      float("nan")), 3),
+            "uhi_extent_km2": round(s.get("spatial_extent_km2", float("nan")), 3),
+            "n_hotspots":     n_hot,
+            "val_r2":         round(v.get("r2",   float("nan")), 4),
+            "val_rmse_C":     round(v.get("rmse", float("nan")), 4),
+            "val_mae_C":      round(v.get("mae",  float("nan")), 4),
+            "val_mbe_C":      round(v.get("mbe",  float("nan")), 4),
+        })
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(cmp_dir / "comparison_metrics.csv", index=False)
+    with open(cmp_dir / "comparison_metrics.json", "w") as f:
+        json.dump(make_json_serializable(rows), f, indent=2)
+    logger.info(f"\n{summary_df.to_string(index=False)}")
+    logger.info(f"  ✅ Metrics → {cmp_dir / 'comparison_metrics.csv'}")
+
+    # ── 2. Bar-chart comparison ───────────────────────────────────────────────
+    try:
+        metric_specs = [
+            ("val_r2",         "R²",           True),
+            ("val_rmse_C",     "RMSE (°C)",    False),
+            ("val_mae_C",      "MAE (°C)",     False),
+            ("uhi_mean_C",     "Mean UHI (°C)",True),
+            ("uhi_max_C",      "Max UHI (°C)", True),
+            ("uhi_extent_km2", "Extent (km²)", True),
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle("Cross-Model Comparison", fontsize=15, fontweight="bold")
+        for ax, (key, ylabel, higher_better) in zip(axes.flat, metric_specs):
+            vals = [summary_df.loc[summary_df["model"] == lb, key].values[0]
+                    for lb in labels]
+            bars = ax.bar(labels, vals, color=colors[:n], edgecolor="white", width=0.5)
+            ax.set_title(ylabel, fontsize=10, fontweight="bold")
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xticklabels(labels, rotation=22, ha="right", fontsize=9)
+            for bar, v in zip(bars, vals):
+                if np.isfinite(v):
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + max(abs(v) * 0.01, 0.001),
+                            f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+            finite_idx = [(i, v) for i, v in enumerate(vals) if np.isfinite(v)]
+            if finite_idx:
+                best_i = (max if higher_better else min)(finite_idx, key=lambda x: x[1])[0]
+                bars[best_i].set_edgecolor("gold"); bars[best_i].set_linewidth(2.5)
+        plt.tight_layout()
+        fig.savefig(cmp_dir / "comparison_bar_charts.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  ✅ Bar charts → {cmp_dir / 'comparison_bar_charts.png'}")
+    except Exception as e:
+        logger.warning(f"  Bar-chart comparison failed: {e}")
+
+    # ── 3. Side-by-side LST + UHI maps ───────────────────────────────────────
+    try:
+        fig, axes = plt.subplots(2, n, figsize=(6 * n, 12), squeeze=False)
+        fig.suptitle("Cross-Model LST & UHI Maps", fontsize=14, fontweight="bold")
+        for col, label in enumerate(labels):
+            lst = model_results[label].get("lst_processed")
+            uhi = model_results[label].get("uhi_map")
+            for row, (arr, cmap, clabel, row_title) in enumerate([
+                (lst, "RdYlBu_r", "LST (°C)",    "LST"),
+                (uhi, "RdBu_r",   "UHI (°C)",    "UHI Intensity"),
+            ]):
+                ax = axes[row, col]
+                ax.axis("off")
+                ax.set_title(f"{label}\n{row_title}", fontsize=10, fontweight="bold")
+                if arr is None:
+                    continue
+                if row == 0:  # LST: percentile stretch
+                    vmin = float(np.nanpercentile(arr, 2))
+                    vmax = float(np.nanpercentile(arr, 98))
+                    im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax,
+                                   interpolation="bilinear", origin="upper")
+                else:         # UHI: diverging around 0
+                    abs_max = max(float(np.nanpercentile(np.abs(arr[np.isfinite(arr)]), 98)), 0.1)
+                    im = ax.imshow(arr, cmap=cmap,
+                                   norm=_TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max),
+                                   interpolation="bilinear", origin="upper")
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=clabel)
+                ax.text(0.02, 0.02,
+                        f"mean={np.nanmean(arr):+.2f}°C\nstd={np.nanstd(arr):.2f}°C",
+                        transform=ax.transAxes, fontsize=7, color="white", va="bottom",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.6))
+        plt.tight_layout()
+        fig.savefig(cmp_dir / "comparison_maps.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  ✅ Map comparison → {cmp_dir / 'comparison_maps.png'}")
+    except Exception as e:
+        logger.warning(f"  Map comparison failed: {e}")
+
+    # ── 4. Difference maps (model_i − model_0) ────────────────────────────────
+    try:
+        ref_label = labels[0]
+        diff_labels = labels[1:]
+        if diff_labels:
+            n_diff = len(diff_labels)
+            fig, axes = plt.subplots(2, n_diff, figsize=(6 * n_diff, 10), squeeze=False)
+            fig.suptitle(f"Difference maps  (model − {ref_label})",
+                         fontsize=13, fontweight="bold")
+            for col, label in enumerate(diff_labels):
+                for row, arr_key in enumerate(["lst_processed", "uhi_map"]):
+                    ax   = axes[row, col]
+                    arr  = model_results[label].get(arr_key)
+                    ref  = model_results[ref_label].get(arr_key)
+                    unit = "°C"
+                    row_title = "LST diff" if arr_key == "lst_processed" else "UHI diff"
+                    ax.axis("off")
+                    ax.set_title(f"{label}\n{row_title}", fontsize=10)
+                    if arr is None or ref is None:
+                        continue
+                    if arr.shape != ref.shape:
+                        from scipy.ndimage import zoom as _zoom
+                        zf  = (ref.shape[0] / arr.shape[0], ref.shape[1] / arr.shape[1])
+                        arr = _zoom(arr, zf, order=1)
+                    diff  = arr - ref
+                    d_abs = max(float(np.nanpercentile(np.abs(diff[np.isfinite(diff)]), 98)), 0.1)
+                    im    = ax.imshow(diff,
+                                      norm=_TwoSlopeNorm(vmin=-d_abs, vcenter=0, vmax=d_abs),
+                                      cmap="RdBu_r", interpolation="bilinear", origin="upper")
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=unit)
+                    rmsd = float(np.sqrt(np.nanmean(diff ** 2)))
+                    ax.text(0.02, 0.02,
+                            f"mean Δ={np.nanmean(diff):+.2f}{unit}\nRMSD={rmsd:.2f}{unit}",
+                            transform=ax.transAxes, fontsize=7, color="white", va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.6))
+            plt.tight_layout()
+            fig.savefig(cmp_dir / "comparison_difference_maps.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"  ✅ Difference maps → {cmp_dir / 'comparison_difference_maps.png'}")
+    except Exception as e:
+        logger.warning(f"  Difference maps failed: {e}")
+
+    # ── 5. Distribution overlay (KDE) ─────────────────────────────────────────
+    try:
+        from scipy.stats import gaussian_kde as _kde
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle("Cross-Model Distribution Comparison", fontsize=13, fontweight="bold")
+        for ax_idx, (key, xlabel) in enumerate([
+            ("lst_processed", "LST (°C)"),
+            ("uhi_map",       "UHI Intensity (°C)"),
+        ]):
+            ax = axes[ax_idx]
+            ax.set_xlabel(xlabel, fontsize=10); ax.set_ylabel("Density", fontsize=10)
+            ax.set_title(f"{xlabel} Distribution", fontsize=11, fontweight="bold")
+            for label, color in zip(labels, colors):
+                arr = model_results[label].get(key)
+                if arr is None:
+                    continue
+                flat = arr[np.isfinite(arr)].flatten()
+                if len(flat) < 10 or flat.std() < 1e-6:
+                    continue
+                x_grid = np.linspace(float(np.percentile(flat, 1)),
+                                     float(np.percentile(flat, 99)), 300)
+                try:
+                    kde_vals = _kde(flat)(x_grid)
+                    ax.plot(x_grid, kde_vals, color=color, lw=2, label=label)
+                    ax.fill_between(x_grid, kde_vals, alpha=0.12, color=color)
+                except Exception:
+                    ax.hist(flat, bins=60, density=True, alpha=0.35,
+                            color=color, label=label, edgecolor="white")
+            ax.legend(fontsize=9); ax.grid(alpha=0.25)
+        plt.tight_layout()
+        fig.savefig(cmp_dir / "comparison_distributions.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  ✅ Distribution overlay → {cmp_dir / 'comparison_distributions.png'}")
+    except Exception as e:
+        logger.warning(f"  Distribution overlay failed: {e}")
+
+    logger.info(f"\n✅ Cross-model comparison artefacts → {cmp_dir}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Single-model pipeline wrapper (reusable by multi-model orchestrator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_single_model(args, output_dir: Path, norm_stats_path: Path,
+                     bounds: tuple, device_seed: int = 42) -> dict:
+    """
+    Run stages 1-13 for one model directory and return comparison artefacts.
+
+    Returns dict with keys: lst_processed, uhi_map, uhi_stats,
+                             val_metrics, hotspots_df
+    (or empty dict on critical failure).
+    """
+    maps_dir    = output_dir / "maps"
+    data_dir    = output_dir / "data"
+    reports_dir = output_dir / "reports"
+    geotiff_dir = output_dir / "geotiff"
+    for d in (maps_dir, data_dir, reports_dir, geotiff_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    _set_deterministic_mode(seed=device_seed)
+
+    try:
+        data = stage_load_data(args)
+    except Exception as exc:
+        logger.error(f"Cannot load data: {exc}"); return {}
+    X_test, y_test = data["X_test"], data["y_test"]
+
+    try:
+        predictor = stage_init_predictor(args, norm_stats_path)
+    except Exception as exc:
+        logger.error(f"Cannot init predictor: {exc}"); return {}
+
+    stage_adaptive_calibration(predictor, y_test, norm_stats_path)
+
+    try:
+        results = stage_inference(args, predictor, X_test, data_dir)
+    except Exception as exc:
+        logger.error(f"Inference failed: {exc}"); return {}
+
+    try:
+        lst_processed, _ = stage_postprocess(args, results, data_dir)
+    except Exception as exc:
+        logger.error(f"Post-processing failed: {exc}"); return {}
+
+    try:
+        uhi_ctx = stage_uhi_analysis(args, lst_processed, data_dir)
+    except Exception as exc:
+        logger.error(f"UHI analysis failed: {exc}"); return {}
+
+    try:
+        hotspot_ctx = stage_hotspots(args, lst_processed, data_dir,
+                                     water_mask=uhi_ctx.get("water_mask"))
+    except Exception as exc:
+        logger.warning(f"Hotspot detection failed: {exc}")
+        hotspot_ctx = {"hotspots_df": pd.DataFrame(), "gi_star": None,
+                       "hotspot_mask": None, "detector": None}
+
+    val_ctx = _try("Validation stage", stage_validation,
+                   args, predictor, results, y_test,
+                   norm_stats_path, maps_dir, reports_dir)
+
+    _try("Diagnostic plots", stage_diagnostics,
+         args, lst_processed, uhi_ctx, hotspot_ctx, val_ctx, results, maps_dir)
+    _try("Standard visualizations", stage_visualizations,
+         args, lst_processed, uhi_ctx, hotspot_ctx, results, val_ctx, maps_dir)
+    _try("GeoTIFF export", stage_geotiff,
+         args, lst_processed, uhi_ctx, hotspot_ctx, bounds, geotiff_dir)
+    _try("Web map", stage_webmap,
+         args, lst_processed, uhi_ctx, hotspot_ctx, bounds, output_dir)
+    _try("Report", stage_report, uhi_ctx, hotspot_ctx, val_ctx, reports_dir)
+
+    print_summary(args, uhi_ctx, hotspot_ctx, val_ctx, lst_processed, output_dir)
+
+    return {
+        "lst_processed": lst_processed,
+        "uhi_map":       uhi_ctx["uhi_map"],
+        "uhi_stats":     uhi_ctx["uhi_stats"],
+        "val_metrics":   val_ctx["metrics"] if val_ctx else None,
+        "hotspots_df":   hotspot_ctx["hotspots_df"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # main()
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1460,7 +1769,6 @@ def main() -> int:
 
     _section("UHI ANALYSIS PIPELINE — FULLY INTEGRATED")
     logger.info(f"  Study area   : {STUDY_AREA['name']}")
-    logger.info(f"  Model dir    : {args.model_dir}")
     logger.info(f"  Output dir   : {args.output_dir}")
     logger.info(f"  Test data    : {args.test_data}")
     logger.info(f"  TTA          : {args.use_tta}  (n={args.tta_augs})")
@@ -1468,21 +1776,135 @@ def main() -> int:
     logger.info(f"  Hotspot r    : {args.hotspot_radius} m  "
                 f"CI={args.hotspot_confidence}")
 
-    # ── Determinism — must be called BEFORE any torch / numpy random ops ──────
     _section("DETERMINISM SETUP")
     _set_deterministic_mode(seed=args.seed)
 
-    # ── Resolve shared paths ───────────────────────────────────────────────────
-    output_dir       = Path(args.output_dir)
-    norm_stats_path  = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
+    output_dir      = Path(args.output_dir)
+    norm_stats_path = PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json"
     bounds = (
-        STUDY_AREA["bounds"]["min_lon"],
-        STUDY_AREA["bounds"]["min_lat"],
-        STUDY_AREA["bounds"]["max_lon"],
-        STUDY_AREA["bounds"]["max_lat"],
+        STUDY_AREA["bounds"]["min_lon"], STUDY_AREA["bounds"]["min_lat"],
+        STUDY_AREA["bounds"]["max_lon"], STUDY_AREA["bounds"]["max_lat"],
     )
 
-    # ── Create output sub-directories ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # MULTI-MODEL MODE  (--models dir1 dir2 ...)
+    # ══════════════════════════════════════════════════════════════════════════
+    if args.models:
+        model_dirs   = [Path(d) for d in args.models]
+        model_labels = list(args.model_labels or [d.name for d in model_dirs])
+
+        if len(model_labels) != len(model_dirs):
+            logger.error("--model-labels count must match --models count")
+            return 1
+
+        # ── Resolve per-model test-data directories ───────────────────────────
+        # Priority:
+        #   1. Explicit --test-data-dirs (one per model, must match count)
+        #   2. Auto-detect: look for a processed dataset dir that is a sibling
+        #      of the model dir and follows the naming convention
+        #      cnn_dataset_<label>/test  or  cnn_dataset/test  within PROCESSED_DATA_DIR
+        #   3. Fallback to --test-data for every model (original behaviour)
+        explicit_test_dirs = None
+        if args.test_data_dirs:
+            if len(args.test_data_dirs) != len(model_dirs):
+                logger.error(
+                    f"--test-data-dirs has {len(args.test_data_dirs)} entries but "
+                    f"--models has {len(model_dirs)}. They must match.")
+                return 1
+            explicit_test_dirs = [Path(d) for d in args.test_data_dirs]
+
+        def _resolve_test_dir(model_dir: Path, label: str) -> Path:
+            """Return the best test-data directory for this model variant."""
+            # Candidates in priority order
+            candidates = [
+                # dataset named after the model label
+                PROCESSED_DATA_DIR / f"cnn_dataset_{label.lower()}" / "test",
+                PROCESSED_DATA_DIR / f"cnn_dataset_{label.lower()}_test",
+                # dataset named after the model directory
+                PROCESSED_DATA_DIR / f"cnn_dataset_{model_dir.name}" / "test",
+                # generic fallback
+                PROCESSED_DATA_DIR / "cnn_dataset" / "test",
+                Path(args.test_data),
+            ]
+            for c in candidates:
+                if c.exists() and (c / "X.npy").exists():
+                    logger.info(f"  [{label}] test data → {c}")
+                    return c
+            # Last resort: return args.test_data even if it doesn't exist so
+            # stage_load_data produces a clear FileNotFoundError
+            logger.warning(
+                f"  [{label}] Could not auto-detect test data dir. "
+                f"Tried: {[str(c) for c in candidates]}. "
+                f"Falling back to --test-data={args.test_data}. "
+                f"Use --test-data-dirs to specify explicitly.")
+            return Path(args.test_data)
+
+        def _resolve_norm_stats(test_dir: Path) -> Path:
+            """Find normalization_stats.json for the given test dataset."""
+            candidates = [
+                test_dir.parent / "normalization_stats.json",        # <dataset>/
+                test_dir.parent.parent / "normalization_stats.json", # <processed>/
+                PROCESSED_DATA_DIR / "cnn_dataset" / "normalization_stats.json",
+            ]
+            for c in candidates:
+                if c.exists():
+                    return c
+            # Return the first candidate path — stage_init_predictor will error clearly
+            return candidates[0]
+
+        logger.info(f"\n  Multi-model mode — {len(model_dirs)} model(s):")
+        for lbl, mdir in zip(model_labels, model_dirs):
+            logger.info(f"    [{lbl}]  {mdir}")
+
+        all_results = {}
+        for idx, (label, model_dir) in enumerate(zip(model_labels, model_dirs)):
+            logger.info(f"\n{'#'*70}")
+            logger.info(f"# MODEL: {label.upper()}  →  {model_dir}")
+            logger.info(f"{'#'*70}")
+
+            per_model_out = output_dir / "models" / label
+            per_model_out.mkdir(parents=True, exist_ok=True)
+
+            # Resolve test data and norm stats for this specific model
+            if explicit_test_dirs:
+                per_model_test_dir = explicit_test_dirs[idx]
+            else:
+                per_model_test_dir = _resolve_test_dir(model_dir, label)
+
+            per_model_norm_stats = _resolve_norm_stats(per_model_test_dir)
+
+            logger.info(f"  test data    : {per_model_test_dir}")
+            logger.info(f"  norm stats   : {per_model_norm_stats}")
+
+            # Patch args so all stages see the correct paths for this model
+            args.model_dir = str(model_dir)
+            args.test_data = str(per_model_test_dir)
+
+            artefacts = run_single_model(
+                args, per_model_out, per_model_norm_stats, bounds,
+                device_seed=args.seed)
+            if artefacts:
+                all_results[label] = artefacts
+            else:
+                logger.warning(f"  ⚠ Model [{label}] produced no artefacts — skipping")
+
+        if len(all_results) >= 2:
+            _try("Cross-model comparison", stage_model_comparison,
+                 all_results, output_dir)
+        else:
+            logger.warning("  ⚠ Fewer than 2 models succeeded — comparison skipped")
+
+        _section("MULTI-MODEL RUN COMPLETE")
+        logger.info(f"  Models run     : {len(all_results)}")
+        logger.info(f"  Comparison dir : {output_dir / 'model_comparison'}")
+        logger.info(f"  Per-model dirs : {output_dir / 'models'}")
+        return 0
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SINGLE-MODEL MODE  (original --model-dir behaviour)
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.info(f"  Model dir    : {args.model_dir}")
+
     maps_dir    = output_dir / "maps"
     data_dir    = output_dir / "data"
     reports_dir = output_dir / "reports"
@@ -1490,89 +1912,55 @@ def main() -> int:
     for d in (maps_dir, data_dir, reports_dir, geotiff_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Execute pipeline stages
-    # ══════════════════════════════════════════════════════════════════════════
-
-    # 1. Load data
     try:
         data = stage_load_data(args)
     except Exception as exc:
-        logger.error(f"Cannot continue without data: {exc}")
-        return 1
+        logger.error(f"Cannot continue without data: {exc}"); return 1
     X_test, y_test = data["X_test"], data["y_test"]
 
-    # 2. Init predictor
     try:
         predictor = stage_init_predictor(args, norm_stats_path)
     except Exception as exc:
-        logger.error(f"Cannot continue without predictor: {exc}")
-        return 1
+        logger.error(f"Cannot continue without predictor: {exc}"); return 1
 
-    # 3. Adaptive calibration
     stage_adaptive_calibration(predictor, y_test, norm_stats_path)
 
-    # 4. Inference
     try:
         results = stage_inference(args, predictor, X_test, data_dir)
     except Exception as exc:
         logger.error(f"Inference failed: {exc}"); traceback.print_exc(); return 1
 
-    # 5. Post-processing
     try:
         lst_processed, lst_maps_processed = stage_postprocess(args, results, data_dir)
     except Exception as exc:
         logger.error(f"Post-processing failed: {exc}"); return 1
 
-    # 6. UHI analysis
     try:
         uhi_ctx = stage_uhi_analysis(args, lst_processed, data_dir)
     except Exception as exc:
         logger.error(f"UHI analysis failed: {exc}"); return 1
 
-    # 7. Hotspot detection
     try:
         hotspot_ctx = stage_hotspots(args, lst_processed, data_dir,
-                                         water_mask=uhi_ctx.get("water_mask"))
+                                     water_mask=uhi_ctx.get("water_mask"))
     except Exception as exc:
         logger.error(f"Hotspot detection failed: {exc}"); return 1
 
-    # 8. Validation
-    val_ctx = _try(
-        "Validation stage",
-        stage_validation,
-        args, predictor, results, y_test,
-        norm_stats_path, maps_dir, reports_dir,
-    )
+    val_ctx = _try("Validation stage", stage_validation,
+                   args, predictor, results, y_test,
+                   norm_stats_path, maps_dir, reports_dir)
 
-    # 9. Diagnostic plots (uhi_analysis)
-    _try("Diagnostic plots",
-         stage_diagnostics,
+    _try("Diagnostic plots", stage_diagnostics,
          args, lst_processed, uhi_ctx, hotspot_ctx, val_ctx, results, maps_dir)
-
-    # 10. Standard visualizations (uhi_visualization)
-    _try("Standard visualizations",
-         stage_visualizations,
+    _try("Standard visualizations", stage_visualizations,
          args, lst_processed, uhi_ctx, hotspot_ctx, results, val_ctx, maps_dir)
-
-    # 11. GeoTIFF
-    _try("GeoTIFF export",
-         stage_geotiff,
+    _try("GeoTIFF export", stage_geotiff,
          args, lst_processed, uhi_ctx, hotspot_ctx, bounds, geotiff_dir)
-
-    # 12. Web map
-    _try("Web map",
-         stage_webmap,
+    _try("Web map", stage_webmap,
          args, lst_processed, uhi_ctx, hotspot_ctx, bounds, output_dir)
+    _try("Report", stage_report, uhi_ctx, hotspot_ctx, val_ctx, reports_dir)
 
-    # 13. Report
-    _try("Report",
-         stage_report,
-         uhi_ctx, hotspot_ctx, val_ctx, reports_dir)
-
-    # ── Final summary ──────────────────────────────────────────────────────────
     print_summary(args, uhi_ctx, hotspot_ctx, val_ctx, lst_processed, output_dir)
-
     return 0
 
 

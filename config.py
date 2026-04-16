@@ -317,6 +317,68 @@ GBM_CONFIG = {
     },
 }
 
+# ============================================================================
+# HYPERPARAMETER TUNING CONFIGURATION
+# Controls Optuna-based search for GBM params and CNN training hyperparams.
+# ============================================================================
+HYPERPARAM_TUNING_CONFIG = {
+    # Whether to run tuning at all; set False to skip and use defaults
+    "enabled": True,
+
+    # Number of Optuna trials per model
+    "gbm_n_trials":  30,
+    "cnn_n_trials":  15,
+
+    # Optuna sampler ("tpe" = Tree-structured Parzen Estimator, "random" = baseline)
+    "sampler":       "tpe",
+
+    # Fraction of training data used for internal tuning cross-validation
+    # to keep tuning fast (1.0 = use all training data)
+    "data_fraction": 1.0,
+
+    # Number of CV folds used during GBM tuning
+    "cv_folds":      3,
+
+    # Primary metric to optimise (lower is better: "rmse"; higher: "r2")
+    "primary_metric":       "rmse",
+    "primary_metric_mode":  "minimize",   # "minimize" or "maximize"
+
+    # Pruning: stop unpromising trials early (Optuna MedianPruner)
+    "pruning_enabled":       True,
+    "pruning_warmup_steps":  5,   # number of steps before pruning can trigger
+
+    # Timeout per tuning run (seconds); None = no limit
+    "timeout_seconds": None,
+
+    # Random seed for reproducibility
+    "seed": 42,
+
+    # ── GBM search space ──────────────────────────────────────────────────────
+    "gbm_search_space": {
+        "num_leaves":       {"type": "int",   "low": 15,    "high": 127},
+        "max_depth":        {"type": "int",   "low": 3,     "high": 12},
+        "learning_rate":    {"type": "float", "low": 0.005, "high": 0.10,  "log": True},
+        "n_estimators":     {"type": "int",   "low": 500,   "high": 5000,  "step": 500},
+        "subsample":        {"type": "float", "low": 0.5,   "high": 1.0},
+        "colsample_bytree": {"type": "float", "low": 0.3,   "high": 1.0},
+        "reg_alpha":        {"type": "float", "low": 1e-3,  "high": 10.0,  "log": True},
+        "reg_lambda":       {"type": "float", "low": 1e-3,  "high": 10.0,  "log": True},
+        "min_child_samples":{"type": "int",   "low": 20,    "high": 200},
+    },
+
+    # ── CNN search space ──────────────────────────────────────────────────────
+    "cnn_search_space": {
+        "initial_lr":    {"type": "float", "low": 1e-4, "high": 1e-2,  "log": True},
+        "weight_decay":  {"type": "float", "low": 1e-4, "high": 0.05,  "log": True},
+        "dropout_rate":  {"type": "float", "low": 0.1,  "high": 0.6},
+        "batch_size":    {"type": "categorical", "choices": [8, 16, 32]},
+    },
+
+    # Directory where tuning artifacts (study DB, best params JSON) are saved
+    # relative to MODEL_DIR
+    "study_dir": "tuning",
+}
+
 ENSEMBLE_WEIGHTS = {
     "cnn":      0.35,
     "gbm":      0.55,
