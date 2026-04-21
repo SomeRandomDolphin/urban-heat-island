@@ -337,27 +337,69 @@ class DiagnosticsPlotter:
             logger.warning(f"plot_residual_distribution failed: {e}")
 
     # ── 4. Ensemble strategy comparison ──────────────────────────────────────
-    def plot_ensemble_comparison(self, comparison: dict):
-        """Bar charts comparing R², RMSE, MAE across strategies."""
+    def plot_ensemble_comparison(self, comparison: dict,
+                                  comparison_spatial: dict = None):
+        """Two-row bar charts: patch-level and pixel-level R², RMSE, MAE.
+
+        Parameters
+        ----------
+        comparison         : patch-mean metrics dict  {strategy_name: metrics}
+        comparison_spatial : pixel-level metrics dict {strategy_name: metrics}
+                             If None, only the patch-level row is drawn.
+        """
         try:
             self._use_style()
             names  = list(comparison.keys())
             colors = plt.cm.tab10(np.linspace(0, 0.6, len(names)))
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-            fig.suptitle("Ensemble Strategy Comparison", fontsize=14, fontweight="bold")
-            for idx, (mkey, mlabel) in enumerate(
-                    zip(["r2", "rmse", "mae"], ["R²", "RMSE (°C)", "MAE (°C)"])):
-                ax = axes[idx]
-                vals = [comparison[n].get(mkey, 0) for n in names]
-                bars = ax.bar(names, vals, color=colors, edgecolor="white")
-                ax.set_title(mlabel); ax.set_ylabel(mlabel)
-                ax.set_xticks(range(len(names)))
-                ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
-                for bar, v in zip(bars, vals):
-                    ax.text(bar.get_x() + bar.get_width() / 2,
-                            bar.get_height() + 0.001, f"{v:.4f}",
-                            ha="center", va="bottom", fontsize=8)
-            plt.tight_layout()
+
+            has_spatial  = comparison_spatial is not None
+            n_rows       = 2 if has_spatial else 1
+            fig, axes    = plt.subplots(n_rows, 3, figsize=(18, 6 * n_rows), squeeze=False)
+            fig.suptitle(
+                "Ensemble Strategy Comparison — Two-Level Evaluation",
+                fontsize=14, fontweight="bold",
+            )
+
+            metric_keys   = ["r2", "rmse", "mae"]
+            metric_labels = ["R²", "RMSE (°C)", "MAE (°C)"]
+
+            def _draw_row(row_axes, data_dict, row_title_prefix):
+                for col, (mkey, mlabel) in enumerate(zip(metric_keys, metric_labels)):
+                    ax   = row_axes[col]
+                    vals = [data_dict[n].get(mkey, 0) for n in names]
+                    bars = ax.bar(names, vals, color=colors, edgecolor="white")
+                    ax.set_title(f"{row_title_prefix}  —  {mlabel}", fontsize=10)
+                    ax.set_ylabel(mlabel)
+                    ax.set_xticks(range(len(names)))
+                    ax.set_xticklabels(names, rotation=22, ha="right", fontsize=9)
+                    for bar, v in zip(bars, vals):
+                        ax.text(
+                            bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + 0.001,
+                            f"{v:.4f}", ha="center", va="bottom", fontsize=8,
+                        )
+
+            _draw_row(axes[0], comparison, "Patch-Mean (all models comparable)")
+
+            if has_spatial:
+                _draw_row(axes[1], comparison_spatial,
+                          "Pixel-Level (spatial quality; flat models penalised)")
+                flat_models = {"GBM Only", "Weighted Ensemble"}
+                for col in range(3):
+                    ax = axes[1, col]
+                    for bar_patch, name in zip(ax.patches, names):
+                        if name in flat_models:
+                            bar_patch.set_hatch("//")
+                            bar_patch.set_alpha(0.6)
+                fig.text(
+                    0.5, 0.01,
+                    "Hatched bars = flat prediction (no within-patch spatial variation). "
+                    "Low pixel R² is expected and reveals the cost of missing spatial detail.",
+                    ha="center", fontsize=9, style="italic",
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.12),
+                )
+
+            plt.tight_layout(rect=[0, 0.04, 1, 1] if has_spatial else [0, 0, 1, 1])
             self._save(fig, "04_ensemble_comparison")
         except Exception as e:
             logger.warning(f"plot_ensemble_comparison failed: {e}")
@@ -710,16 +752,17 @@ class DiagnosticsPlotter:
                                y_train: np.ndarray = None,
                                y_val: np.ndarray = None,
                                norm_stats: dict = None,
-                               ensemble_comparison: dict = None):
+                               ensemble_comparison: dict = None,
+                               ensemble_comparison_spatial: dict = None):
         """Convenience wrapper — calls every available plot method."""
         logger.info("\n📊 Generating all post-training diagnostic plots...")
         self.plot_training_curves(history)
         self.plot_diagnostic_metrics_over_epochs(history)
         self.plot_summary_dashboard(history, ensemble_metrics, cnn_metrics,
                                     gbm_metrics, ensemble_weights)
-        # FIX 3: generate ensemble strategy comparison chart when data is available
         if ensemble_comparison is not None:
-            self.plot_ensemble_comparison(ensemble_comparison)
+            self.plot_ensemble_comparison(ensemble_comparison,
+                                          comparison_spatial=ensemble_comparison_spatial)
         if cnn_preds_flat is not None and targets_flat is not None:
             self.plot_pred_vs_actual(cnn_preds_flat, targets_flat, "CNN")
             self.plot_residual_distribution(cnn_preds_flat, targets_flat, "CNN")
@@ -1881,7 +1924,9 @@ class EnsembleTrainer:
             "cnn_metrics": [],
             "gbm_metrics": [],
             "ensemble_metrics": [],
-            "lr": []
+            "lr": [],
+            "ensemble_comparison": {},
+            "ensemble_comparison_spatial": {},
         }
         
     def _create_scheduler(self):
@@ -2491,7 +2536,10 @@ class EnsembleTrainer:
             except Exception as _e:
                 logger.warning(f"  Could not save stacking ridge: {_e}")
 
-        # ── Compare all strategies ────────────────────────────────────────────
+        # ── LEVEL 1: PATCH-MEAN EVALUATION (all four strategies) ─────────────
+        # All models reduced to one scalar per patch.  GBM is native at this
+        # level; CNN is averaged down.  Fair for comparing "how well does each
+        # strategy anchor the absolute temperature level of a patch?"
         all_results = [
             ("GBM Only",          gbm_metrics,      {"cnn": 0.0, "gbm": 1.0}),
             ("CNN Only",          cnn_metrics,       {"cnn": 1.0, "gbm": 0.0}),
@@ -2499,24 +2547,128 @@ class EnsembleTrainer:
             ("CNN-as-Residual",   residual_metrics,  {"cnn": "residual", "gbm": 1.0}),
         ]
 
-        logger.info("\n" + "="*84)
-        logger.info("ENSEMBLE STRATEGY COMPARISON")
-        logger.info("="*84)
-        logger.info(f"{'Strategy':<22} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} {'MBE(°C)':>9} {'Slope':>7} {'StdRat':>8}")
-        logger.info("-"*84)
+        W = 102  # total log-line width
+        logger.info("\n" + "=" * W)
+        logger.info("LEVEL 1 — PATCH-MEAN EVALUATION  (one scalar per patch, all models comparable)")
+        logger.info("NOTE: GBM predicts a single value per patch by design; CNN is averaged to match.")
+        logger.info("=" * W)
+        logger.info(
+            f"{'Strategy':<24} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} "
+            f"{'MBE(°C)':>9} {'Slope':>7} {'StdRat':>8}"
+        )
+        logger.info("-" * W)
         for name, m, _ in all_results:
             logger.info(
-                f"{name:<22} {m['r2']:>7.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f} "
+                f"{name:<24} {m['r2']:>7.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f} "
                 f"{m.get('mbe', float('nan')):>9.4f} "
-                f"{m.get('slope', float('nan')):>7.3f} {m.get('std_ratio', float('nan')):>8.3f}")
-        logger.info("="*84)
+                f"{m.get('slope', float('nan')):>7.3f} "
+                f"{m.get('std_ratio', float('nan')):>8.3f}"
+            )
+        logger.info("=" * W)
 
+        # ── LEVEL 2: PIXEL-LEVEL SPATIAL EVALUATION ───────────────────────────
+        # Broadcast each strategy to full (N, H*W) pixel arrays and evaluate
+        # against the pixel-level ground truth.  GBM and Weighted-Ensemble
+        # (which is still patch-level) suffer here because they predict zero
+        # within-patch variation; only CNN and CNN-as-Residual produce spatial
+        # detail.  This is the evaluation that matters for UHI mapping quality.
+        logger.info("\n" + "=" * W)
+        logger.info("LEVEL 2 — PIXEL-LEVEL SPATIAL EVALUATION  (what actually matters for UHI mapping)")
+        logger.info("GBM / Weighted-Ensemble broadcast one value across all patch pixels → penalised.")
+        logger.info("CNN and CNN-as-Residual preserve within-patch spatial structure.")
+        logger.info("=" * W)
+        logger.info(
+            f"{'Strategy':<24} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} "
+            f"{'MBE(°C)':>9} {'Slope':>7} {'StdRat':>8} {'SpatialDet':>11}"
+        )
+        logger.info("-" * W)
+
+        # Ground-truth at pixel level: y_val is (N, 1, H, W); flatten to (N, H*W)
+        N, _, H, W_patch = cnn_preds_4d.shape
+        y_val_pixel = y_val.reshape(N, -1)      # (N, H*W) — still normalised
+
+        # Build pixel-level prediction arrays for each strategy
+        def _broadcast_patch_to_pixels(patch_preds_1d: np.ndarray, n_pixels: int) -> np.ndarray:
+            """Tile a (N,) patch-mean array to (N, n_pixels) for spatial scoring."""
+            return np.repeat(patch_preds_1d[:, np.newaxis], n_pixels, axis=1)
+
+        n_pixels = H * W_patch
+        cnn_pixel          = cnn_preds_4d.reshape(N, -1)                            # (N, H*W) — real spatial
+        gbm_pixel          = _broadcast_patch_to_pixels(gbm_preds, n_pixels)        # constant per patch
+        weighted_pixel     = _broadcast_patch_to_pixels(blend_sc, n_pixels)         # constant per patch
+        residual_pixel     = _broadcast_patch_to_pixels(residual_patch_mean, n_pixels)  # constant per patch
+
+        spatial_has_detail = {
+            "GBM Only":          False,
+            "CNN Only":          True,
+            "Weighted Ensemble": False,
+            "CNN-as-Residual":   True,
+        }
+
+        spatial_results = []
+        for (name, _, weights), pixel_preds in zip(
+            all_results,
+            [gbm_pixel, cnn_pixel, weighted_pixel, residual_pixel],
+        ):
+            flat_preds   = pixel_preds.flatten()
+            flat_targets = y_val_pixel.flatten()
+            m_spatial    = self._calculate_metrics(flat_preds, flat_targets, f"{name} [pixel]")
+            spatial_results.append((name, m_spatial, weights))
+
+            spatial_tag = "✓ spatial" if spatial_has_detail[name] else "✗ flat"
+            logger.info(
+                f"{name:<24} {m_spatial['r2']:>7.4f} {m_spatial['rmse']:>10.4f} "
+                f"{m_spatial['mae']:>9.4f} {m_spatial.get('mbe', float('nan')):>9.4f} "
+                f"{m_spatial.get('slope', float('nan')):>7.3f} "
+                f"{m_spatial.get('std_ratio', float('nan')):>8.3f} "
+                f"{spatial_tag:>11}"
+            )
+        logger.info("=" * W)
+        logger.info(
+            "ℹ️  Spatial models (CNN Only, CNN-as-Residual) show higher pixel R² than flat models "
+            "because they resolve within-patch temperature gradients — the flat models miss all of this."
+        )
+
+        # ── TWO-LEVEL SUMMARY TABLE (thesis-ready) ────────────────────────────
+        logger.info("\n" + "=" * W)
+        logger.info("SUMMARY — TWO-LEVEL COMPARISON  (use this table in thesis defence)")
+        logger.info("=" * W)
+        logger.info(
+            f"{'Strategy':<24} {'Patch R²':>9} {'Pixel R²':>9} "
+            f"{'Patch RMSE':>11} {'Pixel RMSE':>11} {'Spatial?':>9}"
+        )
+        logger.info("-" * W)
+        for (name, patch_m, _), (_, spatial_m, _) in zip(all_results, spatial_results):
+            has_spatial = "yes" if spatial_has_detail[name] else "no (flat)"
+            logger.info(
+                f"{name:<24} {patch_m['r2']:>9.4f} {spatial_m['r2']:>9.4f} "
+                f"{patch_m['rmse']:>11.4f} {spatial_m['rmse']:>11.4f} "
+                f"{has_spatial:>9}"
+            )
+        logger.info("=" * W)
+        logger.info(
+            "KEY INTERPRETATION:\n"
+            "  • High Patch R² for GBM is expected — it is optimised for exactly this.\n"
+            "  • Low Pixel R² for GBM/Weighted reveals the cost of zero spatial detail.\n"
+            "  • CNN-as-Residual combines GBM's patch-level calibration with CNN's spatial "
+            "resolution → strongest candidate for UHI mapping."
+        )
+
+        # ── SELECT BEST STRATEGY (patch R² — unchanged decision logic) ────────
         best_name, best_metrics, best_weights = max(
             all_results, key=lambda x: x[1]['r2'])
 
-        logger.info(f"\n🏆 BEST STRATEGY: {best_name}")
-        logger.info(f"   R²={best_metrics['r2']:.4f}  RMSE={best_metrics['rmse']:.4f}°C  "
-                    f"slope={best_metrics.get('slope', float('nan')):.3f}")
+        logger.info(f"\n🏆 BEST STRATEGY (patch-mean R²): {best_name}")
+        logger.info(
+            f"   Patch  R²={best_metrics['r2']:.4f}  RMSE={best_metrics['rmse']:.4f}°C  "
+            f"slope={best_metrics.get('slope', float('nan')):.3f}"
+        )
+        # Also surface the spatial R² of the best strategy
+        best_spatial = next(m for n, m, _ in spatial_results if n == best_name)
+        logger.info(
+            f"   Pixel  R²={best_spatial['r2']:.4f}  RMSE={best_spatial['rmse']:.4f}°C  "
+            f"slope={best_spatial.get('slope', float('nan')):.3f}"
+        )
 
         # Update ensemble weights
         if isinstance(best_weights.get("cnn"), float):
@@ -2527,14 +2679,18 @@ class EnsembleTrainer:
 
         # Warn if GBM-only wins (expected given diagnostics)
         if best_name == "GBM Only":
-            logger.info("ℹ️  GBM alone is strongest — CNN will be used spatially via CNN-as-Residual at inference")
+            logger.info(
+                "ℹ️  GBM alone is strongest at patch level — CNN will be used spatially "
+                "via CNN-as-Residual at inference"
+            )
         elif best_name == "Weighted Ensemble":
             logger.info(f"   Weights: CNN={opt_w['cnn']:.3f}, GBM={opt_w['gbm']:.3f}")
 
-        # FIX 3: store comparison dict so plot_ensemble_comparison can be called
-        self.history["ensemble_comparison"] = {name: m for name, m, _ in all_results}
+        # Store both comparison dicts for downstream plotting
+        self.history["ensemble_comparison"]         = {name: m for name, m, _ in all_results}
+        self.history["ensemble_comparison_spatial"]  = {name: m for name, m, _ in spatial_results}
 
-        logger.info("="*70)
+        logger.info("=" * 70)
         return best_metrics
     
     def _calculate_metrics(self, preds, targets, name=""):
@@ -2929,7 +3085,8 @@ class EnsembleTrainer:
                 y_train          = y_train,   # FIX 2: pass real arrays so data-dist plot (06) generates
                 y_val            = y_val,
                 norm_stats       = _norm_stats,
-                ensemble_comparison = self.history.get("ensemble_comparison"),  # FIX 3: plot 04
+                ensemble_comparison         = self.history.get("ensemble_comparison"),
+                ensemble_comparison_spatial = self.history.get("ensemble_comparison_spatial"),
             )
         except Exception as _pe:
             logger.warning(f"Post-training plot generation failed: {_pe}")
@@ -3050,7 +3207,7 @@ class EnsembleTrainer:
             elif key == "ensemble_metrics":
                 if isinstance(values, dict):
                     history_serializable[key] = {k: float(v) for k, v in values.items()}
-            elif key == "ensemble_comparison":
+            elif key in ("ensemble_comparison", "ensemble_comparison_spatial"):
                 # Dict[str, dict] — serialize each strategy's metrics as floats
                 if isinstance(values, dict):
                     history_serializable[key] = {
