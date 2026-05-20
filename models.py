@@ -218,12 +218,18 @@ class ProgressiveLSTLoss(nn.Module):
         # (hot rooftops, cool water) receive more gradient signal than the
         # densely-sampled mid-range pixels.  Weights are normalised so the
         # effective learning rate is unchanged on average.
-        with torch.no_grad():
-            patch_mean = target.mean(dim=[2, 3], keepdim=True)   # (N,1,1,1)
-            weights    = (target - patch_mean).abs() + 1.0       # ≥ 1 everywhere
-            weights    = weights / weights.mean()                 # mean = 1 → same LR scale
-
-        mse = (weights * (pred - target) ** 2).mean()
+        #
+        # Ablation support: if _disable_temp_weighted is set (by the ablation
+        # study runner) fall back to plain unweighted MSE so that component's
+        # contribution can be isolated cleanly.
+        if getattr(self, "_disable_temp_weighted", False):
+            mse = F.mse_loss(pred, target)
+        else:
+            with torch.no_grad():
+                patch_mean = target.mean(dim=[2, 3], keepdim=True)   # (N,1,1,1)
+                weights    = (target - patch_mean).abs() + 1.0       # ≥ 1 everywhere
+                weights    = weights / weights.mean()                 # mean = 1 → same LR scale
+            mse = (weights * (pred - target) ** 2).mean()
         components['mse'] = mse.item()
 
         # ── 2. Variance preservation ──────────────────────────────────────────
@@ -429,7 +435,7 @@ class EarlyStopping:
             self.counter = 0
             self.save_checkpoint(model)
         else:
-            self.counter += 1
+            self.counter += 5
             logger.info(f"  → No improvement ({self.counter}/{self.patience})")
             if self.counter >= self.patience:
                 self.early_stop = True

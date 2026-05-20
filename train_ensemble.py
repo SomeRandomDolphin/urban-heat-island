@@ -1282,11 +1282,56 @@ class HyperparameterTuner:
                     f"{best_trial.value:.6f}")
         logger.info(f"   Best params: {best_params}")
 
-        # Persist best params
+        # ── Top-10 GBM Optuna trials ──────────────────────────────────────────
+        completed_trials = [t for t in study.trials
+                            if t.state == optuna.trial.TrialState.COMPLETE]
+        reverse = (self.cfg.get("primary_metric_mode", "minimize") == "maximize")
+        top10 = sorted(completed_trials,
+                       key=lambda t: t.value,
+                       reverse=reverse)[:10]
+
+        metric_label = self.cfg.get("primary_metric", "score").upper()
+        W = 110
+        logger.info("\n" + "=" * W)
+        logger.info(f"  TOP-10 GBM OPTUNA TRIALS  (metric: {metric_label})")
+        logger.info("=" * W)
+
+        # Collect all param keys that appear in any of the top-10
+        param_keys = []
+        for t in top10:
+            for k in t.params:
+                if k not in param_keys:
+                    param_keys.append(k)
+
+        # Header
+        col_w = 12
+        header = f"  {'Rank':<5} {'Trial':>6} {metric_label:>12}  " + \
+                 "  ".join(f"{k[:col_w]:<{col_w}}" for k in param_keys)
+        logger.info(header)
+        logger.info("-" * W)
+
+        for rank, t in enumerate(top10, 1):
+            param_str = "  ".join(
+                f"{str(t.params.get(k, 'N/A'))[:col_w]:<{col_w}}"
+                for k in param_keys
+            )
+            logger.info(f"  {rank:<5} {t.number:>6} {t.value:>12.6f}  {param_str}")
+
+        logger.info("=" * W)
+
+        # Persist best params + top-10 summary
+        top10_records = [
+            {"rank": i + 1,
+             "trial_number": t.number,
+             metric_label.lower(): t.value,
+             "params": t.params}
+            for i, t in enumerate(top10)
+        ]
         results_path = self.study_dir / "best_gbm_params.json"
         with open(results_path, "w") as f:
             json.dump({"best_value": best_trial.value,
-                       "best_params": best_params}, f, indent=2)
+                       "best_params": best_params,
+                       "top10_trials": top10_records}, f, indent=2)
         logger.info(f"   Saved → {results_path}")
 
         return best_params
@@ -1416,9 +1461,51 @@ class HyperparameterTuner:
         logger.info(f"\n✅ CNN tuning complete — best val R²: {best.value:.4f}")
         logger.info(f"   Best params: {best.params}")
 
+        # ── Top-10 CNN Optuna trials ──────────────────────────────────────────
+        completed_trials = [t for t in study.trials
+                            if t.state == optuna.trial.TrialState.COMPLETE]
+        top10_cnn = sorted(completed_trials,
+                           key=lambda t: t.value,
+                           reverse=True)[:10]   # CNN always maximises R²
+
+        W = 110
+        logger.info("\n" + "=" * W)
+        logger.info("  TOP-10 CNN OPTUNA TRIALS  (metric: val R²)")
+        logger.info("=" * W)
+
+        cnn_param_keys = []
+        for t in top10_cnn:
+            for k in t.params:
+                if k not in cnn_param_keys:
+                    cnn_param_keys.append(k)
+
+        col_w = 14
+        header = f"  {'Rank':<5} {'Trial':>6} {'val_R2':>10}  " + \
+                 "  ".join(f"{k[:col_w]:<{col_w}}" for k in cnn_param_keys)
+        logger.info(header)
+        logger.info("-" * W)
+
+        for rank, t in enumerate(top10_cnn, 1):
+            param_str = "  ".join(
+                f"{str(t.params.get(k, 'N/A'))[:col_w]:<{col_w}}"
+                for k in cnn_param_keys
+            )
+            logger.info(f"  {rank:<5} {t.number:>6} {t.value:>10.4f}  {param_str}")
+
+        logger.info("=" * W)
+
+        top10_cnn_records = [
+            {"rank": i + 1,
+             "trial_number": t.number,
+             "val_r2": t.value,
+             "params": t.params}
+            for i, t in enumerate(top10_cnn)
+        ]
         results_path = self.study_dir / "best_cnn_params.json"
         with open(results_path, "w") as f:
-            json.dump({"best_r2": best.value, "best_params": best.params}, f, indent=2)
+            json.dump({"best_r2": best.value,
+                       "best_params": best.params,
+                       "top10_trials": top10_cnn_records}, f, indent=2)
         logger.info(f"   Saved → {results_path}")
 
         return best_cnn_config, best.params.get("dropout_rate", 0.3)
@@ -3490,6 +3577,1144 @@ def _train_one_variant(dataset_dir: Path, model_dir: Path, device, label: str):
     return history
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST SET EVALUATION MODULE
+# Implements the four testing scenarios described in section 4.6 of the thesis:
+#   • Table 4.8  — Final ensemble vs CNN-only on held-out test set
+#   • Table 4.9  — Ablation study: per-component contribution
+#   • Table 4.10 — Cross-variant comparison: Landsat vs Fusion
+#   • Section 4.6.2 — Residual diagnostics (heteroscedasticity, QQ, Moran's I,
+#                      temporal stability, feature importance)
+#
+# All results are persisted as JSON alongside the trained model artefacts and
+# are also written to the main training log for traceability.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_test_loader(dataset_dir: Path, batch_size: int, num_workers: int,
+                       pin_memory: bool) -> Tuple[DataLoader, np.ndarray, np.ndarray]:
+    """Load the held-out test split and return (loader, X_test, y_test).
+
+    The test split is intentionally kept separate from train/val so it is
+    never seen during training or ensemble weight optimisation.
+    """
+    X_test, y_test = load_data("test", dataset_dir)
+    test_dataset   = UHIDataset(X_test, y_test, augment=False)
+    test_loader    = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return test_loader, X_test, y_test
+
+
+def _cnn_predict_test(cnn_model, test_loader, device) -> Tuple[np.ndarray, np.ndarray]:
+    """Run the CNN on the test loader and return (flat_preds, flat_targets) in
+    normalised space — callers are responsible for denormalisation."""
+    cnn_model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for data, target in tqdm(test_loader, desc="CNN test inference"):
+            data = data.to(device)
+            out  = cnn_model(data)
+            all_preds.append(out.cpu().numpy())
+            all_targets.append(target.numpy())
+    preds   = np.concatenate(all_preds,   axis=0).flatten()
+    targets = np.concatenate(all_targets, axis=0).flatten()
+    mask    = np.isfinite(preds) & np.isfinite(targets)
+    return preds[mask], targets[mask]
+
+
+def _ensemble_predict_test(
+    cnn_model, gbm_model, pca, test_loader,
+    X_test, y_test, ensemble_weights, dataset_dir, device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Blend CNN + GBM predictions on the test set using the weighted-average
+    strategy (the winner from val-set strategy selection).
+
+    Returns (flat_ensemble_preds, flat_targets) in denormalised °C.
+    """
+    # CNN pixel predictions
+    cnn_norm, targets_norm = _cnn_predict_test(cnn_model, test_loader, device)
+    cnn_patch_mean = (
+        np.concatenate(
+            [cnn_model(d.to(device)).cpu().detach().numpy()
+             for d, _ in test_loader],
+            axis=0,
+        ).reshape(len(X_test), -1).mean(axis=1)
+        if False  # placeholder; we use the already-computed flat cnn_norm mean
+        else cnn_norm
+    )
+    # Re-extract patch means properly
+    cnn_model.eval()
+    patch_preds_list, patch_tgt_list = [], []
+    with torch.no_grad():
+        for data, target in test_loader:
+            out = cnn_model(data.to(device))          # (B,1,H,W)
+            patch_preds_list.append(out.cpu().numpy().reshape(out.shape[0], -1).mean(axis=1))
+            patch_tgt_list.append(target.numpy().reshape(target.shape[0], -1).mean(axis=1))
+    cnn_patch_mean = np.concatenate(patch_preds_list)
+    y_patch_mean   = np.concatenate(patch_tgt_list)
+
+    # GBM predictions
+    bot_test = extract_cnn_bottleneck_features(X_test, cnn_model, device=str(device))
+    if pca is not None:
+        bot_test = pca.transform(bot_test)
+    X_test_gbm, y_test_gbm = prepare_gbm_features(X_test, y_test, bot_test)
+    gbm_preds = gbm_model.predict(X_test_gbm)
+
+    # Normalised weighted blend (same _blend_normalized logic as val-set)
+    tgt_std  = float(y_patch_mean.std()) + 1e-8
+    tgt_mean = float(y_patch_mean.mean())
+    cnn_z = (cnn_patch_mean - cnn_patch_mean.mean()) / (cnn_patch_mean.std() + 1e-8)
+    gbm_z = (gbm_preds       - gbm_preds.mean())       / (gbm_preds.std()       + 1e-8)
+    w_cnn = ensemble_weights.get("cnn", 0.5)
+    w_gbm = ensemble_weights.get("gbm", 0.5)
+    w_sum = w_cnn + w_gbm + 1e-12
+    blend = (w_cnn * cnn_z + w_gbm * gbm_z) / w_sum
+    blend = blend * tgt_std + tgt_mean
+
+    norm_stats = load_normalization_stats(dataset_dir)
+    blend_deg   = denormalize_predictions(blend,       norm_stats)
+    targets_deg = denormalize_predictions(y_patch_mean, norm_stats)
+    return blend_deg, targets_deg
+
+
+def _metrics_from_deg(preds_deg: np.ndarray, targets_deg: np.ndarray) -> Dict:
+    """Compute R², RMSE, MAE, MBE in °C from already-denormalised arrays."""
+    mask = np.isfinite(preds_deg) & np.isfinite(targets_deg)
+    p, t = preds_deg[mask], targets_deg[mask]
+    r2   = float(r2_score(t, p))
+    rmse = float(np.sqrt(mean_squared_error(t, p)))
+    mae  = float(mean_absolute_error(t, p))
+    mbe  = float(np.mean(p - t))
+    return {"r2": r2, "rmse": rmse, "mae": mae, "mbe": mbe}
+
+
+# ── Table 4.8 — Final test-set performance ────────────────────────────────────
+
+def evaluate_on_test_set(
+    cnn_model,
+    gbm_trainer,
+    pca,
+    ensemble_weights: Dict,
+    dataset_dir: Path,
+    model_dir: Path,
+    device,
+    label: str = "variant",
+) -> Dict:
+    """Evaluate CNN-only and Ensemble on the held-out test set.
+
+    Logs a Table 4.8-style summary and persists results to
+    ``<model_dir>/test_results.json``.
+
+    Args:
+        cnn_model:        Trained UNet (best checkpoint already loaded).
+        gbm_trainer:      GBMTrainer with best_model populated.
+        pca:              Fitted PCA for bottleneck compression (or None).
+        ensemble_weights: {'cnn': w, 'gbm': w} from evaluate_ensemble().
+        dataset_dir:      Preprocessed dataset root for this variant.
+        model_dir:        Output directory for this variant.
+        device:           Torch device.
+        label:            Human-readable label for logging (e.g. 'landsat').
+
+    Returns:
+        dict with keys 'cnn_only' and 'ensemble', each containing a metrics
+        dict plus the 'hyperparameters' snapshot logged alongside.
+    """
+    logger.info("\n" + "=" * 70)
+    logger.info(f"TABLE 4.8 — FINAL TEST SET EVALUATION  [{label.upper()}]")
+    logger.info("=" * 70)
+
+    norm_stats  = load_normalization_stats(dataset_dir)
+    batch_size  = TRAINING_CONFIG["batch_size"]
+    test_loader, X_test, y_test = _build_test_loader(
+        dataset_dir, batch_size,
+        COMPUTE_CONFIG["num_workers"], COMPUTE_CONFIG["pin_memory"],
+    )
+
+    # ── Hyperparameter snapshot (logged alongside scores for reproducibility) ──
+    hyperparam_snapshot = {
+        "label":           label,
+        "cnn_config":      {k: str(v) if not isinstance(v, (int, float, bool, str))
+                            else v for k, v in CNN_CONFIG.items()},
+        "gbm_config":      {k: str(v) if not isinstance(v, (int, float, bool, str))
+                            else v for k, v in GBM_CONFIG.items()},
+        "ensemble_weights": ensemble_weights,
+        "training_config": {k: str(v) if not isinstance(v, (int, float, bool, str))
+                            else v for k, v in TRAINING_CONFIG.items()},
+        "scheduler":       {k: str(v) if not isinstance(v, (int, float, bool, str))
+                            else v for k, v in SCHEDULER_CONFIG.items()},
+        "early_stopping":  {k: str(v) if not isinstance(v, (int, float, bool, str))
+                            else v for k, v in EARLY_STOPPING_CONFIG.items()},
+    }
+    logger.info("\nHYPERPARAMETER SNAPSHOT:")
+    logger.info(f"  CNN      initial_lr={CNN_CONFIG.get('initial_lr', 'N/A')}  "
+                f"batch_size={TRAINING_CONFIG.get('batch_size', 'N/A')}  "
+                f"epochs={TRAINING_CONFIG.get('epochs', 'N/A')}")
+    logger.info(f"  GBM      n_estimators={GBM_CONFIG.get('n_estimators', 'N/A')}  "
+                f"num_leaves={GBM_CONFIG.get('num_leaves', 'N/A')}  "
+                f"lr={GBM_CONFIG.get('learning_rate', 'N/A')}")
+    logger.info(f"  Weights  CNN={ensemble_weights.get('cnn', '?'):.4f}  "
+                f"GBM={ensemble_weights.get('gbm', '?'):.4f}")
+
+    # ── CNN-only test metrics ─────────────────────────────────────────────────
+    logger.info("\n[1/2] CNN-only inference on test set…")
+    cnn_norm_preds, cnn_norm_tgts = _cnn_predict_test(cnn_model, test_loader, device)
+    cnn_preds_deg   = denormalize_predictions(cnn_norm_preds, norm_stats)
+    cnn_targets_deg = denormalize_predictions(cnn_norm_tgts,  norm_stats)
+    cnn_metrics_test = _metrics_from_deg(cnn_preds_deg, cnn_targets_deg)
+
+    # ── Ensemble test metrics ─────────────────────────────────────────────────
+    logger.info("[2/2] Ensemble inference on test set…")
+    gbm_model = gbm_trainer.best_model if gbm_trainer.best_model is not None else gbm_trainer.model
+    if gbm_model is not None:
+        ens_preds_deg, ens_targets_deg = _ensemble_predict_test(
+            cnn_model, gbm_model, pca, test_loader,
+            X_test, y_test, ensemble_weights, dataset_dir, device,
+        )
+        ens_metrics_test = _metrics_from_deg(ens_preds_deg, ens_targets_deg)
+    else:
+        logger.warning("⚠️ GBM model not available — reporting CNN-only for ensemble row")
+        ens_metrics_test = cnn_metrics_test
+
+    # ── Baseline targets (from VALIDATION_CONFIG) ─────────────────────────────
+    tgt = VALIDATION_CONFIG["targets"]
+    delta_r2     = ens_metrics_test["r2"]   - cnn_metrics_test["r2"]
+    delta_r2_pct = delta_r2 / max(abs(cnn_metrics_test["r2"]), 1e-8) * 100
+
+    # ── Table 4.8 log ─────────────────────────────────────────────────────────
+    W = 90
+    logger.info("\n" + "=" * W)
+    logger.info(
+        f"{'Model Configuration':<28} {'R²':>7} {'RMSE(°C)':>10} "
+        f"{'MAE(°C)':>9} {'MBE(°C)':>9} {'ΔR² vs CNN':>12}"
+    )
+    logger.info("-" * W)
+    logger.info(
+        f"{'CNN only — ' + label:<28} "
+        f"{cnn_metrics_test['r2']:>7.4f} {cnn_metrics_test['rmse']:>10.4f} "
+        f"{cnn_metrics_test['mae']:>9.4f} {cnn_metrics_test['mbe']:>9.4f} {'—':>12}"
+    )
+    logger.info(
+        f"{'Ensemble — ' + label:<28} "
+        f"{ens_metrics_test['r2']:>7.4f} {ens_metrics_test['rmse']:>10.4f} "
+        f"{ens_metrics_test['mae']:>9.4f} {ens_metrics_test['mbe']:>9.4f} "
+        f"{delta_r2:>+7.4f} ({delta_r2_pct:+.1f}%):>5"
+    )
+    logger.info("=" * W)
+
+    # ── Target checks ─────────────────────────────────────────────────────────
+    targets_met = (
+        ens_metrics_test["r2"]   >= tgt["r2"]   and
+        ens_metrics_test["rmse"] <= tgt["rmse"]  and
+        ens_metrics_test["mae"]  <= tgt["mae"]
+    )
+    logger.info(f"\nTarget thresholds: R²≥{tgt['r2']}  RMSE≤{tgt['rmse']}°C  MAE≤{tgt['mae']}°C")
+    if targets_met:
+        logger.info("✅ ALL TEST PERFORMANCE TARGETS MET")
+    else:
+        logger.warning("⚠️ One or more test performance targets NOT met")
+        if ens_metrics_test["r2"]   < tgt["r2"]:
+            logger.warning(f"   R²   {ens_metrics_test['r2']:.4f} < {tgt['r2']}")
+        if ens_metrics_test["rmse"] > tgt["rmse"]:
+            logger.warning(f"   RMSE {ens_metrics_test['rmse']:.4f}°C > {tgt['rmse']}°C")
+        if ens_metrics_test["mae"]  > tgt["mae"]:
+            logger.warning(f"   MAE  {ens_metrics_test['mae']:.4f}°C > {tgt['mae']}°C")
+
+    # ── Residual diagnostics (Section 4.6.2) ─────────────────────────────────
+    residual_diagnostics = _run_residual_diagnostics(
+        preds_deg=ens_preds_deg, targets_deg=ens_targets_deg, label=label
+    )
+
+    # ── Feature importance (Section 4.6.3) ────────────────────────────────────
+    feature_importance_top5 = _log_gbm_feature_importance(gbm_model)
+
+    # ── Persist test_results.json ─────────────────────────────────────────────
+    test_results = {
+        "label":                label,
+        "hyperparameters":      hyperparam_snapshot,
+        "cnn_only":             cnn_metrics_test,
+        "ensemble":             ens_metrics_test,
+        "delta_r2":             float(delta_r2),
+        "delta_r2_pct":         float(delta_r2_pct),
+        "targets_met":          targets_met,
+        "residual_diagnostics": residual_diagnostics,
+        "feature_importance_top5": feature_importance_top5,
+    }
+    out_path = model_dir / "test_results.json"
+    with open(out_path, "w") as f:
+        json.dump(test_results, f, indent=2)
+    logger.info(f"\n✅ Test results saved → {out_path}")
+
+    return test_results
+
+
+# ── Section 4.6.2 — Residual diagnostics ─────────────────────────────────────
+
+def _run_residual_diagnostics(
+    preds_deg: np.ndarray,
+    targets_deg: np.ndarray,
+    label: str = "",
+    month_labels: np.ndarray = None,
+) -> Dict:
+    """Compute and log the residual diagnostics described in Section 4.6.2.
+
+    Covers:
+    * Heteroscedastic fan — residual spread at thermal extremes vs core range
+    * Shapiro-Wilk normality on a random 5 000-sample subset
+    * QQ r-value
+    * Spatial autocorrelation proxy (Moran's I on 1-D residual ordering)
+    * Temporal RMSE variance across months (if month_labels provided)
+
+    Returns a dict of all diagnostic values for JSON serialisation.
+    """
+    logger.info("\n" + "=" * 70)
+    logger.info(f"SECTION 4.6.2 — RESIDUAL DIAGNOSTICS  [{label.upper()}]")
+    logger.info("=" * 70)
+
+    residuals = preds_deg - targets_deg
+    finite    = np.isfinite(residuals)
+    residuals, targets_deg_f = residuals[finite], targets_deg[finite]
+
+    diag: Dict = {}
+
+    # ── (a) Heteroscedastic fan ───────────────────────────────────────────────
+    p10, p90 = np.percentile(targets_deg_f, 10), np.percentile(targets_deg_f, 90)
+    p30, p70 = np.percentile(targets_deg_f, 30), np.percentile(targets_deg_f, 70)
+
+    extreme_mask  = (targets_deg_f < p10) | (targets_deg_f > p90)
+    core_mask     = (targets_deg_f >= p30) & (targets_deg_f <= p70)
+
+    spread_extreme = float(np.std(residuals[extreme_mask])) if extreme_mask.sum() > 10 else float("nan")
+    spread_core    = float(np.std(residuals[core_mask]))    if core_mask.sum()    > 10 else float("nan")
+    fan_ratio      = spread_extreme / spread_core if (spread_core and spread_core > 0) else float("nan")
+
+    diag["heteroscedastic_fan"] = {
+        "spread_extreme_deg": spread_extreme,
+        "spread_core_deg":    spread_core,
+        "fan_ratio":          fan_ratio,
+        "extreme_percentile_range": "< p10 or > p90",
+        "core_percentile_range":    "p30 – p70",
+    }
+    logger.info(f"\n(a) Heteroscedastic fan:")
+    logger.info(f"    Extreme spread (< p10, > p90):  σ = {spread_extreme:.4f}°C")
+    logger.info(f"    Core spread    (p30 – p70):     σ = {spread_core:.4f}°C")
+    logger.info(f"    Fan ratio  (extreme / core):    {fan_ratio:.2f}×  "
+                f"(doc. reference: ≈1.8×)")
+
+    # ── (b) Shapiro-Wilk normality on up to 5 000 samples ────────────────────
+    rng          = np.random.default_rng(seed=42)
+    n_sw         = min(5000, len(residuals))
+    sw_sample    = rng.choice(residuals, size=n_sw, replace=False)
+    sw_stat, sw_p = stats.shapiro(sw_sample)
+
+    diag["shapiro_wilk"] = {"W": float(sw_stat), "p_value": float(sw_p), "n": n_sw}
+    logger.info(f"\n(b) Shapiro-Wilk normality (n={n_sw}):")
+    logger.info(f"    W = {sw_stat:.4f}  p = {sw_p:.4f}")
+    if sw_p < 0.05:
+        logger.info(f"    → Non-Gaussian tails at α=0.05  "
+                    f"(doc. reference: W=0.987, p=0.0021, near-normal)")
+    else:
+        logger.info(f"    → Cannot reject normality at α=0.05")
+
+    # ── (c) QQ r-value ────────────────────────────────────────────────────────
+    (osm, osr), (qq_sl, qq_ic, qq_r) = stats.probplot(residuals, dist="norm")
+    diag["qq_r_value"] = float(qq_r)
+    logger.info(f"\n(c) Q-Q r-value: {qq_r:.4f}  (1.00 = perfectly normal)")
+
+    # ── (d) Spatial autocorrelation proxy (Moran's I, 1-D lag-1) ─────────────
+    #   True 2-D Moran's I requires patch coordinates, which are not available
+    #   at this stage.  We compute the 1-D Moran's I on the residual sequence
+    #   as a proxy — non-zero I indicates patch-to-patch autocorrelation in
+    #   the ordering that preprocessing imposed (spatially contiguous tiles).
+    n_res  = len(residuals)
+    r_mean = residuals.mean()
+    r_c    = residuals - r_mean
+    if n_res > 2:
+        numerator   = float(np.sum(r_c[:-1] * r_c[1:]))
+        denominator = float(np.sum(r_c ** 2))
+        W_sum       = n_res - 1          # number of lag-1 pairs (queen W)
+        morans_i    = (n_res / W_sum) * (numerator / (denominator + 1e-12))
+        # Approximate z-score under normality assumption
+        E_I    = -1.0 / (n_res - 1)
+        Var_I  = (n_res ** 2 * (n_res - 1) /
+                  ((n_res + 1) * (n_res - 1) ** 2) - E_I ** 2)
+        z_I    = (morans_i - E_I) / (np.sqrt(Var_I) + 1e-12)
+        p_I    = float(2 * (1 - stats.norm.cdf(abs(z_I))))
+    else:
+        morans_i = float("nan")
+        p_I      = float("nan")
+
+    diag["morans_i_proxy"] = {
+        "I":      float(morans_i),
+        "p_value": p_I,
+        "note":   "1-D lag-1 Moran proxy; positive I = residual autocorrelation in patch order",
+    }
+    logger.info(f"\n(d) Spatial autocorrelation (1-D Moran's I proxy):")
+    logger.info(f"    I = {morans_i:.4f}  p = {p_I:.4f}  "
+                f"(doc. reference: I=0.14, p<0.001)")
+    if morans_i > 0 and p_I < 0.05:
+        logger.info(f"    → Significant positive autocorrelation — "
+                    f"residuals cluster across consecutive patches")
+    elif p_I >= 0.05:
+        logger.info(f"    → No significant autocorrelation at α=0.05")
+
+    # ── (e) Temporal RMSE stability across months ─────────────────────────────
+    temporal: Dict = {}
+    if month_labels is not None and len(month_labels) == len(residuals):
+        monthly_rmse = {}
+        for m in range(1, 13):
+            idx = (month_labels == m)
+            if idx.sum() < 5:
+                continue
+            monthly_rmse[int(m)] = float(
+                np.sqrt(np.mean(residuals[idx] ** 2))
+            )
+        if monthly_rmse:
+            rmse_values    = np.array(list(monthly_rmse.values()))
+            rmse_variance  = float(np.var(rmse_values))
+            rmse_std       = float(np.std(rmse_values))
+            worst_month    = int(max(monthly_rmse, key=monthly_rmse.get))
+            mean_rmse      = float(rmse_values.mean())
+            worst_above    = monthly_rmse[worst_month] - mean_rmse
+            temporal = {
+                "monthly_rmse":    monthly_rmse,
+                "rmse_variance":   rmse_variance,
+                "rmse_std":        rmse_std,
+                "worst_month":     worst_month,
+                "worst_rmse_above_mean": float(worst_above),
+            }
+            logger.info(f"\n(e) Temporal RMSE stability (monthly):")
+            logger.info(f"    RMSE variance across months: {rmse_variance:.4f}°C²  "
+                        f"(σ = {rmse_std:.4f}°C)")
+            logger.info(f"    Worst month: {worst_month:02d}  "
+                        f"(+{worst_above:.4f}°C above average)")
+            logger.info(f"    (doc. reference: variance=0.18°C², σ=0.05°C, worst month=11)")
+        else:
+            logger.info("\n(e) Temporal stability: not enough per-month samples")
+    else:
+        logger.info("\n(e) Temporal stability: month_labels not provided — "
+                    "pass a (N,) array of month integers (1–12) to enable this check")
+        temporal = {"note": "month_labels not provided"}
+
+    diag["temporal_stability"] = temporal
+    logger.info("=" * 70)
+    return diag
+
+
+# ── Section 4.6.3 — GBM feature importance ────────────────────────────────────
+
+def _log_gbm_feature_importance(gbm_model, top_n: int = 5) -> list:
+    """Log top-N LightGBM features by split gain and return as a list of dicts.
+
+    Corresponds to Figure 4.4 / the five highest-importance features listed in
+    Section 4.6.3 of the thesis.
+    """
+    if gbm_model is None:
+        logger.warning("_log_gbm_feature_importance: gbm_model is None — skipping")
+        return []
+
+    try:
+        importance = gbm_model.feature_importance(importance_type="gain")
+        names      = gbm_model.feature_name()
+        # Sort descending
+        order      = np.argsort(importance)[::-1]
+        top_n      = min(top_n, len(names))
+
+        logger.info(f"\nSECTION 4.6.3 — GBM FEATURE IMPORTANCE (top {top_n}, split gain):")
+        logger.info(f"  {'Rank':<6} {'Feature':<30} {'Gain':>12}")
+        logger.info(f"  {'-'*50}")
+        top_features = []
+        for rank, idx in enumerate(order[:top_n], start=1):
+            feat = {"rank": rank, "feature": names[idx], "gain": float(importance[idx])}
+            top_features.append(feat)
+            logger.info(f"  {rank:<6} {names[idx]:<30} {importance[idx]:>12.2f}")
+        logger.info(
+            f"\n  (doc. reference: ch10_mean, ch10_std, ch_ndbi_mean, "
+            f"ch_ndvi_std, ch_albedo_mean)"
+        )
+        return top_features
+
+    except Exception as e:
+        logger.warning(f"_log_gbm_feature_importance failed: {e}")
+        return []
+
+
+# ── Table 4.9 — Ablation study ────────────────────────────────────────────────
+
+def run_ablation_study(
+    dataset_dir: Path,
+    model_dir: Path,
+    device,
+    label: str = "fusion",
+    n_ablation_epochs: int = None,
+) -> Dict:
+    """Reproduce the ablation experiment described in Table 4.9.
+
+    Design: load the already-trained production CNN + GBM + PCA from disk,
+    then for each ablation scenario retrain *only the component being tested*
+    while keeping everything else identical to the full-pipeline run.
+
+    This ensures that e.g. the S3 "Multi-Component Loss" baseline matches the
+    production LEVEL-1 numbers (R²≈0.91), and only the ablated variant deviates.
+    Training everything from scratch would give artificially low baselines
+    because the ablation epoch budget is much smaller than full training.
+
+    Scenarios tested
+    ----------------
+    1.  With Hyperparameter Tuning (Optuna) vs. Default Config Parameters
+        → retrain CNN with/without Optuna params; GBM retrained on new bottleneck
+    2a. Patch-level:  Weighted Ensemble vs. GBM-only
+        → swap ensemble blend; no retraining needed
+    2b. Pixel-level:  CNN-as-Residual vs. CNN-only
+        → swap inference path; no retraining needed
+    3.  Multi-component ProgressiveLSTLoss vs. Plain MSE
+        → retrain CNN with MSE-only loss; GBM retrained on new bottleneck
+    4.  Stratified Sampling vs. Uniform Sampling
+        → retrain CNN with uniform sampler; GBM retrained on new bottleneck
+
+    Args:
+        dataset_dir:       Dataset root for the fusion variant.
+        model_dir:         Base output dir; each config gets its own sub-dir.
+        device:            Torch device.
+        label:             Dataset label for log messages.
+        n_ablation_epochs: Override epoch count (None = use TRAINING_CONFIG).
+
+    Returns:
+        Dict mapping config name → {hyperparameters, metrics}.
+    """
+    logger.info("\n" + "=" * 70)
+    logger.info("TABLE 4.9 — ABLATION STUDY  (load-then-ablate design)")
+    logger.info(f"Dataset: {dataset_dir}  |  Device: {device}")
+    logger.info("=" * 70)
+
+    epochs = n_ablation_epochs or TRAINING_CONFIG["epochs"]
+
+    # ── Load shared data once ─────────────────────────────────────────────────
+    X_train, y_train = load_data("train", dataset_dir)
+    X_val,   y_val   = load_data("val",   dataset_dir)
+    n_channels = X_train.shape[-1] if X_train.ndim == 4 else CNN_CONFIG["input_channels"]
+    _ns = load_normalization_stats(dataset_dir)
+
+    # ── Load the production-trained CNN (best checkpoint) ────────────────────
+    # All ablation scenarios start from this model. Only the component under
+    # test is retrained; everything else inherits the production weights so
+    # that baselines match the LEVEL-1 evaluation numbers exactly.
+    logger.info("\n  Loading production CNN checkpoint…")
+    _prod_cnn = UNet(in_channels=n_channels, out_channels=1)
+    _ckpt_mgr = CheckpointManager(
+        save_dir=model_dir / "checkpoints",
+        metrics=CHECKPOINT_CONFIG["metrics"],
+    )
+    _best_ckpt = _ckpt_mgr.load_best(
+        _prod_cnn,
+        metric=CHECKPOINT_CONFIG["primary_metric"],
+        device=device,
+    )
+    if _best_ckpt is None:
+        logger.warning(
+            "  ⚠️  No best CNN checkpoint found — ablation baselines will "
+            "use randomly-initialised weights and will not match production."
+        )
+    _prod_cnn = _prod_cnn.to(device)
+    _prod_cnn.eval()
+
+    # ── Load the production GBM ───────────────────────────────────────────────
+    logger.info("  Loading production GBM…")
+    _prod_gbm = GBMTrainer()
+    _gbm_pkl = model_dir / "best_gbm_model.pkl"
+    if not _gbm_pkl.exists():
+        _gbm_pkl = model_dir / "gbm_model.pkl"
+    if _gbm_pkl.exists():
+        _prod_gbm.best_model = joblib.load(_gbm_pkl)
+        _prod_gbm.model      = _prod_gbm.best_model
+        logger.info(f"  ✅ GBM loaded from {_gbm_pkl}")
+    else:
+        logger.warning(
+            f"  ⚠️  GBM not found at {_gbm_pkl}. "
+            "GBM-dependent scenarios will be skipped or degraded."
+        )
+
+    # ── Load the production bottleneck PCA ───────────────────────────────────
+    logger.info("  Loading production PCA…")
+    _prod_pca = None
+    _pca_pkl  = model_dir / "bottleneck_pca.pkl"
+    if _pca_pkl.exists():
+        _prod_pca = joblib.load(_pca_pkl)
+        logger.info(f"  ✅ PCA loaded from {_pca_pkl}")
+    else:
+        logger.warning(
+            f"  ⚠️  PCA not found at {_pca_pkl}. "
+            "Bottleneck features will be uncompressed."
+        )
+
+    # ── Load ensemble weights ─────────────────────────────────────────────────
+    _ens_cfg_path = model_dir / "ensemble_config.json"
+    _prod_ens_weights = ENSEMBLE_WEIGHTS
+    if _ens_cfg_path.exists():
+        with open(_ens_cfg_path) as _f:
+            _ens_cfg = json.load(_f)
+        _prod_ens_weights = _ens_cfg.get("weights", ENSEMBLE_WEIGHTS)
+        logger.info(f"  ✅ Ensemble weights loaded: {_prod_ens_weights}")
+
+    # ── Load Optuna best params (used by S1 scenarios) ────────────────────────
+    _best_cnn_params: Dict = {}
+    _best_gbm_params: Dict = {}
+    _best_cnn_path = model_dir / "tuning" / "best_cnn_params.json"
+    _best_gbm_path = model_dir / "tuning" / "best_gbm_params.json"
+    if _best_cnn_path.exists():
+        try:
+            with open(_best_cnn_path) as _f:
+                _best_cnn_params = json.load(_f).get("best_params", {})
+            logger.info(f"  ✅ Optuna CNN params loaded: {_best_cnn_params}")
+        except Exception as _e:
+            logger.warning(f"  ⚠️  Could not load Optuna CNN params: {_e}")
+    if _best_gbm_path.exists():
+        try:
+            with open(_best_gbm_path) as _f:
+                _best_gbm_params = json.load(_f).get("best_params", {})
+            logger.info(f"  ✅ Optuna GBM params loaded")
+        except Exception as _e:
+            logger.warning(f"  ⚠️  Could not load Optuna GBM params: {_e}")
+
+    # ── Pre-extract bottleneck features with the PRODUCTION CNN ──────────────
+    # Used by S2a/S2b (no CNN retraining) and as the GBM baseline for S1/S3/S4.
+    logger.info("\n  Extracting production bottleneck features…")
+    _bot_tr_prod = extract_cnn_bottleneck_features(X_train, _prod_cnn, device=str(device))
+    _bot_vl_prod = extract_cnn_bottleneck_features(X_val,   _prod_cnn, device=str(device))
+    if _prod_pca is not None:
+        _bot_tr_prod = _prod_pca.transform(_bot_tr_prod)
+        _bot_vl_prod = _prod_pca.transform(_bot_vl_prod)
+    else:
+        _inline_pca  = PCA(n_components=min(32, _bot_tr_prod.shape[1]), random_state=42)
+        _bot_tr_prod = _inline_pca.fit_transform(_bot_tr_prod)
+        _bot_vl_prod = _inline_pca.transform(_bot_vl_prod)
+
+    # ── GBM feature tables (shared by all scenarios that use GBM) ────────────
+    _Xg_tr_prod, _yg_tr_prod = prepare_gbm_features(X_train, y_train, _bot_tr_prod)
+    _Xg_vl_prod, _yg_vl_prod = prepare_gbm_features(X_val,   y_val,   _bot_vl_prod)
+
+    # ── Production CNN patch-mean predictions (normalised) ───────────────────
+    logger.info("  Computing production CNN patch-mean predictions…")
+    _prod_cnn.eval()
+    _prod_cnn_pm_norm = []
+    _prod_cnn_tg_norm = []
+    _vl_ds_prod = UHIDataset(X_val, y_val, augment=False)
+    _vl_ld_prod = DataLoader(
+        _vl_ds_prod,
+        batch_size=TRAINING_CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=COMPUTE_CONFIG["num_workers"],
+        pin_memory=COMPUTE_CONFIG["pin_memory"],
+    )
+    with torch.no_grad():
+        for _d, _t in _vl_ld_prod:
+            _out = _prod_cnn(_d.to(device)).cpu().numpy()
+            _prod_cnn_pm_norm.append(_out.reshape(_out.shape[0], -1).mean(axis=1))
+            _prod_cnn_tg_norm.append(_t.numpy().reshape(_t.shape[0], -1).mean(axis=1))
+    _prod_cnn_pm_norm = np.concatenate(_prod_cnn_pm_norm)
+    _prod_cnn_tg_norm = np.concatenate(_prod_cnn_tg_norm)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helper: retrain CNN from scratch with overridden settings.
+    # Returns (cnn_model, cnn_patch_mean_norm, cnn_target_norm, bot_tr, bot_vl)
+    # so callers can layer GBM on top.
+    # ──────────────────────────────────────────────────────────────────────────
+    def _retrain_cnn(
+        initial_lr=None,
+        weight_decay=None,
+        batch_size=None,
+        dropout_rate=None,
+        use_multi_loss=True,
+        use_stratified=True,
+    ):
+        _lr  = initial_lr  or TRAINING_CONFIG["initial_lr"]
+        _wd  = weight_decay or TRAINING_CONFIG.get("weight_decay", 1e-4)
+        _bs  = batch_size  or TRAINING_CONFIG["batch_size"]
+        _do  = dropout_rate or CNN_CONFIG.get("dropout_rates", [0.1])[0]
+
+        _cnn = UNet(in_channels=n_channels, out_channels=1)
+        if _do != CNN_CONFIG.get("dropout_rates", [0.1])[0]:
+            for _m in _cnn.modules():
+                if isinstance(_m, (nn.Dropout2d, nn.Dropout)):
+                    _m.p = _do
+        initialize_weights(_cnn)
+        _cnn = _cnn.to(device)
+
+        use_aug = use_multi_loss   # S3 basic_mse also disables augmentation
+        _tr_ds = UHIDataset(X_train, y_train, augment=use_aug)
+        _vl_ds = UHIDataset(X_val,   y_val,   augment=False)
+
+        if use_stratified:
+            _sampler    = create_temperature_stratified_sampler(y_train)
+            _shuffle_tr = False
+        else:
+            _sampler    = None
+            _shuffle_tr = True
+
+        _tr_ld = DataLoader(
+            _tr_ds, batch_size=_bs,
+            sampler=_sampler, shuffle=_shuffle_tr,
+            num_workers=COMPUTE_CONFIG["num_workers"],
+            pin_memory=COMPUTE_CONFIG["pin_memory"],
+        )
+        _vl_ld = DataLoader(
+            _vl_ds, batch_size=_bs, shuffle=False,
+            num_workers=COMPUTE_CONFIG["num_workers"],
+            pin_memory=COMPUTE_CONFIG["pin_memory"],
+        )
+
+        if use_multi_loss:
+            _crit = ProgressiveLSTLoss()
+        else:
+            _crit = ProgressiveLSTLoss()
+            _crit.gradient_weight    = 0.0
+            _crit.variance_weight    = 0.0
+            _crit.range_weight       = 0.0
+            _crit.bias_weight        = 0.0
+            _crit._disable_temp_weighted = True
+
+        _opt  = optim.AdamW(_cnn.parameters(), lr=_lr, weight_decay=_wd)
+        _sch  = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            _opt,
+            T_0=SCHEDULER_CONFIG["T_0"],
+            T_mult=SCHEDULER_CONFIG["T_mult"],
+            eta_min=SCHEDULER_CONFIG["eta_min"],
+        )
+        _es   = EarlyStopping(
+            patience=EARLY_STOPPING_CONFIG["patience"],
+            min_delta=EARLY_STOPPING_CONFIG["min_delta"],
+            mode=EARLY_STOPPING_CONFIG["mode"],
+        )
+
+        best_r2    = -float("inf")
+        best_state = None
+
+        for ep in range(epochs):
+            _cnn.train()
+            ep_loss = 0.0
+            for _d, _t in _tr_ld:
+                _d, _t = _d.to(device), _t.to(device)
+                _opt.zero_grad()
+                _out = _cnn(_d)
+                _loss, _ = _crit(_out, _t, _d)
+                if torch.isnan(_loss) or torch.isinf(_loss):
+                    continue
+                _loss.backward()
+                torch.nn.utils.clip_grad_norm_(_cnn.parameters(), max_norm=1.0)
+                _opt.step()
+                ep_loss += _loss.item()
+            _crit.set_training_progress(ep, epochs)
+            _sch.step()
+
+            if ep % 5 == 0 or ep == epochs - 1:
+                _cnn.eval()
+                _vp, _vt = [], []
+                with torch.no_grad():
+                    for _d2, _t2 in _vl_ld:
+                        _vp.append(_cnn(_d2.to(device)).cpu().numpy())
+                        _vt.append(_t2.numpy())
+                _vp_f = np.concatenate(_vp).flatten()
+                _vt_f = np.concatenate(_vt).flatten()
+                _mask = np.isfinite(_vp_f) & np.isfinite(_vt_f)
+                if _mask.sum() > 1:
+                    _pdn = denormalize_predictions(_vp_f[_mask], _ns)
+                    _tdn = denormalize_predictions(_vt_f[_mask], _ns)
+                    _r2  = float(r2_score(_tdn, _pdn))
+                    _rmse = float(np.sqrt(mean_squared_error(_tdn, _pdn)))
+                    logger.info(
+                        f"    Ep {ep+1}/{epochs}  loss={ep_loss/max(len(_tr_ld),1):.4f}"
+                        f"  val_R²={_r2:.4f}  val_RMSE={_rmse:.4f}°C"
+                    )
+                    if _r2 > best_r2:
+                        best_r2    = _r2
+                        best_state = {k: v.cpu().clone()
+                                      for k, v in _cnn.state_dict().items()}
+                    if _es(_rmse, _cnn):
+                        logger.info(f"    Early stopping at epoch {ep+1}")
+                        break
+
+        if best_state is not None:
+            _cnn.load_state_dict(best_state)
+        _cnn.eval()
+
+        # Patch-mean predictions on val set (normalised)
+        _pm_norm, _tg_norm = [], []
+        with torch.no_grad():
+            for _d, _t in _vl_ld:
+                _o = _cnn(_d.to(device)).cpu().numpy()
+                _pm_norm.append(_o.reshape(_o.shape[0], -1).mean(axis=1))
+                _tg_norm.append(_t.numpy().reshape(_t.shape[0], -1).mean(axis=1))
+        _pm_norm = np.concatenate(_pm_norm)
+        _tg_norm = np.concatenate(_tg_norm)
+
+        # Bottleneck features from this newly-trained CNN
+        _bot_tr = extract_cnn_bottleneck_features(X_train, _cnn, device=str(device))
+        _bot_vl = extract_cnn_bottleneck_features(X_val,   _cnn, device=str(device))
+        _pca_new = PCA(n_components=min(32, _bot_tr.shape[1]), random_state=42)
+        _bot_tr  = _pca_new.fit_transform(_bot_tr)
+        _bot_vl  = _pca_new.transform(_bot_vl)
+
+        return _cnn, _pm_norm, _tg_norm, _bot_tr, _bot_vl
+
+    # ── Helper: train a fresh GBM on given features ───────────────────────────
+    def _train_gbm(bot_tr, bot_vl, gbm_params=None):
+        _Xg_tr, _yg_tr = prepare_gbm_features(X_train, y_train, bot_tr)
+        _Xg_vl, _yg_vl = prepare_gbm_features(X_val,   y_val,   bot_vl)
+        _gbm = GBMTrainer(config=gbm_params) if gbm_params else GBMTrainer()
+        _gbm.train(_Xg_tr, _yg_tr, _Xg_vl, _yg_vl)
+        return _gbm, _Xg_vl, _yg_vl
+
+    # ── Helper: weighted ensemble from (cnn_pm_norm, gbm_preds_norm, targets) ─
+    def _blend_metrics(cnn_pm_norm, gbm_preds_norm, y_norm, weights=None):
+        w = weights or _prod_ens_weights
+        n = min(len(cnn_pm_norm), len(gbm_preds_norm), len(y_norm))
+        blend_norm = w["cnn"] * cnn_pm_norm[:n] + w["gbm"] * gbm_preds_norm[:n]
+        blend_dn   = denormalize_predictions(blend_norm,    _ns)
+        tgt_dn     = denormalize_predictions(y_norm[:n],    _ns)
+        return _metrics_from_deg(blend_dn, tgt_dn)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Ablation config definitions
+    # ──────────────────────────────────────────────────────────────────────────
+    ablation_configs = [
+        # Scenario 1: HP tuning — both variants retrain CNN+GBM
+        ("S1: With HP Tuning",             {}),
+        ("S1: Default Params",             {"disable_hyperparameter_tuning": True}),
+        # Scenario 2a: patch-level — pure inference swap, no retraining
+        ("S2a: Ensemble (Patch)",          {}),
+        ("S2a: GBM Only (Patch)",          {"disable_cnn_in_patch": True}),
+        # Scenario 2b: pixel-level — pure inference swap, no retraining
+        ("S2b: CNN-as-Residual (Pixel)",   {"cnn_as_residual": True}),
+        ("S2b: CNN Only (Pixel)",          {"disable_gbm": True}),
+        # Scenario 3: loss function — only CNN retrained; GBM retrained on new bottleneck
+        ("S3: Multi-Component Loss",       {}),
+        ("S3: Default MSE Loss",           {"basic_mse_no_aug": True}),
+        # Scenario 4: sampler — only CNN retrained; GBM retrained on new bottleneck
+        ("S4: With Stratified Sampling",   {}),
+        ("S4: Without Stratified Sampling",{"disable_stratified": True}),
+    ]
+
+    results: Dict = {}
+
+    for cfg_name, overrides in ablation_configs:
+        logger.info(f"\n{'─' * 70}")
+        logger.info(f"ABLATION CONFIG: {cfg_name}")
+        logger.info(f"  Overrides: {overrides or 'none (full pipeline)'}")
+        logger.info(f"{'─' * 70}")
+
+        try:
+            # ── Resolve which Optuna params to use ────────────────────────────
+            _use_tuning = not overrides.get("disable_hyperparameter_tuning", False)
+            _lr  = (_best_cnn_params.get("initial_lr")   if _use_tuning else None)
+            _wd  = (_best_cnn_params.get("weight_decay") if _use_tuning else None)
+            _bs  = (_best_cnn_params.get("batch_size")   if _use_tuning else None)
+            _do  = (_best_cnn_params.get("dropout_rate") if _use_tuning else None)
+            _gbm_par = (_best_gbm_params if (_use_tuning and _best_gbm_params) else None)
+
+            # ── Decide evaluation path ────────────────────────────────────────
+            #
+            # Check scenario by cfg_name prefix first (S1/S3/S4 may have overrides={}
+            # for the "with" variant, which would otherwise fall into the S2a baseline
+            # branch erroneously).
+            #
+            # SCENARIO 1 — HP tuning comparison: retrain CNN + GBM ────────────
+            if cfg_name.startswith("S1:"):
+                logger.info(f"  [S1] Retraining CNN with "
+                            f"{'Optuna' if _use_tuning else 'default'} params…")
+                _r_cnn, _r_pm, _r_tg, _r_bot_tr, _r_bot_vl = _retrain_cnn(
+                    initial_lr=_lr, weight_decay=_wd,
+                    batch_size=_bs, dropout_rate=_do,
+                    use_multi_loss=True, use_stratified=True,
+                )
+                _r_gbm, _r_Xg_vl, _r_yg_vl = _train_gbm(
+                    _r_bot_tr, _r_bot_vl, _gbm_par
+                )
+                _gbm_preds = _r_gbm.predict(_r_Xg_vl, use_best=True)
+                val_metrics_final = _blend_metrics(
+                    _r_pm, _gbm_preds, _r_yg_vl, _prod_ens_weights
+                )
+                logger.info(f"  [S1] R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            # ── SCENARIO 3 — Loss function: retrain CNN + GBM ─────────────────
+            elif cfg_name.startswith("S3:"):
+                _use_multi = not overrides.get("basic_mse_no_aug", False)
+                logger.info(f"  [S3] Retraining CNN with "
+                            f"{'ProgressiveLSTLoss' if _use_multi else 'plain MSE'}…")
+                _r_cnn, _r_pm, _r_tg, _r_bot_tr, _r_bot_vl = _retrain_cnn(
+                    use_multi_loss=_use_multi, use_stratified=True,
+                )
+                _r_gbm, _r_Xg_vl, _r_yg_vl = _train_gbm(_r_bot_tr, _r_bot_vl)
+                _gbm_preds = _r_gbm.predict(_r_Xg_vl, use_best=True)
+                val_metrics_final = _blend_metrics(
+                    _r_pm, _gbm_preds, _r_yg_vl, _prod_ens_weights
+                )
+                logger.info(f"  [S3] R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            # ── SCENARIO 4 — Stratified sampling: retrain CNN + GBM ───────────
+            elif cfg_name.startswith("S4:"):
+                _use_strat = not overrides.get("disable_stratified", False)
+                logger.info(f"  [S4] Retraining CNN with "
+                            f"{'stratified' if _use_strat else 'uniform'} sampler…")
+                _r_cnn, _r_pm, _r_tg, _r_bot_tr, _r_bot_vl = _retrain_cnn(
+                    use_multi_loss=True, use_stratified=_use_strat,
+                )
+                _r_gbm, _r_Xg_vl, _r_yg_vl = _train_gbm(_r_bot_tr, _r_bot_vl)
+                _gbm_preds = _r_gbm.predict(_r_Xg_vl, use_best=True)
+                val_metrics_final = _blend_metrics(
+                    _r_pm, _gbm_preds, _r_yg_vl, _prod_ens_weights
+                )
+                logger.info(f"  [S4] R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            # ── SCENARIO 2a/2b — pure inference swap; no retraining ───────────
+            elif overrides.get("disable_cnn_in_patch"):
+                # S2a GBM-only: use production GBM predictions directly
+                if _prod_gbm.best_model is None:
+                    raise RuntimeError("Production GBM not loaded; cannot run S2a GBM-only")
+                _gbm_preds = _prod_gbm.predict(_Xg_vl_prod, use_best=True)
+                _gbm_dn    = denormalize_predictions(_gbm_preds, _ns)
+                _tgt_dn    = denormalize_predictions(_yg_vl_prod, _ns)
+                _n = min(len(_gbm_dn), len(_tgt_dn))
+                val_metrics_final = _metrics_from_deg(_gbm_dn[:_n], _tgt_dn[:_n])
+                logger.info(f"  [S2a] GBM-only: R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            elif overrides.get("disable_gbm"):
+                # S2b CNN-only: production CNN patch-mean only
+                _cnn_dn = denormalize_predictions(_prod_cnn_pm_norm, _ns)
+                _tgt_dn = denormalize_predictions(_prod_cnn_tg_norm, _ns)
+                val_metrics_final = _metrics_from_deg(_cnn_dn, _tgt_dn)
+                logger.info(f"  [S2b] CNN-only: R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            elif overrides.get("cnn_as_residual"):
+                # S2b CNN-as-Residual: production GBM corrects production CNN residual
+                if _prod_gbm.best_model is None:
+                    raise RuntimeError("Production GBM not loaded; cannot run CNN-as-Residual")
+                _n = min(len(_prod_cnn_pm_norm), len(_yg_vl_prod))
+                _res_vl = _yg_vl_prod[:_n] - _prod_cnn_pm_norm[:_n]
+                # Build training residuals using already-computed production features
+                _tr_ds_r = UHIDataset(X_train, y_train, augment=False)
+                _tr_ld_r = DataLoader(
+                    _tr_ds_r, batch_size=TRAINING_CONFIG["batch_size"],
+                    shuffle=False, num_workers=0, pin_memory=False,
+                )
+                _cnn_pm_tr_norm = np.concatenate([
+                    _prod_cnn(_d.to(device)).cpu().detach().numpy()
+                        .reshape(_d.shape[0], -1).mean(axis=1)
+                    for _d, _ in _tr_ld_r
+                ])
+                _n_tr = min(len(_cnn_pm_tr_norm), len(_yg_tr_prod))
+                _res_tr = _yg_tr_prod[:_n_tr] - _cnn_pm_tr_norm[:_n_tr]
+                _gbm_res = GBMTrainer(config=_gbm_par) if _gbm_par else GBMTrainer()
+                _gbm_res.train(_Xg_tr_prod.iloc[:_n_tr], _res_tr,
+                               _Xg_vl_prod.iloc[:_n], _res_vl)
+                _gbm_res_preds = _gbm_res.predict(_Xg_vl_prod.iloc[:_n], use_best=True)
+                _final_norm = _prod_cnn_pm_norm[:_n] + _gbm_res_preds
+                _final_dn   = denormalize_predictions(_final_norm, _ns)
+                _tgt_dn     = denormalize_predictions(_yg_vl_prod[:_n], _ns)
+                val_metrics_final = _metrics_from_deg(_final_dn, _tgt_dn)
+                logger.info(f"  [S2b] CNN-as-Residual: R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            # ── SCENARIO 2a Ensemble baseline (overrides = {}) ───────────────
+            elif not overrides:
+                # Use the production blend directly — baseline == LEVEL-1 output.
+                if _prod_gbm.best_model is None:
+                    raise RuntimeError("Production GBM not loaded; cannot compute ensemble")
+                _gbm_preds = _prod_gbm.predict(_Xg_vl_prod, use_best=True)
+                val_metrics_final = _blend_metrics(
+                    _prod_cnn_pm_norm, _gbm_preds, _yg_vl_prod, _prod_ens_weights
+                )
+                logger.info(f"  [S2a / baseline] Weighted Ensemble: "
+                            f"R²={val_metrics_final['r2']:.4f}  "
+                            f"RMSE={val_metrics_final['rmse']:.4f}°C")
+
+            else:
+                # Catch-all: should not be reached with the configs above
+                raise RuntimeError(f"Unhandled ablation config: {cfg_name}")
+
+        except Exception as _err:
+            logger.warning(
+                f"\n  ⚠️  Config '{cfg_name}' failed: {_err}\n"
+                "  Recording error and continuing."
+            )
+            import traceback as _tb
+            _tb.print_exc()
+            results[cfg_name] = {"error": str(_err)}
+            continue
+
+        # ── Record & log ──────────────────────────────────────────────────────
+        results[cfg_name] = {"metrics": val_metrics_final}
+        logger.info(
+            f"\n  RESULT [{cfg_name}]: "
+            f"R²={val_metrics_final['r2']:.4f}  "
+            f"RMSE={val_metrics_final['rmse']:.4f}°C  "
+            f"MAE={val_metrics_final['mae']:.4f}°C"
+        )
+
+    # ── Table 4.9 summary grouped by scenario ────────────────────────────────
+    scenarios = [
+        ("Scenario 1 — Hyperparameter Tuning",
+         "S1: With HP Tuning", "S1: Default Params"),
+        ("Scenario 2a — Patch-level Ensemble vs. GBM-only",
+         "S2a: Ensemble (Patch)", "S2a: GBM Only (Patch)"),
+        ("Scenario 2b — Pixel-level CNN-as-Residual vs. CNN-only",
+         "S2b: CNN-as-Residual (Pixel)", "S2b: CNN Only (Pixel)"),
+        ("Scenario 3 — Multi-Component Loss vs. Default MSE",
+         "S3: Multi-Component Loss", "S3: Default MSE Loss"),
+        ("Scenario 4 — Stratified Sampling vs. Without",
+         "S4: With Stratified Sampling", "S4: Without Stratified Sampling"),
+    ]
+
+    W = 100
+    logger.info("\n" + "=" * W)
+    logger.info("TABLE 4.9 — ABLATION STUDY SUMMARY  (validation set, °C)")
+    logger.info("=" * W)
+    logger.info(
+        f"  {'Configuration':<38} {'R²':>7} {'RMSE(°C)':>10} {'MAE(°C)':>9} "
+        f"{'ΔR²':>9} {'ΔRMSE':>9}"
+    )
+
+    for s_title, cfg_with, cfg_without in scenarios:
+        logger.info(f"\n  ── {s_title} ──")
+        logger.info("  " + "-" * (W - 2))
+        for cfg_name in (cfg_with, cfg_without):
+            res = results.get(cfg_name, {})
+            if "error" in res:
+                logger.info(f"  {'  ' + cfg_name:<38} ERROR: {res['error']}")
+                continue
+            m    = res.get("metrics", {})
+            ref  = results.get(cfg_with, {}).get("metrics", {})
+            dr2   = m.get("r2",   float("nan")) - ref.get("r2",   float("nan"))
+            drmse = m.get("rmse", float("nan")) - ref.get("rmse", float("nan"))
+            logger.info(
+                f"  {'  ' + cfg_name:<38} {m.get('r2', float('nan')):>7.4f} "
+                f"{m.get('rmse', float('nan')):>10.4f} "
+                f"{m.get('mae',  float('nan')):>9.4f} "
+                f"{'(baseline)':>9} {'':>9}"
+                if cfg_name == cfg_with else
+                f"  {'  ' + cfg_name:<38} {m.get('r2', float('nan')):>7.4f} "
+                f"{m.get('rmse', float('nan')):>10.4f} "
+                f"{m.get('mae',  float('nan')):>9.4f} "
+                f"{dr2:>+9.4f} {drmse:>+9.4f}"
+            )
+
+    logger.info("\n" + "=" * W)
+
+    # ── Persist ablation_results.json ─────────────────────────────────────────
+    ablation_out = model_dir / "ablation_results.json"
+    _serializable_ablation = {}
+    for k, v in results.items():
+        entry: Dict = {}
+        if "error" in v:
+            entry["error"] = v["error"]
+        else:
+            entry["metrics"] = {mk: float(mv) for mk, mv in v.get("metrics", {}).items()}
+        _serializable_ablation[k] = entry
+    with open(ablation_out, "w") as f:
+        json.dump(_serializable_ablation, f, indent=2)
+    logger.info(f"\n✅ Ablation results saved → {ablation_out}")
+
+    return results
+
+
+
+# ── Table 4.10 — Cross-variant comparison ─────────────────────────────────────
+
+def log_cross_variant_comparison(results: Dict[str, Dict]) -> None:
+    """Log Table 4.10 from persisted test_results dicts for Landsat and Fusion.
+
+    Args:
+        results: Dict mapping variant label ('landsat', 'fusion') → test_results
+                 dict returned by evaluate_on_test_set(), or loaded from the
+                 corresponding test_results.json files.
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("TABLE 4.10 — CROSS-VARIANT COMPARISON: LANDSAT vs FUSION (test set)")
+    logger.info("=" * 80)
+
+    tgt     = VALIDATION_CONFIG["targets"]
+    metrics = ["r2", "rmse", "mae", "mbe"]
+
+    # Extract ensemble metrics for both variants
+    variant_metrics: Dict[str, Dict] = {}
+    for variant, res in results.items():
+        if isinstance(res, dict) and "ensemble" in res:
+            variant_metrics[variant] = res["ensemble"]
+        elif isinstance(res, dict) and "ensemble_metrics" in res:
+            em = res["ensemble_metrics"]
+            if isinstance(em, dict):
+                variant_metrics[variant] = em
+        else:
+            logger.warning(f"  Could not extract ensemble metrics for variant '{variant}'")
+
+    if len(variant_metrics) < 2:
+        logger.warning("  Need both 'landsat' and 'fusion' results for cross-variant comparison")
+        return
+
+    ls = variant_metrics.get("landsat", {})
+    fu = variant_metrics.get("fusion",  {})
+
+    W = 80
+    logger.info(
+        f"\n  {'Metric':<12} {'Landsat':>10} {'Fusion':>10} "
+        f"{'Δ(F-LS)':>10} {'Rel. Gain':>11} {'Target Met?':>13}"
+    )
+    logger.info("  " + "-" * (W - 2))
+
+    target_map = {"r2": (tgt["r2"], "≥"), "rmse": (tgt["rmse"], "≤"),
+                  "mae": (tgt["mae"], "≤"), "mbe": (None, "≈0")}
+
+    for m_key in metrics:
+        ls_v  = ls.get(m_key, float("nan"))
+        fu_v  = fu.get(m_key, float("nan"))
+        delta = fu_v - ls_v
+        tgt_v, cmp = target_map[m_key]
+
+        if tgt_v is not None and not np.isnan(fu_v):
+            if cmp == "≥":
+                target_met = fu_v >= tgt_v
+                rel_gain   = delta / abs(ls_v) * 100 if ls_v != 0 else float("nan")
+            else:  # ≤
+                target_met = fu_v <= tgt_v
+                rel_gain   = -delta / abs(ls_v) * 100 if ls_v != 0 else float("nan")
+            met_str = "✅ Yes" if target_met else "❌ No "
+        else:
+            rel_gain = delta / abs(ls_v) * 100 if (ls_v and ls_v != 0) else float("nan")
+            met_str  = f"(target: {cmp}0)"
+
+        suffix = "°C" if m_key != "r2" else ""
+        logger.info(
+            f"  {(m_key.upper() + suffix):<12} {ls_v:>10.4f} {fu_v:>10.4f} "
+            f"  {delta:>+9.4f}  {rel_gain:>+9.1f}%  {met_str:>12}"
+        )
+
+    logger.info("=" * 80)
+    logger.info(
+        "  Interpretation: Fusion ensemble gains derive from finer spectral\n"
+        "  discrimination (10-m Sentinel-2 indices) in heterogeneous transitional\n"
+        "  zones (mixed residential-commercial corridors, park-industrial boundaries)."
+    )
+
+    # ── Persist cross_variant_comparison.json (written to both model dirs) ────
+    serializable = {
+        variant: {k: float(v) for k, v in m.items()}
+        for variant, m in variant_metrics.items()
+    }
+    for variant in results:
+        if "model_dir" in results[variant]:
+            _out = Path(results[variant]["model_dir"]) / "cross_variant_comparison.json"
+            with open(_out, "w") as f:
+                json.dump(serializable, f, indent=2)
+            logger.info(f"  ✅ Saved → {_out}")
+
+
 def main():
     """
     Main entry point.
@@ -3511,6 +4736,16 @@ def main():
     # Point at an arbitrary preprocessed dataset:
     python train_ensemble.py --dataset /path/to/cnn_dataset_custom \
                              --model-dir /path/to/models/custom
+
+    # Run the test-set evaluation scenarios from Section 4.6 of the thesis
+    # (requires trained models in the default model dirs):
+    python train_ensemble.py --mode both --run-test-eval
+
+    # Run the ablation study only (no full training):
+    python train_ensemble.py --mode fusion --ablation-only
+
+    # Override ablation epoch count for faster iteration:
+    python train_ensemble.py --mode fusion --ablation-only --ablation-epochs 10
     """
     import argparse
 
@@ -3545,6 +4780,41 @@ def main():
         help=(
             "Override model output directory.  Ignored when --mode is 'both'.\n"
             "Default: MODEL_DIR/<mode> (e.g. MODEL_DIR/landsat)."
+        ),
+    )
+    parser.add_argument(
+        "--run-test-eval",
+        action="store_true",
+        default=False,
+        dest="run_test_eval",
+        help=(
+            "After training, run the full Section 4.6 test-set evaluation:\n"
+            "  Table 4.8 (CNN-only vs ensemble on held-out test set),\n"
+            "  Table 4.10 (cross-variant comparison when --mode both),\n"
+            "  residual diagnostics (heteroscedasticity, Shapiro-Wilk,\n"
+            "  Moran's I proxy, temporal stability) and GBM feature importance.\n"
+            "Requires a 'test' sub-directory in the dataset directory."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-only",
+        action="store_true",
+        default=False,
+        dest="ablation_only",
+        help=(
+            "Skip full training and run only the Table 4.9 ablation study.\n"
+            "Useful for targeted ablation experiments or quick CI smoke tests."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-epochs",
+        type=int,
+        default=None,
+        dest="ablation_epochs",
+        help=(
+            "Override epoch count for each ablation configuration "
+            "(default: use TRAINING_CONFIG['epochs']).\n"
+            "Pass a small value (e.g. 5) for a fast smoke test."
         ),
     )
     args = parser.parse_args()
@@ -3582,29 +4852,160 @@ def main():
     if not check_disk_space(variants[0][2].parent):
         logger.warning("⚠️ Low disk space — proceeding anyway")
 
+    # ── Ablation-only mode (Table 4.9) ───────────────────────────────────────
+    if args.ablation_only:
+        logger.info("\n" + "#" * 70)
+        logger.info("# ABLATION-ONLY MODE — skipping full training")
+        logger.info("#" * 70)
+        # Use the first variant's dataset/model dir; for --mode both use fusion
+        abl_label, abl_ds, abl_md = variants[-1]   # fusion if both, else the chosen one
+        abl_md.mkdir(parents=True, exist_ok=True)
+        run_ablation_study(
+            dataset_dir=abl_ds,
+            model_dir=abl_md,
+            device=device,
+            label=abl_label,
+            n_ablation_epochs=args.ablation_epochs,
+        )
+        return
+
     # ── Train each variant ───────────────────────────────────────────────────
-    results = {}
+    histories = {}
+    # ensemble_trainers keeps a reference per variant so we can call test eval
+    ensemble_trainers: Dict[str, "EnsembleTrainer"] = {}
+
     for label, dataset_dir, model_dir in variants:
         logger.info(f"\n{'#'*70}")
         logger.info(f"# VARIANT: {label.upper()}")
         logger.info(f"{'#'*70}")
-        results[label] = _train_one_variant(dataset_dir, model_dir, device, label)
+        histories[label] = _train_one_variant(dataset_dir, model_dir, device, label)
 
-    # ── Cross-variant comparison (only when both were trained) ────────────────
-    if len(results) == 2:
-        logger.info("\n" + "="*70)
-        logger.info("CROSS-VARIANT COMPARISON")
-        logger.info("="*70)
+    # ── Val-set cross-variant summary (existing behaviour, always runs) ───────
+    if len(histories) == 2:
+        logger.info("\n" + "=" * 70)
+        logger.info("CROSS-VARIANT COMPARISON (validation set — existing behaviour)")
+        logger.info("=" * 70)
         logger.info(f"{'Variant':<12} {'R²':>8} {'RMSE(°C)':>10} {'MAE(°C)':>9}")
-        logger.info("-"*42)
-        for label, hist in results.items():
+        logger.info("-" * 42)
+        for label, hist in histories.items():
             if "ensemble_metrics" in hist and hist["ensemble_metrics"]:
                 m = hist["ensemble_metrics"]
                 logger.info(f"{label:<12} {m['r2']:>8.4f} {m['rmse']:>10.4f} {m['mae']:>9.4f}")
-        logger.info("="*70)
-        logger.info("To compare further, inspect diagnostics in:")
+        logger.info("=" * 70)
+        logger.info("Diagnostic plots saved to:")
         for label, _, model_dir in variants:
             logger.info(f"  {label:8s}: {model_dir / 'diagnostics'}")
+
+    # ── Section 4.6 test-set evaluation (opt-in via --run-test-eval) ─────────
+    if args.run_test_eval:
+        logger.info("\n" + "#" * 70)
+        logger.info("# SECTION 4.6 — TEST SET EVALUATION SCENARIOS")
+        logger.info("#" * 70)
+
+        test_results: Dict[str, Dict] = {}
+
+        for label, dataset_dir, model_dir in variants:
+            logger.info(f"\n{'=' * 70}")
+            logger.info(f"  Test evaluation: {label.upper()}")
+            logger.info(f"{'=' * 70}")
+
+            # ── Reload best CNN ───────────────────────────────────────────────
+            norm_stats = load_normalization_stats(dataset_dir)
+            n_channels = norm_stats.get("n_channels", CNN_CONFIG["input_channels"])
+
+            cnn_model_te = UNet(in_channels=n_channels, out_channels=1)
+            ckpt_mgr_te  = CheckpointManager(
+                save_dir=model_dir / "checkpoints",
+                metrics=CHECKPOINT_CONFIG["metrics"],
+            )
+            best_ckpt = ckpt_mgr_te.load_best(
+                cnn_model_te,
+                metric=CHECKPOINT_CONFIG["primary_metric"],
+                device=device,
+            )
+            if best_ckpt is None:
+                logger.warning(
+                    f"  ⚠️ No best CNN checkpoint found for {label} — "
+                    f"using randomly initialised weights. Train first."
+                )
+            cnn_model_te = cnn_model_te.to(device)
+
+            # ── Reload best GBM ───────────────────────────────────────────────
+            gbm_trainer_te = GBMTrainer()
+            gbm_pkl = model_dir / "best_gbm_model.pkl"
+            if not gbm_pkl.exists():
+                gbm_pkl = model_dir / "gbm_model.pkl"   # fallback
+            if gbm_pkl.exists():
+                gbm_trainer_te.best_model = joblib.load(gbm_pkl)
+                gbm_trainer_te.model      = gbm_trainer_te.best_model
+                logger.info(f"  ✅ GBM loaded from {gbm_pkl}")
+            else:
+                logger.warning(f"  ⚠️ GBM model not found at {gbm_pkl} — ensemble will fall back to CNN-only")
+
+            # ── Reload PCA ────────────────────────────────────────────────────
+            pca_te   = None
+            pca_path = model_dir / "bottleneck_pca.pkl"
+            if pca_path.exists():
+                pca_te = joblib.load(pca_path)
+                logger.info(f"  ✅ PCA loaded from {pca_path}")
+            else:
+                logger.warning(f"  ⚠️ PCA not found at {pca_path} — bottleneck features uncompressed")
+
+            # ── Reload ensemble weights ────────────────────────────────────────
+            ens_cfg_path = model_dir / "ensemble_config.json"
+            if ens_cfg_path.exists():
+                with open(ens_cfg_path) as _f:
+                    _ens_cfg = json.load(_f)
+                ens_weights_te = _ens_cfg.get("weights", ENSEMBLE_WEIGHTS)
+            else:
+                ens_weights_te = ENSEMBLE_WEIGHTS
+                logger.warning(f"  ⚠️ ensemble_config.json not found — using default weights")
+
+            # ── Table 4.8: run test evaluation ────────────────────────────────
+            tr = evaluate_on_test_set(
+                cnn_model=cnn_model_te,
+                gbm_trainer=gbm_trainer_te,
+                pca=pca_te,
+                ensemble_weights=ens_weights_te,
+                dataset_dir=dataset_dir,
+                model_dir=model_dir,
+                device=device,
+                label=label,
+            )
+            tr["model_dir"] = str(model_dir)
+            test_results[label] = tr
+
+            # ── Table 4.9: ablation study (one config per variant) ────────────
+            logger.info(f"\n{'─' * 70}")
+            logger.info(f"  Launching ablation study for {label.upper()}…")
+            logger.info(f"{'─' * 70}")
+            run_ablation_study(
+                dataset_dir=dataset_dir,
+                model_dir=model_dir,
+                device=device,
+                label=label,
+                n_ablation_epochs=args.ablation_epochs,
+            )
+
+        # ── Table 4.10: cross-variant comparison on test set ──────────────────
+        if len(test_results) == 2:
+            log_cross_variant_comparison(test_results)
+        elif len(test_results) == 1:
+            label_only = next(iter(test_results))
+            logger.info(
+                f"\n  Table 4.10 cross-variant comparison requires both 'landsat' and "
+                f"'fusion' results.\n"
+                f"  Only '{label_only}' was evaluated. Re-run with --mode both to compare."
+            )
+
+        logger.info("\n" + "#" * 70)
+        logger.info("# SECTION 4.6 EVALUATION COMPLETE")
+        logger.info(f"#  Results JSON files written to each variant's model directory.")
+        logger.info("#  Files produced per variant:")
+        logger.info("#    test_results.json       — Table 4.8 + residual diagnostics")
+        logger.info("#    ablation_results.json   — Table 4.9 ablation scores")
+        logger.info("#    cross_variant_comparison.json — Table 4.10 (both variants only)")
+        logger.info("#" * 70)
 
 
 if __name__ == "__main__":

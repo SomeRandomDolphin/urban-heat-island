@@ -1567,7 +1567,7 @@ class AnalysisDiagnosticsPlotter:
             classified[(uhi_map >= 6) & (uhi_map < 8)]        = 4
             classified[uhi_map >= 8]                           = 5
 
-            counts = [int((classified == i).sum()) for i in range(5)]
+            counts = [int((classified == i).sum()) for i in range(6)]
             labels = _UHI_CAT_LABELS
             colors = _UHI_CAT_COLORS
 

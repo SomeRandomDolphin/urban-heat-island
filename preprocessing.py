@@ -801,13 +801,43 @@ class PreprocessingDiagnostics:
     def plot_fusion_comparison(self, landsat_data: dict, sentinel2_data: dict,
                                 fused_data: dict, index: str = "NDVI",
                                 filename: str = "09_fusion_comparison.png"):
-        """Three-panel spatial comparison: Landsat | Sentinel-2 | Fused."""
-        datasets = [
-            (landsat_data,  "Landsat"),
-            (sentinel2_data,"Sentinel-2"),
-            (fused_data,    "Fused"),
-        ]
-        available = [(d, n) for d, n in datasets if index in d]
+        """Three-panel spatial comparison: Landsat | Sentinel-2 | Fused.
+
+        Sentinel-2 is resampled to the Landsat spatial grid before display so
+        that all three panels share the same pixel dimensions and the S2 panel
+        does not appear as a small fragment in the corner.
+        """
+        if index not in landsat_data:
+            logger.warning(f"[Diagnostics] plot_fusion_comparison: '{index}' not in landsat_data.")
+            return
+
+        ls_arr = landsat_data[index].astype(np.float32)
+        ref_h, ref_w = ls_arr.shape
+
+        # Resample S2 to the Landsat grid if present
+        if index in sentinel2_data:
+            s2_raw = sentinel2_data[index].astype(np.float32)
+            if s2_raw.shape != (ref_h, ref_w):
+                zoom_h = ref_h / s2_raw.shape[0]
+                zoom_w = ref_w / s2_raw.shape[1]
+                s2_display = zoom(s2_raw, (zoom_h, zoom_w), order=1, mode='reflect')
+            else:
+                s2_display = s2_raw
+        else:
+            s2_display = None
+
+        fu_arr = fused_data.get(index)
+        if fu_arr is not None:
+            fu_arr = fu_arr.astype(np.float32)
+            if fu_arr.shape != (ref_h, ref_w):
+                fu_arr = fu_arr[:ref_h, :ref_w]
+
+        available = [(ls_arr, "Landsat")]
+        if s2_display is not None:
+            available.append((s2_display, "Sentinel-2"))
+        if fu_arr is not None:
+            available.append((fu_arr, "Fused"))
+
         if len(available) < 2:
             logger.warning(f"[Diagnostics] plot_fusion_comparison: need ≥2 sources for {index}.")
             return
@@ -816,12 +846,11 @@ class PreprocessingDiagnostics:
         if len(available) == 1:
             axes = [axes]
 
-        all_vals = np.concatenate([d[index][np.isfinite(d[index])].ravel()
-                                   for d, _ in available])
+        all_vals = np.concatenate([arr[np.isfinite(arr)].ravel() for arr, _ in available])
         vmin, vmax = np.nanpercentile(all_vals, [2, 98])
 
-        for ax, (data, name) in zip(axes, available):
-            im = ax.imshow(data[index], cmap="RdYlGn", vmin=vmin, vmax=vmax)
+        for ax, (arr, name) in zip(axes, available):
+            im = ax.imshow(arr, cmap="RdYlGn", vmin=vmin, vmax=vmax)
             ax.set_title(f"{name}\n{index}", fontweight="bold")
             ax.axis("off")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -1934,31 +1963,32 @@ class PreprocessingDiagnostics:
             return
 
         # Re-compute the quality-based weights used in MultiSensorFusion.fuse_data.
-        # The old time-based formula is not used anymore (time_diff is always 0
-        # for monthly composites, which made time_weight_s2 = 1.0 permanently).
-        # Here we compute the *average* weight across the index image so the
-        # diagnostic title stays informative.
-        ls_arr_tmp = landsat_data[index].astype(np.float32)
-        s2_arr_tmp = sentinel2_data[index].astype(np.float32)
-        _h = min(ls_arr_tmp.shape[0], s2_arr_tmp.shape[0])
-        _w = min(ls_arr_tmp.shape[1], s2_arr_tmp.shape[1])
-        valid_s2_diag = float(np.isfinite(s2_arr_tmp[:_h, :_w]).mean())
-        valid_ls_diag = float(np.isfinite(ls_arr_tmp[:_h, :_w]).mean())
+        # Sentinel-2 is resampled to the Landsat spatial grid first so that the
+        # weight calculation and display panels see the correct full-extent coverage
+        # instead of measuring validity only over the tiny top-left corner produced
+        # by a raw min()-crop of two differently-sized arrays.
+        ls_arr = landsat_data[index].astype(np.float32)
+        ref_h, ref_w = ls_arr.shape
+
+        s2_raw = sentinel2_data[index].astype(np.float32)
+        if s2_raw.shape != (ref_h, ref_w):
+            _zh = ref_h / s2_raw.shape[0]
+            _zw = ref_w / s2_raw.shape[1]
+            s2_arr = zoom(s2_raw, (_zh, _zw), order=1, mode="reflect")
+        else:
+            s2_arr = s2_raw
+
+        fu_arr = fused_data[index].astype(np.float32)
+        if fu_arr.shape != (ref_h, ref_w):
+            fu_arr = fu_arr[:ref_h, :ref_w]
+
+        # All arrays are now the same shape — compute weights over full grid
+        valid_s2_diag = float(np.isfinite(s2_arr).mean())
+        valid_ls_diag = float(np.isfinite(ls_arr).mean())
         _denom = valid_s2_diag + valid_ls_diag
         time_weight_s2 = valid_s2_diag / _denom if _denom > 1e-6 else 0.5
         time_weight_ls = 1.0 - time_weight_s2
-        del ls_arr_tmp, s2_arr_tmp
-
-        ls_arr = landsat_data[index].astype(np.float32)
-        s2_arr = sentinel2_data[index].astype(np.float32)
-        fu_arr = fused_data[index].astype(np.float32)
-
-        # Crop to minimum common shape
-        h = min(ls_arr.shape[0], s2_arr.shape[0], fu_arr.shape[0])
-        w = min(ls_arr.shape[1], s2_arr.shape[1], fu_arr.shape[1])
-        ls_arr = ls_arr[:h, :w]
-        s2_arr = s2_arr[:h, :w]
-        fu_arr = fu_arr[:h, :w]
+        h, w = ref_h, ref_w
 
         # Validate: fused should ≈ w_s2*S2 + w_ls*LS
         expected = time_weight_s2 * s2_arr + time_weight_ls * ls_arr
@@ -5566,8 +5596,9 @@ def main():
                 del processed; gc.collect()
                 continue
 
-            # Generate diagnostics for the first file while data is still in RAM
-            if not landsat_records:
+            # Generate diagnostics for the January 2019 file while data is still in RAM
+            _is_diag_target = (timestamp.year == 2025 and timestamp.month == 11)
+            if _is_diag_target:
                 try:
                     raw_data_for_plot = load_tif_as_bands(raw_file) or {}
                     diag.plot_raw_bands(raw_data_for_plot, title=f"Raw Bands – {raw_file.name}",
@@ -5636,8 +5667,9 @@ def main():
                 del processed; gc.collect()
                 continue
 
-            if not sentinel2_records:
-                # First S2 file — generate S2-specific diagnostics now
+            _is_s2_diag_target = (timestamp.year == 2025 and timestamp.month == 11)
+            if _is_s2_diag_target:
+                # January 2019 S2 file — generate S2-specific diagnostics now
                 try:
                     raw_s2_data = load_tif_as_bands(raw_file) or {}
                     diag.plot_s2_raw_bands(raw_s2_data,        filename="s2_01_raw_bands.png")
@@ -5657,8 +5689,8 @@ def main():
             sentinel2_records.append(rec)
             logger.info(f"  ✓ {raw_file.name}")
 
-            # Evict unless it's the first file still needed for cross-sensor plot
-            if len(sentinel2_records) > 1:
+            # Evict unless it's the Jan 2019 file still needed for cross-sensor plot
+            if not _is_s2_diag_target:
                 del processed; gc.collect()
 
         logger.info(f"\n✓ Registered {len(sentinel2_records)} Sentinel-2 scenes")
