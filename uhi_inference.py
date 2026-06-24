@@ -1033,6 +1033,214 @@ class InferenceDiagnosticsPlotter:
         except Exception as e:
             logger.warning(f"_plot_full_mosaic failed: {e}")
 
+    # ── 3c. Original vs Predicted patch comparison ────────────────────────────
+
+    def plot_patch_comparison(self, results: Dict[str, np.ndarray],
+                              X: np.ndarray,
+                              targets: np.ndarray = None,
+                              n_samples: int = 6,
+                              rgb_indices: tuple = (2, 1, 0)):
+        """
+        Side-by-side comparison of the original input patch and the predicted
+        LST patch (ensemble), with an optional ground-truth column and a
+        difference map when targets are available.
+
+        Layout per row (one patch per row):
+          [Original RGB/false-colour] | [Ensemble Prediction] | [Target (opt)] | [Difference (opt)]
+
+        The original-patch panel renders a false-colour composite from the
+        input tensor ``X`` using ``rgb_indices`` to select three bands (default:
+        bands 2, 1, 0 → standard BGR→RGB flip for Landsat/Sentinel stacks).
+        When the tensor has fewer than three bands the first band is shown as a
+        greyscale intensity image instead.
+
+        Args:
+            results:     Output dict from ``EnsemblePredictor.predict_ensemble()``.
+            X:           Input patches ``(N, H, W, C)`` or ``(N, C, H, W)``.
+                         Must have the same leading dimension as ``results``.
+            targets:     Optional ground-truth LST array ``(N, H, W)`` in °C.
+                         When supplied, adds "Target" and "Difference" columns.
+            n_samples:   Number of patches (rows) to show (default 6).
+            rgb_indices: Tuple of three band indices used to build the
+                         false-colour composite (default ``(2, 1, 0)``).
+
+        Saves:
+            ``03c_patch_comparison.png``
+        """
+        try:
+            self._use_style()
+
+            # ── Resolve ensemble array ────────────────────────────────────────
+            ensemble = np.asarray(
+                results.get("ensemble", results.get("ensemble_patch"))
+            )
+
+            # Ensure (N, H, W)
+            def _to_spatial(arr):
+                arr = np.asarray(arr)
+                if arr.ndim == 4 and arr.shape[1] == 1:
+                    return arr[:, 0]
+                if arr.ndim == 4 and arr.shape[3] == 1:
+                    return arr[:, :, :, 0]
+                if arr.ndim == 3:
+                    return arr
+                return arr
+
+            ensemble = _to_spatial(ensemble)
+            n = min(n_samples, len(ensemble))
+            if n == 0:
+                logger.warning("plot_patch_comparison: no samples, skipping")
+                return
+
+            # ── Normalise input tensor to (N, H, W, C) ───────────────────────
+            X_arr = np.asarray(X)
+            if X_arr.ndim == 4 and X_arr.shape[1] < X_arr.shape[-1]:
+                # (N, C, H, W) → (N, H, W, C)
+                X_arr = X_arr.transpose(0, 2, 3, 1)
+
+            n_channels = X_arr.shape[-1] if X_arr.ndim == 4 else 1
+            use_rgb    = n_channels >= 3
+
+            # ── Column layout ─────────────────────────────────────────────────
+            has_targets = targets is not None
+            if has_targets:
+                tgt = _to_spatial(np.asarray(targets))
+                n_cols     = 4
+                col_labels = ["Original Input", "Ensemble Prediction",
+                               "Ground Truth", "Difference (Pred − GT)"]
+            else:
+                n_cols     = 2
+                col_labels = ["Original Input", "Ensemble Prediction"]
+
+            fig_w = 4 * n_cols
+            fig_h = 3.2 * n
+            fig, axes = plt.subplots(n, n_cols, figsize=(fig_w, fig_h),
+                                     squeeze=False)
+            fig.suptitle(
+                f"Patch Comparison — Original Input vs Predicted LST  "
+                f"(first {n} patches)",
+                fontsize=13, fontweight="bold"
+            )
+
+            # Shared LST colour scale across ensemble & target panels
+            lst_vmin = float(np.nanpercentile(ensemble[:n], 2))
+            lst_vmax = float(np.nanpercentile(ensemble[:n], 98))
+            lst_cmap = "RdYlBu_r"
+
+            for i in range(n):
+                # ── Panel 0: original input patch ─────────────────────────────
+                ax_orig = axes[i, 0]
+                if use_rgb and X_arr.ndim == 4:
+                    r_idx, g_idx, b_idx = [
+                        min(idx, n_channels - 1) for idx in rgb_indices
+                    ]
+                    # NOTE: fancy indexing X_arr[i,:,:,[r,g,b]] moves the list
+                    # axis to the front → (3,H,W), which imshow rejects.
+                    # np.stack on the last axis gives the correct (H,W,3).
+                    rgb = np.stack([
+                        X_arr[i, :, :, r_idx],
+                        X_arr[i, :, :, g_idx],
+                        X_arr[i, :, :, b_idx],
+                    ], axis=-1).astype(np.float32)
+                    # Per-channel percentile stretch → [0, 1]
+                    for ch in range(3):
+                        lo = np.nanpercentile(rgb[:, :, ch], 2)
+                        hi = np.nanpercentile(rgb[:, :, ch], 98)
+                        if hi > lo:
+                            rgb[:, :, ch] = np.clip(
+                                (rgb[:, :, ch] - lo) / (hi - lo), 0, 1
+                            )
+                        else:
+                            rgb[:, :, ch] = 0.0
+                    ax_orig.imshow(rgb, origin="upper", interpolation="bilinear")
+                    band_label = (
+                        f"Bands {rgb_indices[0]},{rgb_indices[1]},{rgb_indices[2]}"
+                        " (R,G,B)"
+                    )
+                else:
+                    band0 = (X_arr[i, :, :, 0] if X_arr.ndim == 4
+                             else X_arr[i])
+                    lo = np.nanpercentile(band0, 2)
+                    hi = np.nanpercentile(band0, 98)
+                    band_stretched = np.clip(
+                        (band0 - lo) / max(hi - lo, 1e-9), 0, 1
+                    )
+                    ax_orig.imshow(band_stretched, cmap="grey",
+                                   origin="upper", interpolation="bilinear")
+                    band_label = "Band 0 (greyscale)"
+
+                ax_orig.set_title(
+                    f"S{i+1} — {col_labels[0]}\n{band_label}",
+                    fontsize=8
+                )
+                ax_orig.axis("off")
+
+                # ── Panel 1: ensemble prediction ──────────────────────────────
+                ax_pred = axes[i, 1]
+                im_pred = ax_pred.imshow(
+                    ensemble[i], vmin=lst_vmin, vmax=lst_vmax,
+                    cmap=lst_cmap, origin="upper", interpolation="bilinear"
+                )
+                ax_pred.set_title(
+                    f"S{i+1} — {col_labels[1]}\n"
+                    f"mean={np.nanmean(ensemble[i]):.1f}°C  "
+                    f"σ={np.nanstd(ensemble[i]):.2f}°C",
+                    fontsize=8
+                )
+                ax_pred.axis("off")
+                plt.colorbar(im_pred, ax=ax_pred, shrink=0.82,
+                             label="LST (°C)", pad=0.02)
+
+                if has_targets:
+                    # ── Panel 2: ground truth ─────────────────────────────────
+                    ax_tgt = axes[i, 2]
+                    im_tgt = ax_tgt.imshow(
+                        tgt[i], vmin=lst_vmin, vmax=lst_vmax,
+                        cmap=lst_cmap, origin="upper", interpolation="bilinear"
+                    )
+                    ax_tgt.set_title(
+                        f"S{i+1} — {col_labels[2]}\n"
+                        f"mean={np.nanmean(tgt[i]):.1f}°C  "
+                        f"σ={np.nanstd(tgt[i]):.2f}°C",
+                        fontsize=8
+                    )
+                    ax_tgt.axis("off")
+                    plt.colorbar(im_tgt, ax=ax_tgt, shrink=0.82,
+                                 label="LST (°C)", pad=0.02)
+
+                    # ── Panel 3: difference map ───────────────────────────────
+                    ax_diff = axes[i, 3]
+                    diff    = ensemble[i] - tgt[i]
+                    patch_rmse = float(np.sqrt(np.nanmean(diff ** 2)))
+                    patch_mae  = float(np.nanmean(np.abs(diff)))
+                    patch_mbe  = float(np.nanmean(diff))
+                    diff_abs   = max(
+                        float(np.nanpercentile(np.abs(diff), 98)), 1e-6
+                    )
+                    norm_diff = TwoSlopeNorm(
+                        vmin=-diff_abs, vcenter=0.0, vmax=diff_abs
+                    )
+                    im_diff = ax_diff.imshow(
+                        diff, norm=norm_diff, cmap="RdBu_r",
+                        origin="upper", interpolation="bilinear"
+                    )
+                    ax_diff.set_title(
+                        f"S{i+1} — {col_labels[3]}\n"
+                        f"RMSE={patch_rmse:.2f}  MAE={patch_mae:.2f}  "
+                        f"MBE={patch_mbe:+.2f} °C",
+                        fontsize=8
+                    )
+                    ax_diff.axis("off")
+                    plt.colorbar(im_diff, ax=ax_diff, shrink=0.82,
+                                 label="Δ LST (°C)", pad=0.02)
+
+            plt.tight_layout()
+            self._save(fig, "03c_patch_comparison")
+            logger.info(f"  ✅ Saved patch comparison figure (03c) — {n} patches")
+
+        except Exception as e:
+            logger.warning(f"plot_patch_comparison failed: {e}")
+
     # ── 4. Uncertainty maps ───────────────────────────────────────────────────
 
     def plot_uncertainty_maps(self, results: Dict[str, np.ndarray],
@@ -1600,6 +1808,8 @@ class InferenceDiagnosticsPlotter:
         self.plot_prediction_distribution(results, targets=targets)
         self.plot_spatial_predictions(results, targets=targets, grid_cols=grid_cols,
                                       patch_positions=patch_positions)
+        if X is not None:
+            self.plot_patch_comparison(results, X, targets=targets)
         self.plot_model_agreement(results)
         self.plot_uncertainty_maps(results)
         self.plot_tta_variance(results)

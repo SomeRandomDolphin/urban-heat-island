@@ -290,7 +290,8 @@ def stage_adaptive_calibration(predictor: EnsemblePredictor,
 # ── Stage 4: Inference ───────────────────────────────────────────────────────
 
 def stage_inference(args, predictor: EnsemblePredictor,
-                    X_test: np.ndarray, data_dir: Path) -> dict:
+                    X_test: np.ndarray, data_dir: Path,
+                    y_test: np.ndarray = None) -> dict:
     _section("STAGE 4 — INFERENCE")
 
     # ── Propagate grid_cols to the inference plotter BEFORE running predictions
@@ -353,6 +354,17 @@ def stage_inference(args, predictor: EnsemblePredictor,
             "Re-run preprocessing to regenerate the dataset with position metadata."
         )
 
+    # Denormalize y_test → °C so plot_patch_comparison and the dashboard
+    # receive ground-truth in the same scale as predictions.
+    targets_celsius = None
+    if y_test is not None:
+        try:
+            targets_celsius = predictor.normalizer.denormalize_predictions(
+                y_test.squeeze(), "target"
+            ).reshape(y_test.shape)
+        except Exception as _de:
+            logger.warning(f"  ⚠ Could not denormalize y_test for diagnostics: {_de}")
+
     if args.use_tta:
         logger.info(f"  Mode: TTA  (n_augmentations={args.tta_augs})")
         results = predictor.predict_ensemble_with_tta(
@@ -361,6 +373,7 @@ def stage_inference(args, predictor: EnsemblePredictor,
             n_augmentations=args.tta_augs,
             return_uncertainty=True,
             use_spatial_ensemble=args.use_spatial_ensemble,
+            targets=targets_celsius,
         )
     else:
         logger.info("  Mode: standard ensemble  (return_uncertainty=True)")
@@ -369,6 +382,7 @@ def stage_inference(args, predictor: EnsemblePredictor,
             batch_size=args.batch_size,
             return_uncertainty=True,
             use_spatial_ensemble=args.use_spatial_ensemble,
+            targets=targets_celsius,
         )
 
     # Persist predictions
@@ -1024,6 +1038,7 @@ def stage_validation(args, predictor, results, y_test,
                 n_augmentations=args.tta_augs,
                 return_uncertainty=True,
                 use_spatial_ensemble=args.use_spatial_ensemble,
+                save_diagnostics=False,      # diagnostics already saved in stage 4
             )
             pred_arr = tta_res["ensemble"]
         except Exception as exc:
@@ -1712,7 +1727,7 @@ def run_single_model(args, output_dir: Path, norm_stats_path: Path,
     stage_adaptive_calibration(predictor, y_test, norm_stats_path)
 
     try:
-        results = stage_inference(args, predictor, X_test, data_dir)
+        results = stage_inference(args, predictor, X_test, data_dir, y_test=y_test)
     except Exception as exc:
         logger.error(f"Inference failed: {exc}"); return {}
 
@@ -1926,7 +1941,7 @@ def main() -> int:
     stage_adaptive_calibration(predictor, y_test, norm_stats_path)
 
     try:
-        results = stage_inference(args, predictor, X_test, data_dir)
+        results = stage_inference(args, predictor, X_test, data_dir, y_test=y_test)
     except Exception as exc:
         logger.error(f"Inference failed: {exc}"); traceback.print_exc(); return 1
 
