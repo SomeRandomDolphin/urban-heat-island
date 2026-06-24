@@ -1,0 +1,3 @@
+model,uhi_mean_C,uhi_max_C,uhi_extent_km2,n_hotspots,val_r2,val_rmse_C,val_mae_C,val_mbe_C
+Landsat,5.424,13.048,2362.025,42,0.8233,3.0459,2.3238,0.8233
+Fusion,4.905,12.666,2033.52,43,0.8523,2.6056,1.9294,-0.0117

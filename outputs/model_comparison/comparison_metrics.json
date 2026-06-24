@@ -1,0 +1,24 @@
+[
+  {
+    "model": "Landsat",
+    "uhi_mean_C": 5.424,
+    "uhi_max_C": 13.048,
+    "uhi_extent_km2": 2362.025,
+    "n_hotspots": 42,
+    "val_r2": 0.8233,
+    "val_rmse_C": 3.0459,
+    "val_mae_C": 2.3238,
+    "val_mbe_C": 0.8233
+  },
+  {
+    "model": "Fusion",
+    "uhi_mean_C": 4.905,
+    "uhi_max_C": 12.666,
+    "uhi_extent_km2": 2033.52,
+    "n_hotspots": 43,
+    "val_r2": 0.8523,
+    "val_rmse_C": 2.6056,
+    "val_mae_C": 1.9294,
+    "val_mbe_C": -0.0117
+  }
+]
